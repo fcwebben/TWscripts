@@ -60,20 +60,17 @@
   }
 
   function getRelicMaxTiles(range) {
-	  if (range === 1) return 5;
-	  if (range === 2) return 13;
-	  if (range === 3) return 29;
-	  return 0;
-  }
-	
-  function getRelicRangeLabel(range) {
+	  return 2 * range * range + 2 * range + 1;
+	}
+
+	function getRelicRangeLabel(range) {
 	  if (range === 2) return "Shoddy / Sturdy";
 	  if (range === 3) return "Enhanced / Superior";
 	  if (range === 4) return "Renowned";
 	  return "Unknown";
 	}
 
-  function getRelicOffsets(range) {
+	function getRelicOffsets(range) {
 	  const offsets = [];
 
 	  for (let dx = -range; dx <= range; dx++) {
@@ -89,9 +86,6 @@
 
 	  return offsets;
 	}
-
-    return offsets;
-  }
 
   function getRelevantTables() {
     const tables = [];
