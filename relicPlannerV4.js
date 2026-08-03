@@ -60,7 +60,7 @@
   }
 
   function getRelicMaxTiles(range) {
-	  return 2 * range * range + 2 * range + 1;
+	  return getRelicOffsets(range).length;
 	}
 
 	function getRelicRangeLabel(range) {
@@ -73,16 +73,53 @@
 	function getRelicOffsets(range) {
 	  const offsets = [];
 
-	  for (let dx = -range; dx <= range; dx++) {
-		for (let dy = -range; dy <= range; dy++) {
-		  if (Math.abs(dx) + Math.abs(dy) <= range) {
-			offsets.push({
-			  dx: dx,
-			  dy: dy
-			});
-		  }
+	  const shapes = {
+		2: {
+		  "-2": 0,
+		  "-1": 1,
+		  "0": 2,
+		  "1": 1,
+		  "2": 0
+		},
+		3: {
+		  "-3": 0,
+		  "-2": 2,
+		  "-1": 2,
+		  "0": 3,
+		  "1": 2,
+		  "2": 2,
+		  "3": 0
+		},
+		4: {
+		  "-4": 0,
+		  "-3": 2,
+		  "-2": 3,
+		  "-1": 3,
+		  "0": 4,
+		  "1": 3,
+		  "2": 3,
+		  "3": 2,
+		  "4": 0
 		}
+	  };
+
+	  const shape = shapes[range];
+
+	  if (!shape) {
+		return offsets;
 	  }
+
+	  Object.keys(shape).forEach(dyKey => {
+		const dy = parseInt(dyKey, 10);
+		const halfWidth = shape[dyKey];
+
+		for (let dx = -halfWidth; dx <= halfWidth; dx++) {
+		  offsets.push({
+			dx: dx,
+			dy: dy
+		  });
+		}
+	  });
 
 	  return offsets;
 	}
@@ -837,8 +874,8 @@
 
     [
 	  { value: "2", text: "Shoddy / Sturdy - Range 2 - max 13 tiles" },
-	  { value: "3", text: "Enhanced / Superior - Range 3 - max 25 tiles" },
-	  { value: "4", text: "Renowned - Range 4 - max 41 tiles" }
+	  { value: "3", text: "Enhanced / Superior - Range 3 - max 29 tiles" },
+	  { value: "4", text: "Renowned - Range 4 - max 49 tiles" }
 	].forEach(optionData => {
       const option = document.createElement("option");
       option.value = optionData.value;
@@ -848,7 +885,7 @@
 
     const rangeHelp = document.createElement("div");
     rangeHelp.className = "twvp-small";
-    rangeHelp.textContent = "The calculation uses diamond coverage / Manhattan distance: abs(dx) + abs(dy) <= range.";
+    rangeHelp.textContent = "The calculation uses the relic coverage shape shown on the map, with wider middle rows depending on relic range.";
 
     rangeWrap.appendChild(rangeLabel);
     rangeWrap.appendChild(rangeSelect);
