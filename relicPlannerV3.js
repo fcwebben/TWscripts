@@ -160,46 +160,53 @@
   }
 
   function calculateCandidates(villages, range) {
-    const offsets = getRelicOffsets(range);
-    const villageByCoord = new Map();
+	  const offsets = getRelicOffsets(range);
+	  const villageByCoord = new Map();
 
-    villages.forEach(village => {
-      villageByCoord.set(village.coord, village);
-    });
+	  villages.forEach(village => {
+		villageByCoord.set(village.coord, village);
+	  });
 
-    const candidates = villages.map(village => {
-      const covered = [];
+	  const candidates = villages.map(village => {
+		const coveredByCoord = new Map();
 
-      offsets.forEach(offset => {
-        const targetCoord = (village.x + offset.dx) + "|" + (village.y + offset.dy);
+		// The relic village itself is always covered.
+		// Distance from center to itself is 0.
+		coveredByCoord.set(village.coord, village);
 
-        if (villageByCoord.has(targetCoord)) {
-          covered.push(villageByCoord.get(targetCoord));
-        }
-      });
+		offsets.forEach(offset => {
+		  const targetCoord = (village.x + offset.dx) + "|" + (village.y + offset.dy);
 
-      covered.sort((a, b) => {
-        if (a.y !== b.y) return a.y - b.y;
-        return a.x - b.x;
-      });
+		  if (villageByCoord.has(targetCoord)) {
+			const coveredVillage = villageByCoord.get(targetCoord);
+			coveredByCoord.set(coveredVillage.coord, coveredVillage);
+		  }
+		});
 
-      return {
-        village: village,
-        coord: village.coord,
-        covered: covered,
-        coveredCount: covered.length,
-        maxTiles: offsets.length
-      };
-    });
+		const covered = Array.from(coveredByCoord.values());
 
-    candidates.sort((a, b) => {
-      if (b.coveredCount !== a.coveredCount) return b.coveredCount - a.coveredCount;
-      if (a.village.y !== b.village.y) return a.village.y - b.village.y;
-      return a.village.x - b.village.x;
-    });
+		covered.sort((a, b) => {
+		  if (a.y !== b.y) return a.y - b.y;
+		  return a.x - b.x;
+		});
 
-    return candidates;
-  }
+		return {
+		  village: village,
+		  coord: village.coord,
+		  covered: covered,
+		  coveredCount: covered.length,
+		  maxTiles: offsets.length
+		};
+	  });
+
+	  candidates.sort((a, b) => {
+		if (b.coveredCount !== a.coveredCount) return b.coveredCount - a.coveredCount;
+		if (a.village.y !== b.village.y) return a.village.y - b.village.y;
+		return a.village.x - b.village.x;
+	  });
+
+	  return candidates;
+	}
 
   function buildGreedyPlan(candidates, placementCount) {
     const selected = [];
