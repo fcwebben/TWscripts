@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Twactics
  * License: MIT
  *
- * Twactics Relic Planner v2.2
+ * Twactics Relic Planner v2.3
  *
  * Helps players evaluate relic placement plans using visible/loaded village data,
  * relic inventory data and current relic overview data.
@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v2.2.0";
+  const SCRIPT_VERSION = "v2.3.0";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -82,14 +82,15 @@
   };
 
   const state = {
-    villages: [],
-    villagesById: new Map(),
-    villagesByCoord: new Map(),
-    inventoryRelics: [],
-    placedRelics: [],
-    plan: [],
-    logs: []
-  };
+		villages: [],
+		villagesById: new Map(),
+		villagesByCoord: new Map(),
+		inventoryRelics: [],
+		placedRelics: [],
+		plan: [],
+		unlockedRelicSlots: 10,
+		logs: []
+	};
 
   const ui = {};
 
@@ -642,6 +643,21 @@
 
     return relics;
   }
+	
+	function countUnlockedRelicSlotsFromOverviewHtml(html) {
+		const doc = parseHtml(html);
+		const slots = Array.from(doc.querySelectorAll("#relic_slots .relic-slot"));
+
+		if (!slots.length) {
+			return 10;
+		}
+
+		const unlockedSlots = slots.filter(slot => {
+			return !slot.classList.contains("locked");
+		});
+
+		return Math.max(1, Math.min(10, unlockedSlots.length || 10));
+	}
 
   function rebuildVillageIndexes() {
     state.villagesById = new Map();
@@ -944,7 +960,8 @@
 	  rebuildVillageIndexes();
 
 	  state.inventoryRelics = extractInventoryRelicsFromHtml(responses[1]);
-	  state.placedRelics = extractPlacedRelicsFromOverviewHtml(responses[2]);
+		state.placedRelics = extractPlacedRelicsFromOverviewHtml(responses[2]);
+		state.unlockedRelicSlots = countUnlockedRelicSlotsFromOverviewHtml(responses[2]);
 
 	  console.log(SCRIPT_NAME + " villages:", state.villages);
 	  console.log(SCRIPT_NAME + " inventory relics:", state.inventoryRelics);
@@ -966,7 +983,7 @@
 			const weighting = ui.weightSelect.value;
 
 			const urls = await loadAllData(goal);
-      const maxPlacements = Math.max(1, Math.min(50, parseInt(ui.countInput.value, 10) || 10));
+			const maxPlacements = Math.max(1, Math.min(10, parseInt(ui.countInput.value, 10) || state.unlockedRelicSlots || 10));
 
       state.plan = optimizePlan(goal, mode, weighting, maxPlacements);
 
@@ -1013,6 +1030,142 @@
   function formatScore(value) {
     return Number(value || 0).toFixed(2);
   }
+	
+	const STAT_LABELS = {
+  barracks_speed: "Barracks speed",
+  stable_speed: "Stable speed",
+  workshop_speed: "Workshop speed",
+  academy_speed: "Academy speed",
+
+  barracks_cost: "Barracks cost reduction",
+  stable_cost: "Stable cost reduction",
+  workshop_cost: "Workshop cost reduction",
+
+  axe_attack: "Axeman attack",
+  axe_offdef: "Axeman off/def",
+  light_attack: "Light cavalry attack",
+  light_offdef: "Light cavalry off/def",
+  marcher_attack: "Mounted archer attack",
+  marcher_offdef: "Mounted archer off/def",
+  heavy_attack: "Heavy cavalry attack",
+  heavy_offdef: "Heavy cavalry off/def",
+  ram_attack: "Ram attack",
+  ram_damage: "Ram building damage",
+  catapult_attack: "Catapult attack",
+  catapult_damage: "Catapult building damage"
+};
+
+function getStatDisplayName(key) {
+  return STAT_LABELS[key] || key.replace(/_/g, " ");
+}
+
+function formatImpactStats(stats) {
+  const keys = Object.keys(stats || {}).sort();
+
+  if (!keys.length) {
+    return "-";
+  }
+
+  return keys
+    .map(key => {
+      return getStatDisplayName(key) + " " + formatScore(stats[key]) + "%";
+    })
+    .join(", ");
+}
+
+function buildVillageImpactSummary(plan) {
+  const impactMap = new Map();
+
+  (plan || []).forEach(item => {
+    item.covered.forEach(village => {
+      if (!impactMap.has(village.coord)) {
+        impactMap.set(village.coord, {
+          village: village,
+          relicCount: 0,
+          stats: {}
+        });
+      }
+
+      const entry = impactMap.get(village.coord);
+      entry.relicCount += 1;
+
+      item.relevantStats.forEach(stat => {
+        const current = entry.stats[stat.key] || 0;
+        entry.stats[stat.key] = Math.min(BENEFIT_CAP, current + stat.value);
+      });
+    });
+  });
+
+  return Array.from(impactMap.values()).sort((a, b) => {
+    if (b.relicCount !== a.relicCount) {
+      return b.relicCount - a.relicCount;
+    }
+
+    if (a.village.y !== b.village.y) {
+      return a.village.y - b.village.y;
+    }
+
+    return a.village.x - b.village.x;
+  });
+}
+
+	function renderVillageImpactSummary() {
+		const impactRows = buildVillageImpactSummary(state.plan);
+
+		if (!impactRows.length) {
+			return;
+		}
+
+		const title = document.createElement("div");
+		title.className = "twrp-section-title";
+		title.textContent = "Village impact summary";
+		ui.results.appendChild(title);
+
+		const tableWrap = document.createElement("div");
+		tableWrap.className = "twrp-table-wrap";
+
+		const table = document.createElement("table");
+		table.className = "twrp-table";
+
+		const thead = document.createElement("thead");
+		const headRow = document.createElement("tr");
+
+		["Village", "Relics", "Total stats"].forEach(label => {
+			const th = document.createElement("th");
+			th.textContent = label;
+			headRow.appendChild(th);
+		});
+
+		thead.appendChild(headRow);
+		table.appendChild(thead);
+
+		const tbody = document.createElement("tbody");
+
+		impactRows.forEach(item => {
+			const row = document.createElement("tr");
+
+			const villageCell = document.createElement("td");
+			villageCell.className = "twrp-left";
+			villageCell.textContent = item.village.name;
+
+			const relicCountCell = document.createElement("td");
+			relicCountCell.textContent = String(item.relicCount);
+
+			const statsCell = document.createElement("td");
+			statsCell.className = "twrp-left";
+			statsCell.textContent = formatImpactStats(item.stats);
+
+			row.appendChild(villageCell);
+			row.appendChild(relicCountCell);
+			row.appendChild(statsCell);
+
+			tbody.appendChild(row);
+		});
+
+		table.appendChild(tbody);
+		tableWrap.appendChild(table);
+		ui.results.appendChild(tableWrap);
+	}
 
   function renderResults(context) {
     ui.results.innerHTML = "";
@@ -1147,10 +1300,12 @@
     });
 
     table.appendChild(tbody);
-    tableWrap.appendChild(table);
-    ui.results.appendChild(tableWrap);
+		tableWrap.appendChild(table);
+		ui.results.appendChild(tableWrap);
 
-    const note = document.createElement("div");
+		renderVillageImpactSummary();
+
+		const note = document.createElement("div");
     note.className = "twrp-small";
     note.textContent =
       "Score is a weighted marginal-value estimate after applying the 20% cap per village/stat. Waste is estimated value lost because covered villages are already capped or near capped.";
@@ -1191,6 +1346,26 @@
       lines.push("   Stats: " + formatStatList(item.relevantStats));
       lines.push("");
     });
+		
+		const impactRows = buildVillageImpactSummary(state.plan);
+
+		if (impactRows.length) {
+			lines.push("");
+			lines.push("Village impact summary");
+			lines.push("");
+
+			impactRows.forEach(item => {
+				lines.push(
+					item.village.name +
+						" | Relics: " +
+						item.relicCount +
+						" | " +
+						formatImpactStats(item.stats)
+				);
+			});
+
+			lines.push("");
+		}
 
     const text = lines.join("\n");
 
@@ -1231,6 +1406,30 @@
       ui.status.classList.add("twrp-status-" + type);
     }
   }
+	
+	async function setDefaultMaxRelicSlotsFromOverview(countInput, wasEditedFn) {
+		try {
+			const overviewUrl = buildGameUrl({
+				screen: "relic_system",
+				mode: "overview"
+			});
+
+			const html = await fetchHtml(overviewUrl);
+			const unlockedSlots = countUnlockedRelicSlotsFromOverviewHtml(html);
+
+			state.unlockedRelicSlots = unlockedSlots;
+
+			if (!wasEditedFn()) {
+				countInput.value = String(unlockedSlots);
+				setStatus(
+					"Ready. Detected " + unlockedSlots + " unlocked relic slot(s).",
+					"success"
+				);
+			}
+		} catch (err) {
+			console.warn(SCRIPT_NAME + " could not detect unlocked relic slots:", err);
+		}
+	}
 
   function addStyles() {
     if (document.getElementById(STYLE_ID)) return;
@@ -1570,6 +1769,8 @@
       option.textContent = optionData.text;
       modeSelect.appendChild(option);
     });
+		
+		modeSelect.value = "rebuild";
 
     modeWrap.appendChild(modeLabel);
     modeWrap.appendChild(modeSelect);
@@ -1611,14 +1812,20 @@
     const countWrap = document.createElement("div");
     const countLabel = document.createElement("label");
     countLabel.className = "twrp-label";
-    countLabel.textContent = "Max rows";
+    countLabel.textContent = "Max Relic Slots";
 
     const countInput = document.createElement("input");
     countInput.className = "twrp-input";
     countInput.type = "number";
     countInput.min = "1";
-    countInput.max = "50";
-    countInput.value = "10";
+    countInput.max = "10";
+		countInput.value = String(state.unlockedRelicSlots || 10);
+		
+		let countInputWasEdited = false;
+
+		countInput.addEventListener("input", function () {
+			countInputWasEdited = true;
+		});
 
     countWrap.appendChild(countLabel);
     countWrap.appendChild(countInput);
@@ -1668,15 +1875,19 @@
     document.body.appendChild(box);
 
     ui.goalSelect = goalSelect;
-    ui.modeSelect = modeSelect;
-    ui.weightSelect = weightSelect;
-    ui.countInput = countInput;
-    ui.loadButton = loadButton;
-    ui.copyButton = copyButton;
-    ui.status = status;
-    ui.results = results;
+		ui.modeSelect = modeSelect;
+		ui.weightSelect = weightSelect;
+		ui.countInput = countInput;
+		ui.loadButton = loadButton;
+		ui.copyButton = copyButton;
+		ui.status = status;
+		ui.results = results;
 
-    makeDraggable(box, header);
+		setDefaultMaxRelicSlotsFromOverview(countInput, function () {
+			return countInputWasEdited;
+		});
+
+		makeDraggable(box, header);
   }
 
   createDialog();
