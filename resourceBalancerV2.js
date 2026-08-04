@@ -46,20 +46,21 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.0.0";
+  const SCRIPT_VERSION = "1.1.0";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
 
   const DEFAULTS = {
     constructionHours: 8,
-    averageFactor: 0.15,
+    averageFactor: 0.10,
     reserveMerchants: 0,
     merchantCapacity: 1000,
     minShipment: 700,
     maxDistance: 0,
     emptyQueueBoost: 80,
     lowPointsBoost: 35,
-    donorProtectRatio: 0.08
+    donorProtectRatio: 0.08,
+    prioritizeLowPoints: true
   };
 
   const BUILDING_NAMES = {
@@ -971,28 +972,25 @@
 
   function getSettings() {
     const constructionHours = Math.max(0, Math.min(72, parseFloatSafe(ui.constructionHours.value, DEFAULTS.constructionHours)));
-    const averageFactor = Math.max(0, Math.min(1, parseFloatSafe(ui.averageFactor.value, DEFAULTS.averageFactor)));
     const reserveMerchants = Math.max(0, parseInt(ui.reserveMerchants.value, 10) || DEFAULTS.reserveMerchants);
-    const merchantCapacity = Math.max(1, parseInt(ui.merchantCapacity.value, 10) || DEFAULTS.merchantCapacity);
-    const minShipment = Math.max(1, parseInt(ui.minShipment.value, 10) || DEFAULTS.minShipment);
     const maxDistance = Math.max(0, parseFloatSafe(ui.maxDistance.value, DEFAULTS.maxDistance));
-    const emptyQueueBoost = Math.max(0, Math.min(200, parseFloatSafe(ui.emptyQueueBoost.value, DEFAULTS.emptyQueueBoost)));
-    const lowPointsBoost = Math.max(0, Math.min(200, parseFloatSafe(ui.lowPointsBoost.value, DEFAULTS.lowPointsBoost)));
+    const prioritizeLowPoints = ui.prioritizeLowPoints.checked;
 
     return {
       constructionHours: constructionHours,
-      averageFactor: averageFactor,
+      averageFactor: DEFAULTS.averageFactor,
       reserveMerchants: reserveMerchants,
-      merchantCapacity: merchantCapacity,
-      minShipment: minShipment,
+      merchantCapacity: DEFAULTS.merchantCapacity,
+      minShipment: DEFAULTS.minShipment,
       maxDistance: maxDistance,
-      emptyQueueBoost: emptyQueueBoost,
-      lowPointsBoost: lowPointsBoost,
-      priorityMode: ui.priorityMode.value,
-      donorPreference: ui.donorPreference.value,
-      protectDonorConstruction: ui.protectDonorConstruction.checked,
-      includeAverageBalance: ui.includeAverageBalance.checked,
-      prioritizeNoTemplateDonors: ui.prioritizeNoTemplateDonors.checked
+      emptyQueueBoost: DEFAULTS.emptyQueueBoost,
+      lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
+      priorityMode: "construction_first",
+      donorPreference: "best_score",
+      protectDonorConstruction: true,
+      includeAverageBalance: true,
+      prioritizeNoTemplateDonors: true,
+      prioritizeLowPoints: prioritizeLowPoints
     };
   }
 
@@ -1016,14 +1014,16 @@
       mergeLoadedData(results[0], results[1], results[2], results[3], results[4], settings);
 
       const planResult = createTransferPlan(settings);
-      state.plan = planResult.launches;
+      state.plan = planResult.targetPlans;
       state.stats = planResult.stats;
 
       renderResults(planResult);
       ui.copyButton.disabled = !state.plan.length;
 
       setStatus(
-        "Loaded " + state.villages.length + " village(s). Planned " + state.plan.length + " transfer(s).",
+        "Loaded " + state.villages.length + " village(s). Planned " +
+          planResult.targetPlans.length + " target send(s) from " +
+          planResult.launches.length + " origin transfer(s).",
         "success"
       );
     } catch (err) {
@@ -1040,9 +1040,11 @@
     const targets = buildTargets(villages, stats, settings);
     const donors = buildDonors(villages, stats, settings);
     const launches = matchDonorsToTargets(targets, donors, settings);
+    const targetPlans = groupLaunchesByTarget(launches);
 
     return {
       launches: launches,
+      targetPlans: targetPlans,
       targets: targets,
       donors: donors,
       stats: stats
@@ -1354,6 +1356,38 @@
     return launches;
   }
 
+  function groupLaunchesByTarget(launches) {
+    const map = new Map();
+
+    launches.forEach(launch => {
+      const key = String(launch.target.id);
+
+      if (!map.has(key)) {
+        map.set(key, {
+          id: map.size + 1,
+          target: launch.target,
+          launches: [],
+          resources: emptyResources(),
+          total: 0,
+          merchantsUsed: 0,
+          maxDistance: 0,
+          targetReason: launch.targetReason
+        });
+      }
+
+      const plan = map.get(key);
+      plan.launches.push(launch);
+      plan.resources.wood += launch.resources.wood;
+      plan.resources.stone += launch.resources.stone;
+      plan.resources.iron += launch.resources.iron;
+      plan.total += launch.total;
+      plan.merchantsUsed += launch.merchantsUsed;
+      plan.maxDistance = Math.max(plan.maxDistance, launch.distance);
+    });
+
+    return Array.from(map.values()).sort((a, b) => b.total - a.total);
+  }
+
   function getDonorMatchScore(donor, target, distance, settings) {
     let score = donor.baseScore;
 
@@ -1396,16 +1430,23 @@
     };
   }
 
-  function sendLaunch(launch, button) {
-    if (!launch || !launch.target || !launch.origin) return;
+  function sendTargetPlan(targetPlan, button) {
+    if (!targetPlan || !targetPlan.target || !targetPlan.launches || !targetPlan.launches.length) return;
 
     const data = {};
-    data["resource[" + launch.origin.id + "][wood]"] = launch.resources.wood;
-    data["resource[" + launch.origin.id + "][stone]"] = launch.resources.stone;
-    data["resource[" + launch.origin.id + "][iron]"] = launch.resources.iron;
+
+    targetPlan.launches.forEach(launch => {
+      const woodKey = "resource[" + launch.origin.id + "][wood]";
+      const stoneKey = "resource[" + launch.origin.id + "][stone]";
+      const ironKey = "resource[" + launch.origin.id + "][iron]";
+
+      data[woodKey] = (data[woodKey] || 0) + launch.resources.wood;
+      data[stoneKey] = (data[stoneKey] || 0) + launch.resources.stone;
+      data[ironKey] = (data[ironKey] || 0) + launch.resources.iron;
+    });
 
     const options = {
-      village: launch.target.id,
+      village: targetPlan.target.id,
       ajaxaction: "call",
       h: window.csrf_token
     };
@@ -1419,19 +1460,19 @@
         options,
         data,
         response => {
-          console.log(SCRIPT_NAME + " send response:", response);
+          console.log(SCRIPT_NAME + " grouped send response:", response);
           UI.SuccessMessage(response.success || "Resources sent.", 1500);
           button.textContent = "Sent";
         },
         error => {
-          console.error(SCRIPT_NAME + " send failed:", error);
+          console.error(SCRIPT_NAME + " grouped send failed:", error);
           UI.ErrorMessage("Could not send resources.", 2500);
           button.disabled = false;
           button.textContent = "Send";
         }
       );
     } catch (err) {
-      console.error(SCRIPT_NAME + " send failed:", err);
+      console.error(SCRIPT_NAME + " grouped send failed:", err);
       UI.ErrorMessage("Could not send resources.", 2500);
       button.disabled = false;
       button.textContent = "Send";
@@ -1448,31 +1489,31 @@
     summary.innerHTML =
       "<strong>Plan summary</strong><br>" +
       "Villages: " + state.villages.length + "<br>" +
-      "Transfers: " + planResult.launches.length + "<br>" +
+      "Target sends: " + planResult.targetPlans.length + "<br>" +
+      "Origin transfers: " + planResult.launches.length + "<br>" +
       "Targets considered: " + planResult.targets.length + "<br>" +
       "Donors considered: " + planResult.donors.length + "<br>" +
-      "Priority mode: " + escapeHtml(settings.priorityMode) + "<br>" +
-      "Donor preference: " + escapeHtml(settings.donorPreference);
+      "Construction horizon: " + escapeHtml(settings.constructionHours) + "h";
 
     ui.results.appendChild(summary);
 
-    if (!planResult.launches.length) {
+    if (!planResult.targetPlans.length) {
       const empty = document.createElement("div");
       empty.className = "twrp-status twrp-status-warn";
-      empty.textContent = "No useful transfers found. Try increasing construction hours, lowering minimum shipment, or enabling average balancing.";
+      empty.textContent = "No useful transfers found. Try increasing construction hours or max distance.";
       ui.results.appendChild(empty);
       renderDiagnostics(planResult);
       return;
     }
 
-    renderLaunchTable(planResult.launches);
+    renderTargetTable(planResult.targetPlans);
     renderDiagnostics(planResult);
   }
 
-  function renderLaunchTable(launches) {
+  function renderTargetTable(targetPlans) {
     const title = document.createElement("div");
     title.className = "twrp-section-title";
-    title.textContent = "Recommended transfers";
+    title.textContent = "Recommended target sends";
     ui.results.appendChild(title);
 
     const tableWrap = document.createElement("div");
@@ -1484,7 +1525,7 @@
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
 
-    ["#", "From", "To", "Resources", "Merchants", "Dist", "Why", "Action"].forEach(label => {
+    ["#", "Target", "Total resources", "Origins", "Merchants", "Max dist", "Why", "Action"].forEach(label => {
       const th = document.createElement("th");
       th.textContent = label;
       headRow.appendChild(th);
@@ -1495,19 +1536,46 @@
 
     const tbody = document.createElement("tbody");
 
-    launches.forEach(launch => {
+    targetPlans.forEach(targetPlan => {
       const row = document.createElement("tr");
 
-      appendCell(row, String(launch.id));
-      appendCell(row, launch.origin.name, "twrp-left");
-      appendCell(row, launch.target.name, "twrp-left");
-      appendCell(row, formatResources(launch.resources), "twrp-left");
-      appendCell(row, String(launch.merchantsUsed));
-      appendCell(row, launch.distance.toFixed(1));
+      appendCell(row, String(targetPlan.id));
+      appendCell(row, targetPlan.target.name, "twrp-left");
+      appendCell(row, formatResources(targetPlan.resources), "twrp-left");
+
+      const originsCell = document.createElement("td");
+      originsCell.className = "twrp-left";
+
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = targetPlan.launches.length + " origin village(s)";
+      details.appendChild(summary);
+
+      const originList = document.createElement("div");
+      originList.className = "twrp-covered-list";
+
+      targetPlan.launches.forEach(launch => {
+        const line = document.createElement("div");
+        line.textContent =
+          launch.origin.name +
+          " | " +
+          formatResources(launch.resources) +
+          " | " +
+          launch.distance.toFixed(1) +
+          " fields";
+        originList.appendChild(line);
+      });
+
+      details.appendChild(originList);
+      originsCell.appendChild(details);
+      row.appendChild(originsCell);
+
+      appendCell(row, String(targetPlan.merchantsUsed));
+      appendCell(row, targetPlan.maxDistance.toFixed(1));
 
       const reasonCell = document.createElement("td");
       reasonCell.className = "twrp-left twrp-small";
-      reasonCell.textContent = "Target: " + launch.targetReason + " | Donor: " + launch.donorReason;
+      reasonCell.textContent = targetPlan.targetReason;
       row.appendChild(reasonCell);
 
       const actionCell = document.createElement("td");
@@ -1516,7 +1584,7 @@
       button.className = "btn";
       button.textContent = "Send";
       button.addEventListener("click", function () {
-        sendLaunch(launch, button);
+        sendTargetPlan(targetPlan, button);
       });
       actionCell.appendChild(button);
       row.appendChild(actionCell);
@@ -1530,7 +1598,7 @@
 
     const note = document.createElement("div");
     note.className = "twrp-small";
-    note.textContent = "Each Send button sends only that single transfer row. There is no bulk-send or automatic sending.";
+    note.textContent = "Each Send button sends the grouped request for one target village. It may request resources from several origin villages, but still requires one manual click per target.";
     ui.results.appendChild(note);
   }
 
@@ -1646,16 +1714,25 @@
     lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
     lines.push("");
 
-    state.plan.forEach(launch => {
+    state.plan.forEach(targetPlan => {
       lines.push(
-        launch.id + ". " +
-        launch.origin.name + " -> " + launch.target.name +
-        " | " + formatResources(launch.resources) +
-        " | merchants: " + launch.merchantsUsed +
-        " | distance: " + launch.distance.toFixed(1)
+        targetPlan.id + ". " +
+        "Target: " + targetPlan.target.name +
+        " | " + formatResources(targetPlan.resources) +
+        " | origins: " + targetPlan.launches.length +
+        " | merchants: " + targetPlan.merchantsUsed +
+        " | max distance: " + targetPlan.maxDistance.toFixed(1)
       );
-      lines.push("   Target: " + launch.targetReason);
-      lines.push("   Donor: " + launch.donorReason);
+      lines.push("   Reason: " + targetPlan.targetReason);
+
+      targetPlan.launches.forEach(launch => {
+        lines.push(
+          "   - " + launch.origin.name +
+          " -> " + formatResources(launch.resources) +
+          " | distance: " + launch.distance.toFixed(1)
+        );
+      });
+
       lines.push("");
     });
 
@@ -2079,50 +2156,21 @@
 
     const help = document.createElement("div");
     help.className = "twrp-help";
-    help.textContent = "Creates a resource transfer plan that prioritizes empty AM construction queues, low-point villages, real template construction needs and useful donor villages with merchants. Each transfer must be sent manually.";
+    help.textContent = "Creates a construction-focused resource plan. It prioritizes villages with active Account Manager construction templates, empty or nearly empty building queues, lower-point villages, and donor villages with useful resources and merchants. Each Send button handles one target village manually.";
 
     const grid = document.createElement("div");
-    grid.className = "twrp-grid";
+    grid.className = "twrp-grid twrp-grid-simple";
 
-    const priorityMode = createSelect("Target priority mode", [
-      { value: "construction_first", text: "Construction first" },
-      { value: "empty_am_first", text: "Empty AM queues first" },
-      { value: "low_points_first", text: "Low points first" },
-      { value: "balanced", text: "Balanced" }
-    ], "construction_first");
-
-    const donorPreference = createSelect("Donor preference", [
-      { value: "best_score", text: "Best total score" },
-      { value: "closest", text: "Closest first" },
-      { value: "highest_surplus", text: "Highest surplus first" }
-    ], "best_score");
-
-    const constructionHours = createInput("Construction horizon [h]", DEFAULTS.constructionHours);
-    const averageFactor = createInput("Average balance factor", DEFAULTS.averageFactor);
+    const constructionHours = createInput("Build coverage [hours]", DEFAULTS.constructionHours);
     const reserveMerchants = createInput("Reserve merchants", DEFAULTS.reserveMerchants);
-    const merchantCapacity = createInput("Merchant capacity", DEFAULTS.merchantCapacity);
-    const minShipment = createInput("Minimum shipment", DEFAULTS.minShipment);
     const maxDistance = createInput("Max distance [0 = any]", DEFAULTS.maxDistance);
-    const emptyQueueBoost = createInput("Empty AM queue boost", DEFAULTS.emptyQueueBoost);
-    const lowPointsBoost = createInput("Low points boost", DEFAULTS.lowPointsBoost);
-    const protectDonorConstruction = createCheckbox("Protect donor AM needs", true);
-    const includeAverageBalance = createCheckbox("Include average balancing", true);
-    const prioritizeNoTemplateDonors = createCheckbox("Prefer no-template donors", true);
+    const prioritizeLowPoints = createCheckbox("Prioritize low-point villages", DEFAULTS.prioritizeLowPoints);
 
     [
-      priorityMode.wrap,
-      donorPreference.wrap,
       constructionHours.wrap,
-      averageFactor.wrap,
       reserveMerchants.wrap,
-      merchantCapacity.wrap,
-      minShipment.wrap,
       maxDistance.wrap,
-      emptyQueueBoost.wrap,
-      lowPointsBoost.wrap,
-      protectDonorConstruction.wrap,
-      includeAverageBalance.wrap,
-      prioritizeNoTemplateDonors.wrap
+      prioritizeLowPoints.wrap
     ].forEach(node => grid.appendChild(node));
 
     const buttons = document.createElement("div");
@@ -2165,19 +2213,10 @@
     box.appendChild(body);
     document.body.appendChild(box);
 
-    ui.priorityMode = priorityMode.select;
-    ui.donorPreference = donorPreference.select;
     ui.constructionHours = constructionHours.input;
-    ui.averageFactor = averageFactor.input;
     ui.reserveMerchants = reserveMerchants.input;
-    ui.merchantCapacity = merchantCapacity.input;
-    ui.minShipment = minShipment.input;
     ui.maxDistance = maxDistance.input;
-    ui.emptyQueueBoost = emptyQueueBoost.input;
-    ui.lowPointsBoost = lowPointsBoost.input;
-    ui.protectDonorConstruction = protectDonorConstruction.input;
-    ui.includeAverageBalance = includeAverageBalance.input;
-    ui.prioritizeNoTemplateDonors = prioritizeNoTemplateDonors.input;
+    ui.prioritizeLowPoints = prioritizeLowPoints.input;
     ui.planButton = planButton;
     ui.copyButton = copyButton;
     ui.status = status;
