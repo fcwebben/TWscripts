@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Twactics
  * License: MIT
  *
- * Twactics Relic Planner v2.3
+ * Twactics Relic Planner
  *
  * Helps players evaluate relic placement plans using visible/loaded village data,
  * relic inventory data and current relic overview data.
@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v2.3.0";
+  const SCRIPT_VERSION = "v1.0.0";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -1725,7 +1725,7 @@ function buildVillageImpactSummary(plan) {
     const help = document.createElement("div");
     help.className = "twrp-help";
     help.textContent =
-			"Loads village coordinates or production data depending on goal, plus relic inventory and current relic overview after a manual click. Recruitment uses free farm by default. Offense uses equal village weighting by default.";
+			"Loads village coordinates or production data depending on goal, plus relic inventory and current relic overview after a manual click. Recruitment uses free farm by default. Offense uses equal village weighting by default. More planning options and goal types may be added in future updates.";
 
     const grid = document.createElement("div");
     grid.className = "twrp-grid";
@@ -1812,7 +1812,7 @@ function buildVillageImpactSummary(plan) {
     const countWrap = document.createElement("div");
     const countLabel = document.createElement("label");
     countLabel.className = "twrp-label";
-    countLabel.textContent = "Relic Slots";
+    countLabel.textContent = "Max Relic Slots";
 
     const countInput = document.createElement("input");
     countInput.className = "twrp-input";
