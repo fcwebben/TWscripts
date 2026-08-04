@@ -1812,7 +1812,7 @@ function buildVillageImpactSummary(plan) {
     const countWrap = document.createElement("div");
     const countLabel = document.createElement("label");
     countLabel.className = "twrp-label";
-    countLabel.textContent = "Max Relic Slots";
+    countLabel.textContent = "Relic Slots";
 
     const countInput = document.createElement("input");
     countInput.className = "twrp-input";
