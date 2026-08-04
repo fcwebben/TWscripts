@@ -2,13 +2,14 @@
  * Copyright (c) 2026 Twactics
  * License: MIT
  *
- * Twactics Relic Planner v2.1
+ * Twactics Relic Planner v2.2
  *
  * Helps players evaluate relic placement plans using visible/loaded village data,
  * relic inventory data and current relic overview data.
  *
  * This script:
- * - Reads village data from Overview -> Production
+ * - Reads village coordinates from Overview pages
+ * - Reads farm data from Overview -> Production when needed for recruitment
  * - Reads relic data from Treasury -> Inventory
  * - Reads placed relics from Treasury -> Overview
  * - Calculates suggested relic placements after a manual user click
@@ -44,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v2.1.0";
+  const SCRIPT_VERSION = "v2.2.0";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -156,29 +157,50 @@
   }
 
   function buildGameUrl(params) {
-    const url = new URL("/game.php", window.location.origin);
-    const villageId = getCurrentVillageId();
+	  const url = new URL("/game.php", window.location.origin);
+	  const villageId = getCurrentVillageId();
+	  const currentGroup = getParam("group");
 
-    if (
-      typeof game_data !== "undefined" &&
-      game_data.player &&
-      parseInt(game_data.player.sitter || 0, 10) > 0
-    ) {
-      url.searchParams.set("t", String(game_data.player.id));
-    }
+	  if (
+		typeof game_data !== "undefined" &&
+		game_data.player &&
+		parseInt(game_data.player.sitter || 0, 10) > 0
+	  ) {
+		url.searchParams.set("t", String(game_data.player.id));
+	  }
 
-    if (villageId) {
-      url.searchParams.set("village", villageId);
-    }
+	  if (villageId) {
+		url.searchParams.set("village", villageId);
+	  }
 
-    Object.keys(params || {}).forEach(key => {
-      if (params[key] !== undefined && params[key] !== null) {
-        url.searchParams.set(key, String(params[key]));
-      }
-    });
+	  if (currentGroup && params && params.screen === "overview_villages") {
+		url.searchParams.set("group", currentGroup);
+	  }
 
-    return url.pathname + url.search;
-  }
+	  Object.keys(params || {}).forEach(key => {
+		if (params[key] !== undefined && params[key] !== null) {
+		  url.searchParams.set(key, String(params[key]));
+		}
+	  });
+
+	  return url.pathname + url.search;
+	}
+	
+	function getVillageDataUrl(goal) {
+	  if (goal === "offense") {
+		return buildGameUrl({
+		  screen: "overview_villages",
+		  mode: "combined",
+		  page: -1
+		});
+	  }
+
+	  return buildGameUrl({
+		screen: "overview_villages",
+		mode: "prod",
+		page: -1
+	  });
+	}
 
   function getRelicOffsets(range) {
     const offsets = [];
@@ -498,7 +520,11 @@
 
   function extractVillagesFromProductionHtml(html) {
     const doc = parseHtml(html);
-    const table = doc.querySelector("#production_table") || doc.querySelector("table.overview_table");
+    const table =
+			doc.querySelector("#production_table") ||
+			doc.querySelector("#combined_table") ||
+			doc.querySelector("table.overview_table") ||
+			doc.querySelector("#content_value table.vis");
     const villages = [];
     const seen = new Set();
 
@@ -650,25 +676,37 @@
     });
   }
 
-  function getHighestFarmMax() {
-    return Math.max(1, ...state.villages.map(village => village.farmMax || 0));
-  }
+	function getHighestFarmMax() {
+	  return Math.max(0, ...state.villages.map(village => village.farmMax || 0));
+	}
 
-  function getHighestFarmFree() {
-    return Math.max(1, ...state.villages.map(village => village.farmFree || 0));
-  }
+	function getHighestFarmFree() {
+	  return Math.max(0, ...state.villages.map(village => village.farmFree || 0));
+	}
 
-  function getVillageWeight(village, weighting) {
-    if (weighting === "freeFarm") {
-      return (village.farmFree || 0) / getHighestFarmFree();
-    }
+	function getVillageWeight(village, weighting) {
+	  if (weighting === "freeFarm") {
+		const highestFreeFarm = getHighestFarmFree();
 
-    if (weighting === "farmCap") {
-      return (village.farmMax || 0) / getHighestFarmMax();
-    }
+		if (highestFreeFarm > 0) {
+		  return (village.farmFree || 0) / highestFreeFarm;
+		}
 
-    return 1;
-  }
+		return 1;
+	  }
+
+	  if (weighting === "farmCap") {
+		const highestFarmMax = getHighestFarmMax();
+
+		if (highestFarmMax > 0) {
+		  return (village.farmMax || 0) / highestFarmMax;
+		}
+
+		return 1;
+	  }
+
+	  return 1;
+	}
 
   function createEmptyBonusMap() {
     return new Map();
@@ -877,57 +915,57 @@
     return plan;
   }
 
-  async function loadAllData() {
-    const prodUrl = buildGameUrl({
-      screen: "overview_villages",
-      mode: "prod",
-      page: -1
-    });
+  async function loadAllData(goal) {
+	  const villageUrl = getVillageDataUrl(goal);
 
-    const inventoryUrl = buildGameUrl({
-      screen: "relic_system",
-      mode: "inventory"
-    });
+	  const inventoryUrl = buildGameUrl({
+		screen: "relic_system",
+		mode: "inventory"
+	  });
 
-    const overviewUrl = buildGameUrl({
-      screen: "relic_system",
-      mode: "overview"
-    });
+	  const overviewUrl = buildGameUrl({
+		screen: "relic_system",
+		mode: "overview"
+	  });
 
-    setStatus("Loading production, inventory and overview data...", "warn");
+	  if (goal === "offense") {
+		setStatus("Loading village coordinates, inventory and overview data...", "warn");
+	  } else {
+		setStatus("Loading production, inventory and overview data...", "warn");
+	  }
 
-    const responses = await Promise.all([
-      fetchHtml(prodUrl),
-      fetchHtml(inventoryUrl),
-      fetchHtml(overviewUrl)
-    ]);
+	  const responses = await Promise.all([
+		fetchHtml(villageUrl),
+		fetchHtml(inventoryUrl),
+		fetchHtml(overviewUrl)
+	  ]);
 
-    state.villages = extractVillagesFromProductionHtml(responses[0]);
-    rebuildVillageIndexes();
+	  state.villages = extractVillagesFromProductionHtml(responses[0]);
+	  rebuildVillageIndexes();
 
-    state.inventoryRelics = extractInventoryRelicsFromHtml(responses[1]);
-    state.placedRelics = extractPlacedRelicsFromOverviewHtml(responses[2]);
+	  state.inventoryRelics = extractInventoryRelicsFromHtml(responses[1]);
+	  state.placedRelics = extractPlacedRelicsFromOverviewHtml(responses[2]);
 
-    console.log(SCRIPT_NAME + " villages:", state.villages);
-    console.log(SCRIPT_NAME + " inventory relics:", state.inventoryRelics);
-    console.log(SCRIPT_NAME + " placed relics:", state.placedRelics);
+	  console.log(SCRIPT_NAME + " villages:", state.villages);
+	  console.log(SCRIPT_NAME + " inventory relics:", state.inventoryRelics);
+	  console.log(SCRIPT_NAME + " placed relics:", state.placedRelics);
 
-    return {
-      prodUrl: prodUrl,
-      inventoryUrl: inventoryUrl,
-      overviewUrl: overviewUrl
-    };
-  }
+	  return {
+		villageUrl: villageUrl,
+		inventoryUrl: inventoryUrl,
+		overviewUrl: overviewUrl
+	  };
+	}
 
   async function loadAndOptimize() {
     try {
       ui.loadButton.disabled = true;
 
-      const urls = await loadAllData();
-
       const goal = ui.goalSelect.value;
-      const mode = ui.modeSelect.value;
-      const weighting = ui.weightSelect.value;
+			const mode = ui.modeSelect.value;
+			const weighting = ui.weightSelect.value;
+
+			const urls = await loadAllData(goal);
       const maxPlacements = Math.max(1, Math.min(50, parseInt(ui.countInput.value, 10) || 10));
 
       state.plan = optimizePlan(goal, mode, weighting, maxPlacements);
@@ -961,10 +999,16 @@
   }
 
   function formatStatList(stats) {
-    return (stats || [])
-      .map(stat => stat.label + " +" + stat.value + "%")
-      .join(", ");
-  }
+	  return (stats || [])
+		.map(stat => {
+		  if (/%/.test(stat.label)) {
+			return stat.label;
+		  }
+
+		  return stat.label + " +" + stat.value + "%";
+		})
+		.join(", ");
+	}
 
   function formatScore(value) {
     return Number(value || 0).toFixed(2);
@@ -1066,13 +1110,14 @@
       item.covered.forEach(village => {
         const line = document.createElement("div");
         line.textContent =
-          village.coord +
-          " - " +
-          village.name +
-          " | Farm " +
-          village.farmUsed +
-          "/" +
-          village.farmMax;
+				village.coord +
+				" - " +
+				village.name +
+				(
+					village.farmMax
+						? " | Farm " + village.farmUsed + "/" + village.farmMax + " | Free " + village.farmFree
+						: ""
+				);
         coveredList.appendChild(line);
       });
 
@@ -1481,7 +1526,7 @@
     const help = document.createElement("div");
     help.className = "twrp-help";
     help.textContent =
-      "Loads village production data, relic inventory and current relic overview after a manual click, then suggests placements by marginal value after the 20% benefit cap.";
+			"Loads village coordinates or production data depending on goal, plus relic inventory and current relic overview after a manual click. Recruitment uses free farm by default. Offense uses equal village weighting by default.";
 
     const grid = document.createElement("div");
     grid.className = "twrp-grid";
@@ -1547,6 +1592,18 @@
       option.textContent = optionData.text;
       weightSelect.appendChild(option);
     });
+		
+		weightSelect.value = "freeFarm";
+
+		goalSelect.addEventListener("change", function () {
+			if (goalSelect.value === "recruitment") {
+				weightSelect.value = "freeFarm";
+			}
+
+			if (goalSelect.value === "offense") {
+				weightSelect.value = "equal";
+			}
+		});
 
     weightWrap.appendChild(weightLabel);
     weightWrap.appendChild(weightSelect);
