@@ -46,7 +46,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.0";
+  const SCRIPT_VERSION = "1.7.1";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
 
@@ -1052,6 +1052,59 @@
       prioritizeNoTemplateDonors: useAmTemplates,
       prioritizeLowPoints: prioritizeLowPoints
     };
+  }
+
+  async function loadAndPlan() {
+    try {
+      ui.planButton.disabled = true;
+      ui.copyButton.disabled = true;
+      if (ui.results) ui.results.innerHTML = "";
+
+      const settings = getSettings();
+      state.lastSettings = settings;
+      state.sendLocked = false;
+
+      setStatus(
+        settings.useAmTemplates
+          ? "Loading production, buildings, Account Manager and incoming transport data..."
+          : "Loading production, buildings and incoming transport data...",
+        "warn"
+      );
+
+      const emptyAmData = {
+        templatesByCoord: new Map(),
+        templateDefsByName: new Map()
+      };
+
+      const results = await Promise.all([
+        loadProductionData(),
+        loadBuildingsData(),
+        loadIncomingData(),
+        settings.useAmTemplates ? loadAccountManagerData() : Promise.resolve(emptyAmData),
+        settings.useAmTemplates ? loadBuildingConstants() : Promise.resolve(new Map())
+      ]);
+
+      mergeLoadedData(results[0], results[1], results[2], results[3], results[4], settings);
+
+      const planResult = createTransferPlan(settings);
+      state.plan = planResult.targetPlans;
+      state.stats = planResult.stats;
+
+      renderResults(planResult);
+      ui.copyButton.disabled = !state.plan.length;
+
+      setStatus(
+        "Loaded " + state.villages.length + " village(s). Planned " +
+          planResult.targetPlans.length + " target send(s) from " +
+          planResult.launches.length + " origin transfer(s).",
+        "success"
+      );
+    } catch (err) {
+      console.error(SCRIPT_NAME + " failed:", err);
+      setStatus(err && err.message ? err.message : String(err), "error");
+    } finally {
+      if (ui.planButton) ui.planButton.disabled = false;
+    }
   }
 
   function createTransferPlan(settings) {
