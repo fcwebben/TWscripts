@@ -865,34 +865,59 @@
     const details = [];
     const template = village.amTemplate;
 
+    const horizonSeconds = Math.max(0, settings.constructionHours * 3600);
+    let queueSeconds = village.queueEndSeconds || 0;
+
+    function horizonReached() {
+      return horizonSeconds <= 0 || queueSeconds >= horizonSeconds;
+    }
+
+    function currentHqLevel() {
+      return Math.max(1, levels.main || 1);
+    }
+
     if (!template || !template.buildings || !template.buildings.length) {
       return {
         resources: need,
         details: details,
-        simulatedQueueHours: village.queueEndSeconds / 3600
+        simulatedQueueHours: queueSeconds / 3600
       };
     }
 
     const levels = Object.assign({}, village.buildingLevels || {});
-    const horizonSeconds = settings.constructionHours * 3600;
-    let queueSeconds = village.queueEndSeconds || 0;
-    const hqLevel = levels.main || 1;
+
+    if (horizonReached()) {
+      return {
+        resources: need,
+        details: details,
+        simulatedQueueHours: queueSeconds / 3600
+      };
+    }
 
     if (levels.farm < 30 && village.farmRatio >= (template.farmCapacityPercent || 99) / 100) {
       const constants = state.buildingConstants.get("farm");
       const nextLevel = (levels.farm || 0) + 1;
-      const cost = calculateBuildingCostTime(hqLevel, nextLevel, constants);
+      const cost = calculateBuildingCostTime(currentHqLevel(), nextLevel, constants);
 
       addResources(need, cost);
       details.push({
         building: "farm",
         level: nextLevel,
         reason: "farm capacity",
-        resources: cloneResources(cost)
+        resources: cloneResources(cost),
+        seconds: cost.seconds
       });
 
       levels.farm = nextLevel;
       queueSeconds += cost.seconds;
+
+      if (horizonReached()) {
+        return {
+          resources: need,
+          details: details,
+          simulatedQueueHours: queueSeconds / 3600
+        };
+      }
     }
 
     for (let i = 0; i < template.buildings.length; i++) {
@@ -904,21 +929,30 @@
       if (!constants) continue;
 
       while ((levels[building] || 0) < targetLevel) {
+        if (horizonReached()) {
+          return {
+            resources: need,
+            details: details,
+            simulatedQueueHours: queueSeconds / 3600
+          };
+        }
+
         const nextLevel = (levels[building] || 0) + 1;
-        const cost = calculateBuildingCostTime(hqLevel, nextLevel, constants);
+        const cost = calculateBuildingCostTime(currentHqLevel(), nextLevel, constants);
 
         addResources(need, cost);
         details.push({
           building: building,
           level: nextLevel,
           reason: "template",
-          resources: cloneResources(cost)
+          resources: cloneResources(cost),
+          seconds: cost.seconds
         });
 
         levels[building] = nextLevel;
         queueSeconds += cost.seconds;
 
-        if (queueSeconds >= horizonSeconds) {
+        if (horizonReached()) {
           return {
             resources: need,
             details: details,
