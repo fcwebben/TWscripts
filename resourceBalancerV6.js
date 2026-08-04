@@ -46,7 +46,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.5.0";
+  const SCRIPT_VERSION = "1.7.0";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
 
@@ -64,7 +64,15 @@
     emptyQueueBoost: 80,
     lowPointsBoost: 35,
     prioritizeLowPoints: true,
-    sendDelayMs: 900
+    sendDelayMs: 900,
+    donorPreference: "smart_balanced",
+    donorDistancePenalty: 2.25,
+    noTemplateDonorBonus: 75,
+    farmBlockedDonorBonus: 120,
+    idleDonorBonus: 35,
+    deadVillageDonorBonus: 150,
+    scoreDistanceTieThreshold: 18,
+    donorAuditLimit: 20
   };
 
   const BUILDING_NAMES = {
@@ -1031,63 +1039,19 @@
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
-      donorPreference: "distance_optimized",
+      donorPreference: DEFAULTS.donorPreference,
+      donorDistancePenalty: DEFAULTS.donorDistancePenalty,
+      noTemplateDonorBonus: DEFAULTS.noTemplateDonorBonus,
+      farmBlockedDonorBonus: DEFAULTS.farmBlockedDonorBonus,
+      idleDonorBonus: DEFAULTS.idleDonorBonus,
+      deadVillageDonorBonus: DEFAULTS.deadVillageDonorBonus,
+      scoreDistanceTieThreshold: DEFAULTS.scoreDistanceTieThreshold,
+      donorAuditLimit: DEFAULTS.donorAuditLimit,
       protectDonorConstruction: useAmTemplates,
       includeAverageBalance: false,
       prioritizeNoTemplateDonors: useAmTemplates,
       prioritizeLowPoints: prioritizeLowPoints
     };
-  }
-
-  async function loadAndPlan() {
-    try {
-      ui.planButton.disabled = true;
-      ui.copyButton.disabled = true;
-
-      const settings = getSettings();
-      state.lastSettings = settings;
-
-      setStatus(
-        settings.useAmTemplates
-          ? "Loading production, buildings, Account Manager and incoming transport data..."
-          : "Loading production, buildings and incoming transport data...",
-        "warn"
-      );
-
-      const emptyAmData = {
-        templatesByCoord: new Map(),
-        templateDefsByName: new Map()
-      };
-
-      const results = await Promise.all([
-        loadProductionData(),
-        loadBuildingsData(),
-        loadIncomingData(),
-        settings.useAmTemplates ? loadAccountManagerData() : Promise.resolve(emptyAmData),
-        settings.useAmTemplates ? loadBuildingConstants() : Promise.resolve(new Map())
-      ]);
-
-      mergeLoadedData(results[0], results[1], results[2], results[3], results[4], settings);
-
-      const planResult = createTransferPlan(settings);
-      state.plan = planResult.targetPlans;
-      state.stats = planResult.stats;
-
-      renderResults(planResult);
-      ui.copyButton.disabled = !state.plan.length;
-
-      setStatus(
-        "Loaded " + state.villages.length + " village(s). Planned " +
-          planResult.targetPlans.length + " target send(s) from " +
-          planResult.launches.length + " origin transfer(s).",
-        "success"
-      );
-    } catch (err) {
-      console.error(SCRIPT_NAME + " failed:", err);
-      setStatus(err.message || String(err), "error");
-    } finally {
-      ui.planButton.disabled = false;
-    }
   }
 
   function createTransferPlan(settings) {
@@ -1097,12 +1061,14 @@
     const donors = buildDonors(villages, stats, settings);
     const launches = matchDonorsToTargets(targets, donors, settings);
     const targetPlans = groupLaunchesByTarget(launches);
+    const donorAudit = buildDonorAudit(donors, targets, launches, settings);
 
     return {
       launches: launches,
       targetPlans: targetPlans,
       targets: targets,
       donors: donors,
+      donorAudit: donorAudit,
       stats: stats
     };
   }
@@ -1342,47 +1308,62 @@
       const hasTemplate = Boolean(village.amTemplateName);
       const queueEmpty = (village.queueCount || 0) === 0 && (village.queueEndSeconds || 0) === 0;
       const farmBlocked = isFarmBlockedDonor(village, settings);
+      const deadVillage = farmBlocked && !hasTemplate;
+      const idleDonor = !hasTemplate || queueEmpty;
 
       let baseScore = totalAvailable / 1000;
-      baseScore += merchantsAvailable * 1.5;
+      baseScore += merchantsAvailable * 1.15;
 
       if (settings.prioritizeNoTemplateDonors && !hasTemplate) {
-        baseScore += 30;
+        baseScore += settings.noTemplateDonorBonus;
       }
 
       if (farmBlocked) {
-        baseScore += 18;
+        baseScore += settings.farmBlockedDonorBonus;
       }
 
-      if (!hasTemplate || queueEmpty) {
-        baseScore += 10;
+      if (idleDonor) {
+        baseScore += settings.idleDonorBonus;
+      }
+
+      if (deadVillage) {
+        baseScore += settings.deadVillageDonorBonus;
       }
 
       return {
         village: village,
         available: available,
+        initialAvailable: cloneResources(available),
         protected: protect,
         totalAvailable: totalAvailable,
+        initialTotalAvailable: totalAvailable,
         merchantsAvailable: merchantsAvailable,
+        initialMerchantsAvailable: merchantsAvailable,
+        usedTotal: 0,
+        usedTransfers: 0,
         baseScore: baseScore,
         hasTemplate: hasTemplate,
         queueEmpty: queueEmpty,
         farmBlocked: farmBlocked,
-        reason: buildDonorReason(village, totalAvailable, merchantsAvailable, hasTemplate, farmBlocked, settings)
+        deadVillage: deadVillage,
+        idleDonor: idleDonor,
+        reason: buildDonorReason(village, totalAvailable, merchantsAvailable, hasTemplate, farmBlocked, deadVillage, settings)
       };
     })
       .filter(donor => donor.totalAvailable >= settings.minShipment && donor.merchantsAvailable > 0)
       .sort((a, b) => b.baseScore - a.baseScore);
   }
 
-  function buildDonorReason(village, totalAvailable, merchantsAvailable, hasTemplate, farmBlocked, settings) {
+  function buildDonorReason(village, totalAvailable, merchantsAvailable, hasTemplate, farmBlocked, deadVillage, settings) {
     const reasons = [];
 
     reasons.push("available " + formatNumber(totalAvailable));
     reasons.push(merchantsAvailable + " merchant(s)");
     reasons.push("reserve " + settings.reserveWarehousePercent + "% WH");
 
-    if (farmBlocked) {
+    if (deadVillage) {
+      reasons.push("farm capped + no AM template");
+    } else if (farmBlocked) {
       reasons.push("farm capped / low free farm");
     }
 
@@ -1426,23 +1407,7 @@
               score: getDonorMatchScore(donor, target, distance, settings)
             };
           })
-          .sort((a, b) => {
-            if (settings.donorPreference === "distance_optimized") {
-              if (a.distance !== b.distance) return a.distance - b.distance;
-              if (b.donor.totalAvailable !== a.donor.totalAvailable) return b.donor.totalAvailable - a.donor.totalAvailable;
-              return b.score - a.score;
-            }
-
-            if (settings.donorPreference === "closest") {
-              return a.distance - b.distance;
-            }
-
-            if (settings.donorPreference === "highest_surplus") {
-              return b.donor.totalAvailable - a.donor.totalAvailable;
-            }
-
-            return b.score - a.score;
-          });
+          .sort((a, b) => sortDonorMatches(a, b, settings));
 
         if (!usableDonors.length) break;
 
@@ -1462,6 +1427,8 @@
           totalResources(donor.available),
           donor.merchantsAvailable * settings.merchantCapacity
         );
+        donor.usedTotal += totalResources(shipment.resources);
+        donor.usedTransfers += 1;
 
         launches.push({
           id: launchId++,
@@ -1514,17 +1481,117 @@
     return Array.from(map.values()).sort((a, b) => b.total - a.total);
   }
 
+  function buildDonorAudit(donors, targets, launches, settings) {
+    const usedByCoord = new Map();
+
+    launches.forEach(launch => {
+      const coord = launch.origin.coord;
+      const current = usedByCoord.get(coord) || {
+        total: 0,
+        transfers: 0,
+        nearestDistance: 9999
+      };
+
+      current.total += launch.total;
+      current.transfers += 1;
+      current.nearestDistance = Math.min(current.nearestDistance, launch.distance);
+      usedByCoord.set(coord, current);
+    });
+
+    const activeTargets = targets.filter(target => totalResources(target.need) >= settings.minShipment);
+
+    return donors
+      .slice()
+      .sort((a, b) => b.baseScore - a.baseScore)
+      .slice(0, settings.donorAuditLimit)
+      .map(donor => {
+        const used = usedByCoord.get(donor.village.coord);
+        const nearestTargetDistance = activeTargets.length
+          ? Math.min.apply(null, activeTargets.map(target => getDistance(donor.village.coord, target.village.coord)))
+          : 0;
+
+        return {
+          village: donor.village,
+          available: donor.initialAvailable || donor.available,
+          protected: donor.protected || emptyResources(),
+          merchants: donor.initialMerchantsAvailable || donor.merchantsAvailable,
+          score: donor.baseScore,
+          usedTotal: used ? used.total : 0,
+          usedTransfers: used ? used.transfers : 0,
+          nearestTargetDistance: nearestTargetDistance === 9999 ? 0 : nearestTargetDistance,
+          status: getDonorAuditStatus(donor, activeTargets, used, nearestTargetDistance, settings),
+          reason: donor.reason
+        };
+      });
+  }
+
+  function getDonorAuditStatus(donor, activeTargets, used, nearestTargetDistance, settings) {
+    if (used && used.total > 0) {
+      return "Used: " + formatNumber(used.total) + " in " + used.transfers + " send(s)";
+    }
+
+    if (donor.initialTotalAvailable < settings.minShipment || donor.initialMerchantsAvailable <= 0) {
+      return "Not used: protected by reserve or no merchants";
+    }
+
+    if (!activeTargets.length) {
+      return "Not used: no matching target need";
+    }
+
+    if (settings.maxDistance > 0 && nearestTargetDistance > settings.maxDistance) {
+      return "Not used: excluded by max distance";
+    }
+
+    return "Not used: needs filled by higher-score / nearer donors";
+  }
+
+  function sortDonorMatches(a, b, settings) {
+    if (settings.donorPreference === "smart_balanced") {
+      const scoreDiff = b.score - a.score;
+
+      if (Math.abs(scoreDiff) > settings.scoreDistanceTieThreshold) {
+        return scoreDiff;
+      }
+
+      if (a.distance !== b.distance) {
+        return a.distance - b.distance;
+      }
+
+      return scoreDiff;
+    }
+
+    if (settings.donorPreference === "distance_optimized") {
+      if (a.distance !== b.distance) return a.distance - b.distance;
+      if (b.donor.totalAvailable !== a.donor.totalAvailable) return b.donor.totalAvailable - a.donor.totalAvailable;
+      return b.score - a.score;
+    }
+
+    if (settings.donorPreference === "closest") {
+      return a.distance - b.distance;
+    }
+
+    if (settings.donorPreference === "highest_surplus") {
+      return b.donor.totalAvailable - a.donor.totalAvailable;
+    }
+
+    return b.score - a.score;
+  }
+
   function getDonorMatchScore(donor, target, distance, settings) {
     let score = donor.baseScore;
 
-    score -= distance * 5;
+    score -= distance * settings.donorDistancePenalty;
 
     if (settings.prioritizeNoTemplateDonors && !donor.hasTemplate) {
-      score += 25;
+      score += Math.round(settings.noTemplateDonorBonus * 0.45);
     }
 
     if (donor.farmBlocked) {
-      score += 12;
+      score += Math.round(settings.farmBlockedDonorBonus * 0.45);
+    }
+
+    if (donor.deadVillage) {
+      score += Math.round(settings.deadVillageDonorBonus * 0.45);
     }
 
     if (target.queueEmpty && donor.village.points > target.village.points) {
@@ -1682,6 +1749,10 @@
     }
   }
 
+  function createSummaryCard(label, value) {
+    return "<div class=\"twrp-card\"><span>" + escapeHtml(label) + "</span><strong>" + escapeHtml(value) + "</strong></div>";
+  }
+
   function renderResults(planResult) {
     ui.results.innerHTML = "";
     state.sendLocked = false;
@@ -1689,24 +1760,23 @@
     const settings = state.lastSettings || getSettings();
 
     const summary = document.createElement("div");
-    summary.className = "twrp-summary";
+    summary.className = "twrp-card-row";
     summary.innerHTML =
-      "<strong>Plan summary</strong><br>" +
-      "Villages: " + state.villages.length + "<br>" +
-      "Target sends: " + planResult.targetPlans.length + "<br>" +
-      "Origin transfers: " + planResult.launches.length + "<br>" +
-      "Targets considered: " + planResult.targets.length + "<br>" +
-      "Donors considered: " + planResult.donors.length + "<br>" +
-      "Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance") + "<br>" +
-      "Origin reserve: " + escapeHtml(settings.reserveWarehousePercent) + "% of warehouse" +
-      (settings.useAmTemplates ? "<br>Construction horizon: " + escapeHtml(settings.constructionHours) + "h" : "");
+      createSummaryCard("Villages", state.villages.length) +
+      createSummaryCard("Target sends", planResult.targetPlans.length) +
+      createSummaryCard("Origin transfers", planResult.launches.length) +
+      createSummaryCard("Donors checked", planResult.donors.length) +
+      createSummaryCard("Mode", settings.useAmTemplates ? "AM" : "WH %") +
+      createSummaryCard("Reserve", escapeHtml(settings.reserveWarehousePercent) + "%");
 
     ui.results.appendChild(summary);
 
     if (!planResult.targetPlans.length) {
       const empty = document.createElement("div");
-      empty.className = "twrp-status twrp-status-warn";
-      empty.textContent = "No useful transfers found. Try increasing build coverage, lowering reserve %, or increasing max distance.";
+      empty.className = "twrp-empty";
+      empty.innerHTML =
+        "<strong>No useful transfers found.</strong><br>" +
+        "Try increasing build coverage, lowering origin reserve, or increasing max distance.";
       ui.results.appendChild(empty);
       renderDiagnostics(planResult);
       return;
@@ -1719,19 +1789,19 @@
   function renderTargetTable(targetPlans) {
     const title = document.createElement("div");
     title.className = "twrp-section-title";
-    title.textContent = "Recommended target sends";
+    title.textContent = "Recommended sends";
     ui.results.appendChild(title);
 
     const tableWrap = document.createElement("div");
     tableWrap.className = "twrp-table-wrap";
 
     const table = document.createElement("table");
-    table.className = "twrp-table";
+    table.className = "twrp-table twrp-main-table";
 
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
 
-    ["#", "Target", "Total resources", "Origins", "Merchants", "Max dist", "Why", "Action"].forEach(label => {
+    ["#", "Target", "Resources", "Origins", "Merch", "Dist", "Action"].forEach(label => {
       const th = document.createElement("th");
       th.textContent = label;
       headRow.appendChild(th);
@@ -1746,29 +1816,27 @@
       const row = document.createElement("tr");
 
       appendCell(row, String(targetPlan.id));
-      appendCell(row, targetPlan.target.name, "twrp-left");
-      appendCell(row, formatResources(targetPlan.resources), "twrp-left");
+      appendCell(row, targetPlan.target.name, "twrp-left twrp-target-name");
+      appendCell(row, formatResources(targetPlan.resources), "twrp-left twrp-resource-cell");
 
       const originsCell = document.createElement("td");
       originsCell.className = "twrp-left";
 
       const details = document.createElement("details");
       const summary = document.createElement("summary");
-      summary.textContent = targetPlan.launches.length + " origin village(s)";
+      summary.textContent = targetPlan.launches.length + " origin(s)";
       details.appendChild(summary);
 
       const originList = document.createElement("div");
-      originList.className = "twrp-covered-list";
+      originList.className = "twrp-origin-list";
 
       targetPlan.launches.forEach(launch => {
         const line = document.createElement("div");
-        line.textContent =
-          launch.origin.name +
-          " | " +
-          formatResources(launch.resources) +
-          " | " +
-          launch.distance.toFixed(1) +
-          " fields";
+        line.className = "twrp-origin-line";
+        line.innerHTML =
+          "<strong>" + escapeHtml(launch.origin.name) + "</strong><br>" +
+          "<span>" + escapeHtml(formatResources(launch.resources)) + " | " +
+          escapeHtml(launch.distance.toFixed(1)) + " fields</span>";
         originList.appendChild(line);
       });
 
@@ -1779,16 +1847,12 @@
       appendCell(row, String(targetPlan.merchantsUsed));
       appendCell(row, targetPlan.maxDistance.toFixed(1));
 
-      const reasonCell = document.createElement("td");
-      reasonCell.className = "twrp-left twrp-small";
-      reasonCell.textContent = targetPlan.targetReason;
-      row.appendChild(reasonCell);
-
       const actionCell = document.createElement("td");
       const button = document.createElement("button");
       button.type = "button";
       button.className = "btn twrp-send-button";
       button.textContent = "Send";
+      button.title = targetPlan.targetReason;
       button.addEventListener("click", function () {
         sendTargetPlan(targetPlan, button);
       });
@@ -1806,8 +1870,8 @@
     focusFirstSendButton();
 
     const note = document.createElement("div");
-    note.className = "twrp-small";
-    note.textContent = "Each Send button sends the grouped request for one target village. The first Send button is focused automatically; holding Enter will continue sending the next visible target row, with a short delay after each successful send.";
+    note.className = "twrp-send-note";
+    note.textContent = "One Send button per target. Hold Enter to continue through the list; there is a short delay after each successful send.";
     ui.results.appendChild(note);
   }
 
@@ -1816,20 +1880,19 @@
     details.className = "twrp-details";
 
     const summary = document.createElement("summary");
-    summary.textContent = "Diagnostics: top targets and donors";
+    summary.textContent = "Audit";
     details.appendChild(summary);
 
     const targetTitle = document.createElement("div");
     targetTitle.className = "twrp-section-title";
-    targetTitle.textContent = "Top target villages";
+    targetTitle.textContent = "Top targets";
     details.appendChild(targetTitle);
 
     details.appendChild(createMiniTable(
-      ["Village", "Need", "Score", "Queue", "Reason"],
-      planResult.targets.slice(0, 20).map(target => [
+      ["Village", "Need", "Queue", "Reason"],
+      planResult.targets.slice(0, 12).map(target => [
         target.village.name,
         formatResources(target.need),
-        target.score.toFixed(1),
         target.queueHours.toFixed(1) + "h",
         target.reason
       ])
@@ -1837,18 +1900,18 @@
 
     const donorTitle = document.createElement("div");
     donorTitle.className = "twrp-section-title";
-    donorTitle.textContent = "Top donor villages";
+    donorTitle.textContent = "Top donors / why used or skipped";
     details.appendChild(donorTitle);
 
     details.appendChild(createMiniTable(
-      ["Village", "Available", "Protected", "Merchants", "Score", "Reason"],
-      planResult.donors.slice(0, 20).map(donor => [
+      ["Village", "Available", "Protected", "Merch", "Score", "Status"],
+      (planResult.donorAudit || []).map(donor => [
         donor.village.name,
         formatResources(donor.available),
         formatResources(donor.protected || emptyResources()),
-        String(donor.merchantsAvailable),
-        donor.baseScore.toFixed(1),
-        donor.reason
+        String(donor.merchants),
+        donor.score.toFixed(1),
+        donor.status
       ])
     ));
 
@@ -1998,17 +2061,17 @@
     style.textContent = `
       #${BOX_ID} {
         position: fixed;
-        top: 90px;
-        right: 35px;
-        width: 1080px;
+        top: 72px;
+        right: 28px;
+        width: 980px;
         max-width: 96vw;
-        max-height: 86vh;
+        max-height: 88vh;
         z-index: 999999;
-        border: 2px solid #7d510f;
-        border-radius: 6px;
-        background: #f4e4bc;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-        color: #2f1b00;
+        border: 1px solid #8f6a2f;
+        border-radius: 10px;
+        background: #f7ead0;
+        box-shadow: 0 16px 40px rgba(0,0,0,0.38);
+        color: #2e2112;
         font-family: Verdana, Arial, sans-serif;
         font-size: 12px;
         overflow: hidden;
@@ -2022,91 +2085,145 @@
         display: flex;
         justify-content: space-between;
         align-items: center;
-        padding: 9px 11px;
-        background: #cfa95e;
-        border-bottom: 1px solid #7d510f;
+        padding: 11px 13px;
+        background: linear-gradient(180deg, #d8b776, #bd8f43);
+        border-bottom: 1px solid #8f6a2f;
         cursor: move;
       }
 
       .twrp-title {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
         font-weight: bold;
         font-size: 15px;
       }
 
+      .twrp-subtitle {
+        font-size: 11px;
+        font-weight: normal;
+        opacity: 0.82;
+      }
+
       .twrp-close {
-        width: 20px;
-        height: 20px;
+        width: 24px;
+        height: 24px;
         border: 1px solid #7d510f;
-        background: #f4e4bc;
+        background: #fff4d5;
         color: #2f1b00;
-        border-radius: 3px;
+        border-radius: 5px;
         cursor: pointer;
         font-weight: bold;
       }
 
       .twrp-body {
-        padding: 10px;
-        max-height: calc(86vh - 42px);
+        padding: 12px;
+        max-height: calc(88vh - 48px);
         overflow-y: auto;
       }
 
-      .twrp-help {
-        line-height: 1.35;
-        margin-bottom: 8px;
+      .twrp-quick-help {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 10px;
+      }
+
+      .twrp-pill {
+        padding: 5px 8px;
+        background: #fff7e5;
+        border: 1px solid #d0ad6a;
+        border-radius: 999px;
+        color: #4b3318;
+        white-space: nowrap;
+      }
+
+      .twrp-panel {
+        background: #fff7e5;
+        border: 1px solid #d0ad6a;
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 10px;
       }
 
       .twrp-grid {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(6, minmax(0, 1fr));
         gap: 8px;
-        margin-bottom: 8px;
+        align-items: end;
       }
 
       .twrp-label {
         display: block;
         font-weight: bold;
         margin-bottom: 4px;
+        color: #3b2a18;
+      }
+
+      .twrp-hint {
+        font-size: 10px;
+        opacity: 0.72;
+        margin-top: 3px;
+        min-height: 13px;
       }
 
       .twrp-select,
       .twrp-input {
         width: 100%;
-        padding: 5px;
-        border: 1px solid #7d510f;
-        border-radius: 4px;
-        background: #fffaf0;
+        padding: 6px;
+        border: 1px solid #b99351;
+        border-radius: 5px;
+        background: #fffdf7;
         color: #2f1b00;
+        outline: none;
+      }
+
+      .twrp-select:focus,
+      .twrp-input:focus {
+        border-color: #7d510f;
+        box-shadow: 0 0 0 2px rgba(125,81,15,0.16);
       }
 
       .twrp-check-row {
         display: flex;
         gap: 6px;
         align-items: center;
-        min-height: 27px;
+        min-height: 30px;
+        padding: 6px;
+        border: 1px solid #b99351;
+        border-radius: 5px;
+        background: #fffdf7;
       }
 
       .twrp-buttons {
         display: flex;
         flex-wrap: wrap;
-        gap: 6px;
-        margin: 8px 0;
+        gap: 8px;
+        margin-top: 10px;
       }
 
       .twrp-buttons .btn,
       .twrp-table .btn {
         cursor: pointer;
+        border-radius: 5px;
+      }
+
+      .twrp-primary {
+        font-weight: bold;
       }
 
       .twrp-status {
-        padding: 6px;
-        margin: 8px 0;
-        border: 1px solid #bd9c5a;
-        background: #fff4d5;
-        border-radius: 4px;
+        padding: 8px;
+        margin: 9px 0;
+        border: 1px solid #d0ad6a;
+        background: #fff7e5;
+        border-radius: 7px;
+        line-height: 1.35;
       }
 
       .twrp-status-success {
         background: #dff0d8;
+        border-color: #9bc18e;
       }
 
       .twrp-status-warn {
@@ -2115,64 +2232,138 @@
 
       .twrp-status-error {
         background: #f2dede;
+        border-color: #c99a9a;
       }
 
-      .twrp-summary {
-        padding: 7px;
-        margin: 8px 0;
+      .twrp-card-row {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 8px;
+        margin: 10px 0;
+      }
+
+      .twrp-card {
+        background: #fff7e5;
+        border: 1px solid #d0ad6a;
+        border-radius: 8px;
+        padding: 9px;
+        min-height: 55px;
+      }
+
+      .twrp-card span {
+        display: block;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        opacity: 0.7;
+        margin-bottom: 5px;
+      }
+
+      .twrp-card strong {
+        display: block;
+        font-size: 16px;
+        line-height: 1.2;
+      }
+
+      .twrp-empty {
+        padding: 12px;
         background: #fff4d5;
-        border: 1px solid #bd9c5a;
-        border-radius: 4px;
+        border: 1px solid #d0ad6a;
+        border-radius: 8px;
         line-height: 1.45;
       }
 
       .twrp-section-title {
         margin-top: 12px;
-        margin-bottom: 5px;
+        margin-bottom: 6px;
         font-weight: bold;
         font-size: 13px;
       }
 
       .twrp-table-wrap {
-        max-height: 430px;
+        max-height: 420px;
         overflow: auto;
-        border: 1px solid #bd9c5a;
+        border: 1px solid #d0ad6a;
+        border-radius: 8px;
+        background: #fff7e5;
       }
 
       .twrp-mini-wrap {
-        max-height: 250px;
+        max-height: 230px;
         margin-bottom: 8px;
       }
 
       .twrp-table {
-        border-collapse: collapse;
+        border-collapse: separate;
+        border-spacing: 0;
         width: 100%;
       }
 
       .twrp-table th {
-        background: #cfa95e;
-        border: 1px solid #bd9c5a;
-        padding: 5px;
+        background: #d4ad69;
+        border-bottom: 1px solid #b99351;
+        border-right: 1px solid #b99351;
+        padding: 7px 6px;
         text-align: center;
         position: sticky;
         top: 0;
         z-index: 1;
+        white-space: nowrap;
       }
 
       .twrp-table td {
-        border: 1px solid #bd9c5a;
-        padding: 5px;
+        border-bottom: 1px solid #e1c999;
+        border-right: 1px solid #ead8b3;
+        padding: 7px 6px;
         text-align: center;
-        background: #fff5da;
+        background: #fffaf0;
         vertical-align: top;
       }
 
       .twrp-table tr:nth-child(even) td {
-        background: #f0e2be;
+        background: #f4e8cf;
+      }
+
+      .twrp-main-table th:nth-child(2),
+      .twrp-main-table td:nth-child(2) {
+        min-width: 230px;
+      }
+
+      .twrp-main-table th:nth-child(3),
+      .twrp-main-table td:nth-child(3) {
+        min-width: 150px;
       }
 
       .twrp-left {
         text-align: left !important;
+      }
+
+      .twrp-target-name {
+        font-weight: bold;
+      }
+
+      .twrp-resource-cell {
+        font-family: monospace;
+        font-size: 12px;
+      }
+
+      .twrp-origin-list {
+        margin-top: 5px;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+
+      .twrp-origin-line {
+        padding: 5px;
+        background: rgba(255,255,255,0.55);
+        border: 1px solid #ead8b3;
+        border-radius: 5px;
+      }
+
+      .twrp-origin-line span {
+        font-size: 11px;
+        opacity: 0.85;
       }
 
       .twrp-small {
@@ -2183,6 +2374,25 @@
 
       .twrp-details {
         margin-top: 10px;
+        background: #fff7e5;
+        border: 1px solid #d0ad6a;
+        border-radius: 8px;
+        padding: 8px;
+      }
+
+      .twrp-details > summary {
+        cursor: pointer;
+        font-weight: bold;
+      }
+
+      .twrp-send-note {
+        margin-top: 8px;
+        padding: 7px;
+        background: #fff7e5;
+        border: 1px dashed #d0ad6a;
+        border-radius: 7px;
+        font-size: 11px;
+        line-height: 1.35;
       }
 
       .twrp-footer {
@@ -2191,12 +2401,12 @@
         align-items: center;
         margin-top: 10px;
         padding-top: 8px;
-        border-top: 1px solid #bd9c5a;
+        border-top: 1px solid #d0ad6a;
         font-size: 11px;
-        opacity: 0.8;
+        opacity: 0.78;
       }
 
-      @media (max-width: 900px) {
+      @media (max-width: 980px) {
         #${BOX_ID} {
           top: 50px;
           left: 5px;
@@ -2204,7 +2414,15 @@
           width: auto;
         }
 
-        .twrp-grid {
+        .twrp-grid,
+        .twrp-card-row {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .twrp-grid,
+        .twrp-card-row {
           grid-template-columns: 1fr;
         }
       }
@@ -2259,6 +2477,13 @@
     delete window.twacticsResourcePlanner;
 
     console.log(SCRIPT_NAME + " closed");
+  }
+
+  function addHint(wrap, text) {
+    const hint = document.createElement("div");
+    hint.className = "twrp-hint";
+    hint.textContent = text;
+    wrap.appendChild(hint);
   }
 
   function createInput(labelText, value, type) {
@@ -2354,7 +2579,9 @@
 
     const title = document.createElement("div");
     title.className = "twrp-title";
-    title.textContent = SCRIPT_NAME + " " + SCRIPT_VERSION;
+    title.innerHTML =
+      "<span>" + escapeHtml(SCRIPT_NAME + " " + SCRIPT_VERSION) + "</span>" +
+      "<span class=\"twrp-subtitle\">Resource planning with grouped target sends</span>";
 
     const closeButton = document.createElement("button");
     closeButton.type = "button";
@@ -2368,22 +2595,43 @@
     const body = document.createElement("div");
     body.className = "twrp-body";
 
-    const help = document.createElement("div");
-    help.className = "twrp-help";
-    help.textContent = "Creates a resource plan with one grouped Send button per target village. AM construction mode sends only the calculated construction deficit within the selected build coverage. Warehouse balance mode ignores AM templates and balances resource fill percentage by warehouse size. Origin reserve keeps the selected warehouse percentage at donor villages; farm-30 villages with almost no free farm use a much smaller reserve.";
+    const quickHelp = document.createElement("div");
+    quickHelp.className = "twrp-quick-help";
+    [
+      "One Send per target",
+      "AM construction or WH balance",
+      "Origin reserve protection",
+      "Farm-30 donor boost",
+      "Enter-to-send with delay"
+    ].forEach(text => {
+      const pill = document.createElement("span");
+      pill.className = "twrp-pill";
+      pill.textContent = text;
+      quickHelp.appendChild(pill);
+    });
+
+    const panel = document.createElement("div");
+    panel.className = "twrp-panel";
 
     const grid = document.createElement("div");
-    grid.className = "twrp-grid twrp-grid-simple";
+    grid.className = "twrp-grid";
 
     const planMode = createSelect("Plan mode", [
       { value: "am", text: "AM construction" },
       { value: "warehouse", text: "Warehouse balance" }
     ], DEFAULTS.useAmTemplates ? "am" : "warehouse");
-    const constructionHours = createInput("Build coverage [hours]", DEFAULTS.constructionHours);
+    const constructionHours = createInput("Build coverage", DEFAULTS.constructionHours);
     const reserveMerchants = createInput("Reserve merchants", DEFAULTS.reserveMerchants);
-    const reserveWarehousePercent = createInput("Origin reserve [% WH]", DEFAULTS.reserveWarehousePercent);
-    const maxDistance = createInput("Max distance [0 = any]", DEFAULTS.maxDistance);
-    const prioritizeLowPoints = createCheckbox("Prioritize low-point villages", DEFAULTS.prioritizeLowPoints);
+    const reserveWarehousePercent = createInput("Origin reserve", DEFAULTS.reserveWarehousePercent);
+    const maxDistance = createInput("Max distance", DEFAULTS.maxDistance);
+    const prioritizeLowPoints = createCheckbox("Low-point priority", DEFAULTS.prioritizeLowPoints);
+
+    addHint(planMode.wrap, "AM template or WH %");
+    addHint(constructionHours.wrap, "hours");
+    addHint(reserveMerchants.wrap, "kept home");
+    addHint(reserveWarehousePercent.wrap, "% warehouse");
+    addHint(maxDistance.wrap, "0 = any");
+    addHint(prioritizeLowPoints.wrap, "boost smaller villages");
 
     [
       planMode.wrap,
@@ -2394,9 +2642,12 @@
       prioritizeLowPoints.wrap
     ].forEach(node => grid.appendChild(node));
 
+    panel.appendChild(grid);
+
     function updateModeControls() {
       const amMode = planMode.select.value === "am";
       constructionHours.input.disabled = !amMode;
+      constructionHours.wrap.style.opacity = amMode ? "1" : "0.55";
     }
 
     planMode.select.addEventListener("change", updateModeControls);
@@ -2407,8 +2658,8 @@
 
     const planButton = document.createElement("button");
     planButton.type = "button";
-    planButton.className = "btn";
-    planButton.textContent = "Load data + create plan";
+    planButton.className = "btn twrp-primary";
+    planButton.textContent = "Create plan";
     planButton.addEventListener("click", loadAndPlan);
 
     const copyButton = document.createElement("button");
@@ -2420,10 +2671,11 @@
 
     buttons.appendChild(planButton);
     buttons.appendChild(copyButton);
+    panel.appendChild(buttons);
 
     const status = document.createElement("div");
     status.className = "twrp-status";
-    status.textContent = "Ready. Choose settings and click Load data + create plan.";
+    status.textContent = "Ready. Choose settings and create a plan.";
 
     const results = document.createElement("div");
 
@@ -2431,9 +2683,8 @@
     footer.className = "twrp-footer";
     footer.textContent = "Created by Twactics";
 
-    body.appendChild(help);
-    body.appendChild(grid);
-    body.appendChild(buttons);
+    body.appendChild(quickHelp);
+    body.appendChild(panel);
     body.appendChild(status);
     body.appendChild(results);
     body.appendChild(footer);
