@@ -13,7 +13,7 @@
  * - Reads Account Manager construction template data when available
  * - Reads incoming transport data
  * - Creates a prioritized resource transfer plan after a manual user click
- * - Allows one manual send action per planned transfer row
+ * - Allows one grouped manual send action per target row
  *
  * This script does NOT:
  * - Send attacks, support, or troops
@@ -46,7 +46,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.1.0";
+  const SCRIPT_VERSION = "1.2.0";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
 
@@ -1430,8 +1430,60 @@
     };
   }
 
+  function getFirstEnabledSendButton() {
+    return Array.from(document.querySelectorAll(".twrp-send-button"))
+      .find(button => !button.disabled);
+  }
+
+  function focusFirstSendButton() {
+    const nextButton = getFirstEnabledSendButton();
+
+    if (nextButton) {
+      nextButton.focus();
+      return true;
+    }
+
+    return false;
+  }
+
+  function removeSentTargetRow(button) {
+    const row = button.closest("tr");
+
+    if (row) {
+      row.remove();
+    }
+
+    if (!focusFirstSendButton()) {
+      setStatus("All visible target sends are completed.", "success");
+    }
+  }
+
+  function installHoldEnterSendHandler() {
+    if (state.enterSendHandlerInstalled) return;
+
+    state.enterSendHandlerInstalled = true;
+
+    window.addEventListener("keydown", function (event) {
+      const key = event.key || event.code;
+
+      if (key !== "Enter" && event.which !== 13) {
+        return;
+      }
+
+      const button = getFirstEnabledSendButton();
+
+      if (!button) {
+        return;
+      }
+
+      event.preventDefault();
+      button.click();
+    });
+  }
+
   function sendTargetPlan(targetPlan, button) {
     if (!targetPlan || !targetPlan.target || !targetPlan.launches || !targetPlan.launches.length) return;
+    if (!button || button.disabled) return;
 
     const data = {};
 
@@ -1463,12 +1515,14 @@
           console.log(SCRIPT_NAME + " grouped send response:", response);
           UI.SuccessMessage(response.success || "Resources sent.", 1500);
           button.textContent = "Sent";
+          removeSentTargetRow(button);
         },
         error => {
           console.error(SCRIPT_NAME + " grouped send failed:", error);
           UI.ErrorMessage("Could not send resources.", 2500);
           button.disabled = false;
           button.textContent = "Send";
+          focusFirstSendButton();
         }
       );
     } catch (err) {
@@ -1476,6 +1530,7 @@
       UI.ErrorMessage("Could not send resources.", 2500);
       button.disabled = false;
       button.textContent = "Send";
+      focusFirstSendButton();
     }
   }
 
@@ -1581,7 +1636,7 @@
       const actionCell = document.createElement("td");
       const button = document.createElement("button");
       button.type = "button";
-      button.className = "btn";
+      button.className = "btn twrp-send-button";
       button.textContent = "Send";
       button.addEventListener("click", function () {
         sendTargetPlan(targetPlan, button);
@@ -1596,9 +1651,12 @@
     tableWrap.appendChild(table);
     ui.results.appendChild(tableWrap);
 
+    installHoldEnterSendHandler();
+    focusFirstSendButton();
+
     const note = document.createElement("div");
     note.className = "twrp-small";
-    note.textContent = "Each Send button sends the grouped request for one target village. It may request resources from several origin villages, but still requires one manual click per target.";
+    note.textContent = "Each Send button sends the grouped request for one target village. The first Send button is focused automatically; holding Enter will continue sending the next visible target row after the previous request completes.";
     ui.results.appendChild(note);
   }
 
