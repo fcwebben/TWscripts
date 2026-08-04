@@ -10,9 +10,9 @@
  * This script:
  * - Reads production overview data
  * - Reads building overview data
- * - Reads Account Manager construction template data when available
+ * - Reads Account Manager construction template data when AM construction mode is selected
  * - Reads incoming transport data
- * - Creates a prioritized resource transfer plan after a manual user click
+ * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
  * - Allows one grouped manual send action per target row
  *
  * This script does NOT:
@@ -46,21 +46,25 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.2.0";
+  const SCRIPT_VERSION = "1.5.0";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
 
   const DEFAULTS = {
+    useAmTemplates: true,
     constructionHours: 8,
-    averageFactor: 0.10,
+    averageFactor: 0,
     reserveMerchants: 0,
+    reserveWarehousePercent: 8,
+    lowFarmBlockedReservePercent: 1,
+    lowFarmFreePercent: 4,
     merchantCapacity: 1000,
     minShipment: 700,
     maxDistance: 0,
     emptyQueueBoost: 80,
     lowPointsBoost: 35,
-    donorProtectRatio: 0.08,
-    prioritizeLowPoints: true
+    prioritizeLowPoints: true,
+    sendDelayMs: 900
   };
 
   const BUILDING_NAMES = {
@@ -93,6 +97,7 @@
     plan: [],
     stats: null,
     lastSettings: null,
+    sendLocked: false,
     logs: []
   };
 
@@ -971,25 +976,31 @@
   }
 
   function getSettings() {
+    const useAmTemplates = ui.planMode.value === "am";
     const constructionHours = Math.max(0, Math.min(72, parseFloatSafe(ui.constructionHours.value, DEFAULTS.constructionHours)));
     const reserveMerchants = Math.max(0, parseInt(ui.reserveMerchants.value, 10) || DEFAULTS.reserveMerchants);
     const maxDistance = Math.max(0, parseFloatSafe(ui.maxDistance.value, DEFAULTS.maxDistance));
+    const reserveWarehousePercent = Math.max(0, Math.min(80, parseFloatSafe(ui.reserveWarehousePercent.value, DEFAULTS.reserveWarehousePercent)));
     const prioritizeLowPoints = ui.prioritizeLowPoints.checked;
 
     return {
+      useAmTemplates: useAmTemplates,
       constructionHours: constructionHours,
       averageFactor: DEFAULTS.averageFactor,
       reserveMerchants: reserveMerchants,
+      reserveWarehousePercent: reserveWarehousePercent,
+      lowFarmBlockedReservePercent: DEFAULTS.lowFarmBlockedReservePercent,
+      lowFarmFreePercent: DEFAULTS.lowFarmFreePercent,
       merchantCapacity: DEFAULTS.merchantCapacity,
       minShipment: DEFAULTS.minShipment,
       maxDistance: maxDistance,
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
-      donorPreference: "best_score",
-      protectDonorConstruction: true,
-      includeAverageBalance: true,
-      prioritizeNoTemplateDonors: true,
+      donorPreference: "distance_optimized",
+      protectDonorConstruction: useAmTemplates,
+      includeAverageBalance: false,
+      prioritizeNoTemplateDonors: useAmTemplates,
       prioritizeLowPoints: prioritizeLowPoints
     };
   }
@@ -998,17 +1009,28 @@
     try {
       ui.planButton.disabled = true;
       ui.copyButton.disabled = true;
-      setStatus("Loading production, buildings, Account Manager and incoming transport data...", "warn");
 
       const settings = getSettings();
       state.lastSettings = settings;
+
+      setStatus(
+        settings.useAmTemplates
+          ? "Loading production, buildings, Account Manager and incoming transport data..."
+          : "Loading production, buildings and incoming transport data...",
+        "warn"
+      );
+
+      const emptyAmData = {
+        templatesByCoord: new Map(),
+        templateDefsByName: new Map()
+      };
 
       const results = await Promise.all([
         loadProductionData(),
         loadBuildingsData(),
         loadIncomingData(),
-        loadAccountManagerData(),
-        loadBuildingConstants()
+        settings.useAmTemplates ? loadAccountManagerData() : Promise.resolve(emptyAmData),
+        settings.useAmTemplates ? loadBuildingConstants() : Promise.resolve(new Map())
       ]);
 
       mergeLoadedData(results[0], results[1], results[2], results[3], results[4], settings);
@@ -1053,9 +1075,12 @@
 
   function calculateGlobalStats(villages) {
     const totals = villages.reduce((acc, village) => {
-      acc.wood += village.wood + (village.incoming?.wood || 0);
-      acc.stone += village.stone + (village.incoming?.stone || 0);
-      acc.iron += village.iron + (village.incoming?.iron || 0);
+      const incoming = village.incoming || emptyResources();
+
+      acc.wood += village.wood + incoming.wood;
+      acc.stone += village.stone + incoming.stone;
+      acc.iron += village.iron + incoming.iron;
+      acc.capacity += village.capacity || 0;
       acc.points += village.points || 0;
       acc.minPoints = Math.min(acc.minPoints, village.points || 0);
       acc.maxPoints = Math.max(acc.maxPoints, village.points || 0);
@@ -1064,20 +1089,26 @@
       wood: 0,
       stone: 0,
       iron: 0,
+      capacity: 0,
       points: 0,
       minPoints: 9999999,
       maxPoints: 0
     });
 
     const count = Math.max(1, villages.length);
+    const totalCapacity = Math.max(1, totals.capacity);
 
     return {
       totalWood: totals.wood,
       totalStone: totals.stone,
       totalIron: totals.iron,
+      totalCapacity: totals.capacity,
       avgWood: totals.wood / count,
       avgStone: totals.stone / count,
       avgIron: totals.iron / count,
+      woodFillRatio: Math.min(0.95, Math.max(0, totals.wood / totalCapacity)),
+      stoneFillRatio: Math.min(0.95, Math.max(0, totals.stone / totalCapacity)),
+      ironFillRatio: Math.min(0.95, Math.max(0, totals.iron / totalCapacity)),
       minPoints: totals.minPoints === 9999999 ? 0 : totals.minPoints,
       maxPoints: totals.maxPoints,
       avgPoints: totals.points / count
@@ -1086,28 +1117,7 @@
 
   function buildTargets(villages, stats, settings) {
     return villages.map(village => {
-      const current = {
-        wood: village.wood + (village.incoming?.wood || 0),
-        stone: village.stone + (village.incoming?.stone || 0),
-        iron: village.iron + (village.incoming?.iron || 0)
-      };
-
-      const averageNeed = settings.includeAverageBalance
-        ? {
-            wood: Math.max(0, Math.round(stats.avgWood * settings.averageFactor) - current.wood),
-            stone: Math.max(0, Math.round(stats.avgStone * settings.averageFactor) - current.stone),
-            iron: Math.max(0, Math.round(stats.avgIron * settings.averageFactor) - current.iron)
-          }
-        : emptyResources();
-
-      const constructionNeed = cloneResources(village.ownNeed || emptyResources());
-      const need = {
-        wood: Math.max(0, Math.max(averageNeed.wood, constructionNeed.wood - current.wood)),
-        stone: Math.max(0, Math.max(averageNeed.stone, constructionNeed.stone - current.stone)),
-        iron: Math.max(0, Math.max(averageNeed.iron, constructionNeed.iron - current.iron))
-      };
-
-      const totalNeed = totalResources(need);
+      const current = getCurrentResourcesWithIncoming(village);
       const hasTemplate = Boolean(village.amTemplateName);
       const hasTemplateData = Boolean(village.amTemplate);
       const queueHours = (village.queueEndSeconds || 0) / 3600;
@@ -1121,39 +1131,61 @@
         ? (stats.maxPoints - (village.points || 0)) / pointRange
         : 0;
 
-      let score = totalNeed / 1000;
+      let constructionNeed = emptyResources();
+      let warehouseTarget = emptyResources();
+      let need = emptyResources();
+      let score = 0;
 
-      if (hasTemplate) {
-        score += 10;
+      if (settings.useAmTemplates) {
+        constructionNeed = cloneResources(village.ownNeed || emptyResources());
+        need = {
+          wood: Math.max(0, constructionNeed.wood - current.wood),
+          stone: Math.max(0, constructionNeed.stone - current.stone),
+          iron: Math.max(0, constructionNeed.iron - current.iron)
+        };
+
+        score = totalResources(need) / 1000;
+
+        if (hasTemplate) {
+          score += 10;
+        }
+
+        if (hasTemplate && queueEmpty) {
+          score += settings.emptyQueueBoost;
+        }
+
+        if (hasTemplate) {
+          score += queueSoon * 30;
+        }
+
+        score += lowPointRatio * settings.lowPointsBoost;
+
+        if (!hasTemplateData && hasTemplate) {
+          score *= 0.35;
+        }
+
+        if (settings.priorityMode === "construction_first") {
+          score += totalResources(constructionNeed) / 700;
+        }
+      } else {
+        warehouseTarget = getWarehouseBalanceTarget(village, stats);
+        need = {
+          wood: Math.max(0, warehouseTarget.wood - current.wood),
+          stone: Math.max(0, warehouseTarget.stone - current.stone),
+          iron: Math.max(0, warehouseTarget.iron - current.iron)
+        };
+
+        score = totalResources(need) / 1000;
+        score += lowPointRatio * settings.lowPointsBoost * 0.35;
       }
 
-      if (hasTemplate && queueEmpty) {
-        score += settings.emptyQueueBoost;
-      }
-
-      if (hasTemplate) {
-        score += queueSoon * 30;
-      }
-
-      score += lowPointRatio * settings.lowPointsBoost;
-
-      if (!hasTemplateData && hasTemplate) {
-        score *= 0.35;
-      }
-
-      if (settings.priorityMode === "empty_am_first") {
-        score += hasTemplate && queueEmpty ? 100 : 0;
-      } else if (settings.priorityMode === "low_points_first") {
-        score += lowPointRatio * 80;
-      } else if (settings.priorityMode === "construction_first") {
-        score += totalResources(constructionNeed) / 700;
-      }
+      const totalNeed = totalResources(need);
 
       return {
         village: village,
         need: need,
         constructionNeed: constructionNeed,
-        averageNeed: averageNeed,
+        warehouseTarget: warehouseTarget,
         totalNeed: totalNeed,
         score: score,
         hasTemplate: hasTemplate,
@@ -1161,17 +1193,22 @@
         queueEmpty: queueEmpty,
         queueHours: queueHours,
         lowPointRatio: lowPointRatio,
-        reason: buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings)
+        reason: buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget)
       };
     })
-      .filter(target => target.totalNeed >= settings.minShipment || target.score > settings.emptyQueueBoost)
+      .filter(target => target.totalNeed >= settings.minShipment || (settings.useAmTemplates && target.score > settings.emptyQueueBoost))
       .sort((a, b) => b.score - a.score);
   }
 
-  function buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings) {
+  function buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget) {
     const reasons = [];
 
-    if (hasTemplate && queueEmpty) {
+    if (!settings.useAmTemplates) {
+      reasons.push("below warehouse % target");
+      if (warehouseTarget && totalResources(warehouseTarget) > 0) {
+        reasons.push("target " + formatResources(warehouseTarget));
+      }
+    } else if (hasTemplate && queueEmpty) {
       reasons.push("AM template + empty queue");
     } else if (hasTemplate && queueHours <= settings.constructionHours) {
       reasons.push("AM queue ends soon");
@@ -1179,7 +1216,7 @@
       reasons.push("AM template active");
     }
 
-    if (lowPointRatio > 0.5) {
+    if (lowPointRatio > 0.5 && settings.prioritizeLowPoints) {
       reasons.push("lower points");
     }
 
@@ -1188,38 +1225,75 @@
     }
 
     if (!reasons.length) {
-      reasons.push("balancing target");
+      reasons.push(settings.useAmTemplates ? "construction target" : "warehouse balance target");
     }
 
     return reasons.join(", ");
   }
 
+  function getCurrentResourcesWithIncoming(village) {
+    const incoming = village.incoming || emptyResources();
+
+    return {
+      wood: village.wood + incoming.wood,
+      stone: village.stone + incoming.stone,
+      iron: village.iron + incoming.iron
+    };
+  }
+
+  function getWarehouseBalanceTarget(village, stats) {
+    const capacity = village.capacity || 0;
+
+    return {
+      wood: Math.round(capacity * (stats.woodFillRatio || 0)),
+      stone: Math.round(capacity * (stats.stoneFillRatio || 0)),
+      iron: Math.round(capacity * (stats.ironFillRatio || 0))
+    };
+  }
+
+  function isFarmBlockedDonor(village, settings) {
+    const levels = village.buildingLevels || {};
+    const farmLevel = levels.farm || 0;
+    const farmMax = village.farmMax || 0;
+
+    if (farmLevel < 30 || farmMax <= 0) {
+      return false;
+    }
+
+    const freeFarmRatio = Math.max(0, (farmMax - (village.farmUsed || 0)) / farmMax);
+    return freeFarmRatio <= (settings.lowFarmFreePercent / 100);
+  }
+
+  function getWarehouseReserveRatio(village, settings) {
+    const normalReserve = Math.max(0, Math.min(0.8, settings.reserveWarehousePercent / 100));
+
+    if (isFarmBlockedDonor(village, settings)) {
+      return Math.min(normalReserve, settings.lowFarmBlockedReservePercent / 100);
+    }
+
+    return normalReserve;
+  }
+
   function buildDonors(villages, stats, settings) {
     return villages.map(village => {
-      const incoming = village.incoming || emptyResources();
-      const current = {
-        wood: village.wood + incoming.wood,
-        stone: village.stone + incoming.stone,
-        iron: village.iron + incoming.iron
-      };
+      const current = getCurrentResourcesWithIncoming(village);
+      const warehouseProtect = Math.round((village.capacity || 0) * getWarehouseReserveRatio(village, settings));
 
-      const ownNeed = settings.protectDonorConstruction
-        ? cloneResources(village.ownNeed || emptyResources())
-        : emptyResources();
+      let ownNeed = emptyResources();
+      let balanceProtect = emptyResources();
 
-      const warehouseProtect = Math.round((village.capacity || 0) * DEFAULTS.donorProtectRatio);
-      const averageProtect = settings.includeAverageBalance
-        ? {
-            wood: Math.round(stats.avgWood * settings.averageFactor * 0.5),
-            stone: Math.round(stats.avgStone * settings.averageFactor * 0.5),
-            iron: Math.round(stats.avgIron * settings.averageFactor * 0.5)
-          }
-        : emptyResources();
+      if (settings.useAmTemplates && settings.protectDonorConstruction) {
+        ownNeed = cloneResources(village.ownNeed || emptyResources());
+      }
+
+      if (!settings.useAmTemplates) {
+        balanceProtect = getWarehouseBalanceTarget(village, stats);
+      }
 
       const protect = {
-        wood: Math.max(warehouseProtect, ownNeed.wood, averageProtect.wood),
-        stone: Math.max(warehouseProtect, ownNeed.stone, averageProtect.stone),
-        iron: Math.max(warehouseProtect, ownNeed.iron, averageProtect.iron)
+        wood: Math.max(warehouseProtect, ownNeed.wood, balanceProtect.wood),
+        stone: Math.max(warehouseProtect, ownNeed.stone, balanceProtect.stone),
+        iron: Math.max(warehouseProtect, ownNeed.iron, balanceProtect.iron)
       };
 
       const available = {
@@ -1233,12 +1307,17 @@
       const totalAvailable = Math.min(totalResources(available), merchantCapacityTotal);
       const hasTemplate = Boolean(village.amTemplateName);
       const queueEmpty = (village.queueCount || 0) === 0 && (village.queueEndSeconds || 0) === 0;
+      const farmBlocked = isFarmBlockedDonor(village, settings);
 
       let baseScore = totalAvailable / 1000;
       baseScore += merchantsAvailable * 1.5;
 
       if (settings.prioritizeNoTemplateDonors && !hasTemplate) {
         baseScore += 30;
+      }
+
+      if (farmBlocked) {
+        baseScore += 18;
       }
 
       if (!hasTemplate || queueEmpty) {
@@ -1248,23 +1327,30 @@
       return {
         village: village,
         available: available,
+        protected: protect,
         totalAvailable: totalAvailable,
         merchantsAvailable: merchantsAvailable,
         baseScore: baseScore,
         hasTemplate: hasTemplate,
         queueEmpty: queueEmpty,
-        reason: buildDonorReason(village, totalAvailable, merchantsAvailable, hasTemplate)
+        farmBlocked: farmBlocked,
+        reason: buildDonorReason(village, totalAvailable, merchantsAvailable, hasTemplate, farmBlocked, settings)
       };
     })
       .filter(donor => donor.totalAvailable >= settings.minShipment && donor.merchantsAvailable > 0)
       .sort((a, b) => b.baseScore - a.baseScore);
   }
 
-  function buildDonorReason(village, totalAvailable, merchantsAvailable, hasTemplate) {
+  function buildDonorReason(village, totalAvailable, merchantsAvailable, hasTemplate, farmBlocked, settings) {
     const reasons = [];
 
-    reasons.push("surplus " + formatNumber(totalAvailable));
+    reasons.push("available " + formatNumber(totalAvailable));
     reasons.push(merchantsAvailable + " merchant(s)");
+    reasons.push("reserve " + settings.reserveWarehousePercent + "% WH");
+
+    if (farmBlocked) {
+      reasons.push("farm capped / low free farm");
+    }
 
     if (!hasTemplate) {
       reasons.push("no AM template");
@@ -1307,6 +1393,12 @@
             };
           })
           .sort((a, b) => {
+            if (settings.donorPreference === "distance_optimized") {
+              if (a.distance !== b.distance) return a.distance - b.distance;
+              if (b.donor.totalAvailable !== a.donor.totalAvailable) return b.donor.totalAvailable - a.donor.totalAvailable;
+              return b.score - a.score;
+            }
+
             if (settings.donorPreference === "closest") {
               return a.distance - b.distance;
             }
@@ -1331,11 +1423,11 @@
 
         subtractResources(donor.available, shipment.resources);
         subtractResources(need, shipment.resources);
+        donor.merchantsAvailable = Math.max(0, donor.merchantsAvailable - shipment.merchantsUsed);
         donor.totalAvailable = Math.min(
           totalResources(donor.available),
           donor.merchantsAvailable * settings.merchantCapacity
         );
-        donor.merchantsAvailable = Math.max(0, donor.merchantsAvailable - shipment.merchantsUsed);
 
         launches.push({
           id: launchId++,
@@ -1391,10 +1483,14 @@
   function getDonorMatchScore(donor, target, distance, settings) {
     let score = donor.baseScore;
 
-    score -= distance * 2.5;
+    score -= distance * 5;
 
     if (settings.prioritizeNoTemplateDonors && !donor.hasTemplate) {
       score += 25;
+    }
+
+    if (donor.farmBlocked) {
+      score += 12;
     }
 
     if (target.queueEmpty && donor.village.points > target.village.points) {
@@ -1431,6 +1527,8 @@
   }
 
   function getFirstEnabledSendButton() {
+    if (state.sendLocked) return null;
+
     return Array.from(document.querySelectorAll(".twrp-send-button"))
       .find(button => !button.disabled);
   }
@@ -1458,6 +1556,18 @@
     }
   }
 
+  function releaseSendLockAfterDelay(button) {
+    const delayMs = DEFAULTS.sendDelayMs;
+
+    setStatus("Resources sent. Waiting " + (delayMs / 1000).toFixed(1) + "s before next send is available...", "success");
+
+    window.setTimeout(function () {
+      removeSentTargetRow(button);
+      state.sendLocked = false;
+      focusFirstSendButton();
+    }, delayMs);
+  }
+
   function installHoldEnterSendHandler() {
     if (state.enterSendHandlerInstalled) return;
 
@@ -1483,7 +1593,9 @@
 
   function sendTargetPlan(targetPlan, button) {
     if (!targetPlan || !targetPlan.target || !targetPlan.launches || !targetPlan.launches.length) return;
-    if (!button || button.disabled) return;
+    if (!button || button.disabled || state.sendLocked) return;
+
+    state.sendLocked = true;
 
     const data = {};
 
@@ -1515,11 +1627,12 @@
           console.log(SCRIPT_NAME + " grouped send response:", response);
           UI.SuccessMessage(response.success || "Resources sent.", 1500);
           button.textContent = "Sent";
-          removeSentTargetRow(button);
+          releaseSendLockAfterDelay(button);
         },
         error => {
           console.error(SCRIPT_NAME + " grouped send failed:", error);
           UI.ErrorMessage("Could not send resources.", 2500);
+          state.sendLocked = false;
           button.disabled = false;
           button.textContent = "Send";
           focusFirstSendButton();
@@ -1528,6 +1641,7 @@
     } catch (err) {
       console.error(SCRIPT_NAME + " grouped send failed:", err);
       UI.ErrorMessage("Could not send resources.", 2500);
+      state.sendLocked = false;
       button.disabled = false;
       button.textContent = "Send";
       focusFirstSendButton();
@@ -1536,6 +1650,7 @@
 
   function renderResults(planResult) {
     ui.results.innerHTML = "";
+    state.sendLocked = false;
 
     const settings = state.lastSettings || getSettings();
 
@@ -1548,14 +1663,16 @@
       "Origin transfers: " + planResult.launches.length + "<br>" +
       "Targets considered: " + planResult.targets.length + "<br>" +
       "Donors considered: " + planResult.donors.length + "<br>" +
-      "Construction horizon: " + escapeHtml(settings.constructionHours) + "h";
+      "Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance") + "<br>" +
+      "Origin reserve: " + escapeHtml(settings.reserveWarehousePercent) + "% of warehouse" +
+      (settings.useAmTemplates ? "<br>Construction horizon: " + escapeHtml(settings.constructionHours) + "h" : "");
 
     ui.results.appendChild(summary);
 
     if (!planResult.targetPlans.length) {
       const empty = document.createElement("div");
       empty.className = "twrp-status twrp-status-warn";
-      empty.textContent = "No useful transfers found. Try increasing construction hours or max distance.";
+      empty.textContent = "No useful transfers found. Try increasing build coverage, lowering reserve %, or increasing max distance.";
       ui.results.appendChild(empty);
       renderDiagnostics(planResult);
       return;
@@ -1656,7 +1773,7 @@
 
     const note = document.createElement("div");
     note.className = "twrp-small";
-    note.textContent = "Each Send button sends the grouped request for one target village. The first Send button is focused automatically; holding Enter will continue sending the next visible target row after the previous request completes.";
+    note.textContent = "Each Send button sends the grouped request for one target village. The first Send button is focused automatically; holding Enter will continue sending the next visible target row, with a short delay after each successful send.";
     ui.results.appendChild(note);
   }
 
@@ -1690,10 +1807,11 @@
     details.appendChild(donorTitle);
 
     details.appendChild(createMiniTable(
-      ["Village", "Available", "Merchants", "Score", "Reason"],
+      ["Village", "Available", "Protected", "Merchants", "Score", "Reason"],
       planResult.donors.slice(0, 20).map(donor => [
         donor.village.name,
         formatResources(donor.available),
+        formatResources(donor.protected || emptyResources()),
         String(donor.merchantsAvailable),
         donor.baseScore.toFixed(1),
         donor.reason
@@ -1769,7 +1887,11 @@
     }
 
     const lines = [];
+    const settings = state.lastSettings || getSettings();
+
     lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
+    lines.push("Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance"));
+    lines.push("Origin reserve: " + settings.reserveWarehousePercent + "% of warehouse");
     lines.push("");
 
     state.plan.forEach(targetPlan => {
@@ -2214,22 +2336,37 @@
 
     const help = document.createElement("div");
     help.className = "twrp-help";
-    help.textContent = "Creates a construction-focused resource plan. It prioritizes villages with active Account Manager construction templates, empty or nearly empty building queues, lower-point villages, and donor villages with useful resources and merchants. Each Send button handles one target village manually.";
+    help.textContent = "Creates a resource plan with one grouped Send button per target village. AM construction mode sends only the calculated construction deficit within the selected build coverage. Warehouse balance mode ignores AM templates and balances resource fill percentage by warehouse size. Origin reserve keeps the selected warehouse percentage at donor villages; farm-30 villages with almost no free farm use a much smaller reserve.";
 
     const grid = document.createElement("div");
     grid.className = "twrp-grid twrp-grid-simple";
 
+    const planMode = createSelect("Plan mode", [
+      { value: "am", text: "AM construction" },
+      { value: "warehouse", text: "Warehouse balance" }
+    ], DEFAULTS.useAmTemplates ? "am" : "warehouse");
     const constructionHours = createInput("Build coverage [hours]", DEFAULTS.constructionHours);
     const reserveMerchants = createInput("Reserve merchants", DEFAULTS.reserveMerchants);
+    const reserveWarehousePercent = createInput("Origin reserve [% WH]", DEFAULTS.reserveWarehousePercent);
     const maxDistance = createInput("Max distance [0 = any]", DEFAULTS.maxDistance);
     const prioritizeLowPoints = createCheckbox("Prioritize low-point villages", DEFAULTS.prioritizeLowPoints);
 
     [
+      planMode.wrap,
       constructionHours.wrap,
       reserveMerchants.wrap,
+      reserveWarehousePercent.wrap,
       maxDistance.wrap,
       prioritizeLowPoints.wrap
     ].forEach(node => grid.appendChild(node));
+
+    function updateModeControls() {
+      const amMode = planMode.select.value === "am";
+      constructionHours.input.disabled = !amMode;
+    }
+
+    planMode.select.addEventListener("change", updateModeControls);
+    updateModeControls();
 
     const buttons = document.createElement("div");
     buttons.className = "twrp-buttons";
@@ -2271,8 +2408,10 @@
     box.appendChild(body);
     document.body.appendChild(box);
 
+    ui.planMode = planMode.select;
     ui.constructionHours = constructionHours.input;
     ui.reserveMerchants = reserveMerchants.input;
+    ui.reserveWarehousePercent = reserveWarehousePercent.input;
     ui.maxDistance = maxDistance.input;
     ui.prioritizeLowPoints = prioritizeLowPoints.input;
     ui.planButton = planButton;
