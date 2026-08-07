@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.0.0";
+  const SCRIPT_VERSION = "v1.0.1";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -1314,112 +1314,224 @@ function buildVillageImpactSummary(plan) {
   });
 }
 
-	function renderVillageImpactSummary() {
-		const impactRows = buildVillageImpactSummary(state.plan);
+  function createUiElement(tagName, className, text) {
+    const element = document.createElement(tagName);
 
-		if (!impactRows.length) {
-			return;
-		}
+    if (className) {
+      element.className = className;
+    }
 
-		const title = document.createElement("div");
-		title.className = "twrp-section-title";
-		title.textContent = "Village impact summary";
-		ui.results.appendChild(title);
+    if (text !== undefined && text !== null) {
+      element.textContent = String(text);
+    }
 
-		const tableWrap = document.createElement("div");
-		tableWrap.className = "twrp-table-wrap";
+    return element;
+  }
 
-		const table = document.createElement("table");
-		table.className = "twrp-table";
+  function getGoalLabel(goal) {
+    if (goal === "offense") return "Offense";
+    return "Recruitment";
+  }
 
-		const thead = document.createElement("thead");
-		const headRow = document.createElement("tr");
+  function getModeLabel(mode) {
+    if (mode === "fixed") return "Keep current";
+    if (mode === "inventory") return "Inventory only";
+    return "Full rebuild";
+  }
 
-		["Village", "Relics", "Total stats"].forEach(label => {
-			const th = document.createElement("th");
-			th.textContent = label;
-			headRow.appendChild(th);
-		});
+  function getWeightingLabel(weighting) {
+    if (weighting === "freeFarm") return "Free farm";
+    if (weighting === "farmCap") return "Farm cap";
+    return "Equal";
+  }
 
-		thead.appendChild(headRow);
-		table.appendChild(thead);
+  function getRelicQualityClass(relic) {
+    const text = cleanText((relic && (relic.quality || relic.name)) || "").toLowerCase();
 
-		const tbody = document.createElement("tbody");
+    if (text.indexOf("renowned") >= 0) return "twrp-quality-renowned";
+    if (text.indexOf("superior") >= 0) return "twrp-quality-superior";
+    if (text.indexOf("enhanced") >= 0) return "twrp-quality-enhanced";
+    if (text.indexOf("sturdy") >= 0) return "twrp-quality-sturdy";
+    if (text.indexOf("shoddy") >= 0) return "twrp-quality-shoddy";
 
-		impactRows.forEach(item => {
-			const row = document.createElement("tr");
+    return "twrp-quality-enhanced";
+  }
 
-			const villageCell = document.createElement("td");
-			villageCell.className = "twrp-left";
-			villageCell.textContent = item.village.name;
+  function getUiStatLabel(key) {
+    return getStatCopyLabel(key);
+  }
 
-			const relicCountCell = document.createElement("td");
-			relicCountCell.textContent = String(item.relicCount);
+  function formatUiStatValue(stat, showPlusForPositive) {
+    const sign = isCostStat(stat.key) ? "-" : (showPlusForPositive ? "+" : "");
+    return sign + formatPercentCompact(stat.value) + "%";
+  }
 
-			const statsCell = document.createElement("td");
-			statsCell.className = "twrp-left";
-			statsCell.textContent = formatImpactStats(item.stats);
+  function createStatPills(stats, showPlusForPositive) {
+    const wrap = createUiElement("div", "twrp-stat-pills");
+    const sorted = sortStatsForCopy(stats || []);
 
-			row.appendChild(villageCell);
-			row.appendChild(relicCountCell);
-			row.appendChild(statsCell);
+    if (!sorted.length) {
+      wrap.appendChild(createUiElement("span", "twrp-stat-pill", "No relevant stats"));
+      return wrap;
+    }
 
-			tbody.appendChild(row);
-		});
+    sorted.forEach(stat => {
+      const pill = createUiElement("span", "twrp-stat-pill twrp-stat-" + getStatBuildingIcon(stat.key));
+      const label = createUiElement("span", "twrp-stat-label", getUiStatLabel(stat.key));
+      const value = createUiElement("strong", "", formatUiStatValue(stat, showPlusForPositive));
+      pill.appendChild(label);
+      pill.appendChild(value);
+      wrap.appendChild(pill);
+    });
 
-		table.appendChild(tbody);
-		tableWrap.appendChild(table);
-		ui.results.appendChild(tableWrap);
-	}
+    return wrap;
+  }
 
-  function renderResults(context) {
-    ui.results.innerHTML = "";
+  function createMetricCard(label, value, detail) {
+    const card = createUiElement("div", "twrp-metric-card");
+    card.appendChild(createUiElement("div", "twrp-metric-label", label));
+    card.appendChild(createUiElement("div", "twrp-metric-value", value));
 
-    const summary = document.createElement("div");
-    summary.className = "twrp-summary";
-    summary.innerHTML =
-      "<strong>Data loaded</strong><br>" +
-      "Villages: " +
-      state.villages.length +
-      "<br>" +
-      "Inventory relics: " +
-      state.inventoryRelics.length +
-      "<br>" +
-      "Placed relics: " +
-      state.placedRelics.length +
-      "<br>" +
-      "Goal: " +
-      escapeHtml(context.goal) +
-      " / Mode: " +
-      escapeHtml(context.mode) +
-      " / Weighting: " +
-      escapeHtml(context.weighting);
+    if (detail) {
+      card.appendChild(createUiElement("div", "twrp-metric-detail", detail));
+    }
+
+    return card;
+  }
+
+  function createSectionHeader(title, subtitle) {
+    const header = createUiElement("div", "twrp-section-head");
+    const left = createUiElement("div", "");
+    left.appendChild(createUiElement("div", "twrp-section-title", title));
+
+    if (subtitle) {
+      left.appendChild(createUiElement("div", "twrp-section-subtitle", subtitle));
+    }
+
+    header.appendChild(left);
+    return header;
+  }
+
+  function renderSummaryCards(context) {
+    const impactRows = buildVillageImpactSummary(state.plan);
+    const summary = createUiElement("div", "twrp-summary-grid");
+
+    summary.appendChild(createMetricCard("Placements", state.plan.length, "recommended moves"));
+    summary.appendChild(createMetricCard("Villages", state.villages.length, "loaded"));
+    summary.appendChild(createMetricCard("Relics", state.inventoryRelics.length, "inventory"));
+    summary.appendChild(createMetricCard("Impact", impactRows.length, "affected villages"));
+
+    const contextBar = createUiElement("div", "twrp-context-bar");
+    contextBar.appendChild(createUiElement("span", "twrp-context-pill", getGoalLabel(context.goal)));
+    contextBar.appendChild(createUiElement("span", "twrp-context-pill", getModeLabel(context.mode)));
+    contextBar.appendChild(createUiElement("span", "twrp-context-pill", getWeightingLabel(context.weighting)));
+    contextBar.appendChild(createUiElement("span", "twrp-context-pill", "20% cap applied"));
 
     ui.results.appendChild(summary);
+    ui.results.appendChild(contextBar);
+  }
 
-    if (!state.plan.length) {
-      const empty = document.createElement("div");
-      empty.className = "twrp-status twrp-status-warn";
-      empty.textContent = "No positive-value placements found for the selected goal/mode.";
-      ui.results.appendChild(empty);
+  function createCoveragePreview(item) {
+    const details = document.createElement("details");
+    details.className = "twrp-coverage-details";
+
+    const summary = document.createElement("summary");
+    summary.textContent = item.covered.length + " covered village(s)";
+    details.appendChild(summary);
+
+    const list = createUiElement("div", "twrp-covered-list");
+    item.covered.forEach(village => {
+      const line = createUiElement("div", "twrp-covered-line");
+      line.textContent = village.coord + " - " + village.name;
+      list.appendChild(line);
+    });
+
+    details.appendChild(list);
+    return details;
+  }
+
+  function renderPlacementCards() {
+    ui.results.appendChild(createSectionHeader(
+      "Recommended placements",
+      "Main recommendation cards. Open coverage only when needed."
+    ));
+
+    const grid = createUiElement("div", "twrp-placement-grid");
+
+    state.plan.forEach(item => {
+      const card = createUiElement("div", "twrp-placement-card");
+
+      const top = createUiElement("div", "twrp-placement-top");
+      top.appendChild(createUiElement("div", "twrp-step-badge", item.step));
+
+      const relic = createUiElement("div", "twrp-relic-block");
+      const relicName = createUiElement("div", "twrp-relic-name " + getRelicQualityClass(item.relic), item.relic.name);
+      const relicMeta = createUiElement("div", "twrp-relic-meta", "Range " + item.relic.range + " / " + getRelicRangeLabel(item.relic.range));
+      relic.appendChild(relicName);
+      relic.appendChild(relicMeta);
+      top.appendChild(relic);
+
+      card.appendChild(top);
+
+      const target = createUiElement("div", "twrp-target-block");
+      target.appendChild(createUiElement("div", "twrp-mini-label", "Place at"));
+      target.appendChild(createUiElement("div", "twrp-target-name", item.center.coord + " - " + item.center.name));
+      card.appendChild(target);
+
+      const scoreRow = createUiElement("div", "twrp-score-row");
+      scoreRow.appendChild(createMetricCard("Score", formatScore(item.score), "value"));
+      scoreRow.appendChild(createMetricCard("Coverage", item.covered.length, "villages"));
+      scoreRow.appendChild(createMetricCard("Waste", formatScore(item.wastedScore), "lost value"));
+      card.appendChild(scoreRow);
+
+      card.appendChild(createStatPills(item.relevantStats, true));
+      card.appendChild(createCoveragePreview(item));
+
+      grid.appendChild(card);
+    });
+
+    ui.results.appendChild(grid);
+  }
+
+  function renderVillageImpactSummary() {
+    const impactRows = buildVillageImpactSummary(state.plan);
+
+    if (!impactRows.length) {
       return;
     }
 
-    const title = document.createElement("div");
-    title.className = "twrp-section-title";
-    title.textContent = "Recommended relic placement plan";
-    ui.results.appendChild(title);
+    ui.results.appendChild(createSectionHeader(
+      "Village impact",
+      "Top affected villages first. Full list is collapsed to keep the UI readable."
+    ));
 
-    const tableWrap = document.createElement("div");
-    tableWrap.className = "twrp-table-wrap";
+    const preview = createUiElement("div", "twrp-impact-preview");
 
-    const table = document.createElement("table");
-    table.className = "twrp-table";
+    impactRows.slice(0, 8).forEach((item, index) => {
+      const card = createUiElement("div", "twrp-impact-card");
+      const head = createUiElement("div", "twrp-impact-head");
+      head.appendChild(createUiElement("strong", "", (index + 1) + ". " + item.village.coord));
+      head.appendChild(createUiElement("span", "twrp-count-pill", item.relicCount + " relics"));
+      card.appendChild(head);
+      card.appendChild(createStatPills(Object.keys(item.stats || {}).map(key => ({ key: key, value: item.stats[key] })), false));
+      preview.appendChild(card);
+    });
 
+    ui.results.appendChild(preview);
+
+    const details = document.createElement("details");
+    details.className = "twrp-details twrp-full-impact";
+
+    const summary = document.createElement("summary");
+    summary.textContent = "Show all " + impactRows.length + " affected village(s)";
+    details.appendChild(summary);
+
+    const tableWrap = createUiElement("div", "twrp-table-wrap");
+    const table = createUiElement("table", "twrp-table twrp-compact-table");
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
 
-    ["#", "Relic", "Place at", "Range", "Covered", "Score", "Waste", "Relevant stats"].forEach(label => {
+    ["#", "Village", "Relics", "Stats"].forEach(label => {
       const th = document.createElement("th");
       th.textContent = label;
       headRow.appendChild(th);
@@ -1430,91 +1542,69 @@ function buildVillageImpactSummary(plan) {
 
     const tbody = document.createElement("tbody");
 
-    state.plan.forEach(item => {
+    impactRows.forEach((item, index) => {
       const row = document.createElement("tr");
-
-      const numberCell = document.createElement("td");
-      numberCell.textContent = String(item.step);
-
-      const relicCell = document.createElement("td");
-      relicCell.className = "twrp-left";
-      relicCell.innerHTML =
-        "<strong>" +
-        escapeHtml(item.relic.name) +
-        "</strong><br><span class='twrp-small'>ID: " +
-        escapeHtml(item.relic.id) +
-        "</span>";
-
-      const centerCell = document.createElement("td");
-      centerCell.className = "twrp-left";
-      centerCell.textContent = item.center.name;
-
-      const rangeCell = document.createElement("td");
-      rangeCell.textContent =
-        item.relic.range +
-        " (" +
-        getRelicRangeLabel(item.relic.range) +
-        ")";
-
-      const coveredCell = document.createElement("td");
-      const details = document.createElement("details");
-      const summary = document.createElement("summary");
-      summary.textContent = item.covered.length + " village(s)";
-      details.appendChild(summary);
-
-      const coveredList = document.createElement("div");
-      coveredList.className = "twrp-covered-list";
-
-      item.covered.forEach(village => {
-        const line = document.createElement("div");
-        line.textContent =
-				village.coord +
-				" - " +
-				village.name +
-				(
-					village.farmMax
-						? " | Farm " + village.farmUsed + "/" + village.farmMax + " | Free " + village.farmFree
-						: ""
-				);
-        coveredList.appendChild(line);
-      });
-
-      details.appendChild(coveredList);
-      coveredCell.appendChild(details);
-
-      const scoreCell = document.createElement("td");
-      scoreCell.textContent = formatScore(item.score);
-
-      const wasteCell = document.createElement("td");
-      wasteCell.textContent = formatScore(item.wastedScore);
+      appendTableCell(row, String(index + 1));
+      appendTableCell(row, item.village.coord, "twrp-left");
+      appendTableCell(row, String(item.relicCount));
 
       const statsCell = document.createElement("td");
       statsCell.className = "twrp-left";
-      statsCell.textContent = formatStatList(item.relevantStats);
-
-      row.appendChild(numberCell);
-      row.appendChild(relicCell);
-      row.appendChild(centerCell);
-      row.appendChild(rangeCell);
-      row.appendChild(coveredCell);
-      row.appendChild(scoreCell);
-      row.appendChild(wasteCell);
+      statsCell.appendChild(createStatPills(Object.keys(item.stats || {}).map(key => ({ key: key, value: item.stats[key] })), false));
       row.appendChild(statsCell);
 
       tbody.appendChild(row);
     });
 
     table.appendChild(tbody);
-		tableWrap.appendChild(table);
-		ui.results.appendChild(tableWrap);
+    tableWrap.appendChild(table);
+    details.appendChild(tableWrap);
+    ui.results.appendChild(details);
+  }
 
-		renderVillageImpactSummary();
+  function appendTableCell(row, text, className) {
+    const cell = document.createElement("td");
+    cell.textContent = text;
 
-		const note = document.createElement("div");
-    note.className = "twrp-small";
-    note.textContent =
-      "Score is a weighted marginal-value estimate after applying the 20% cap per village/stat. Waste is estimated value lost because covered villages are already capped or near capped.";
-    ui.results.appendChild(note);
+    if (className) {
+      cell.className = className;
+    }
+
+    row.appendChild(cell);
+    return cell;
+  }
+
+  function renderScoringInfo() {
+    const details = document.createElement("details");
+    details.className = "twrp-details twrp-scoring-info";
+
+    const summary = document.createElement("summary");
+    summary.textContent = "How score and waste work";
+    details.appendChild(summary);
+
+    const body = createUiElement("div", "twrp-muted-block");
+    body.textContent = "Score estimates the marginal value of a placement after the 20% cap per village/stat. Waste estimates value lost because covered villages are already capped or near capped.";
+    details.appendChild(body);
+
+    ui.results.appendChild(details);
+  }
+
+  function renderResults(context) {
+    ui.results.innerHTML = "";
+
+    renderSummaryCards(context);
+
+    if (!state.plan.length) {
+      const empty = document.createElement("div");
+      empty.className = "twrp-status twrp-status-warn";
+      empty.textContent = "No positive-value placements found for the selected goal/mode.";
+      ui.results.appendChild(empty);
+      return;
+    }
+
+    renderPlacementCards();
+    renderVillageImpactSummary();
+    renderScoringInfo();
   }
 
   function copyPlan() {
@@ -1846,6 +1936,252 @@ function buildVillageImpactSummary(plan) {
           grid-template-columns: 1fr;
         }
       }
+
+
+      .twrp-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+        margin: 8px 0;
+      }
+
+      .twrp-metric-card {
+        padding: 8px;
+        border: 1px solid #c8a765;
+        border-radius: 6px;
+        background: #fffaf0;
+        min-width: 0;
+      }
+
+      .twrp-metric-label,
+      .twrp-mini-label {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        opacity: 0.72;
+        margin-bottom: 3px;
+      }
+
+      .twrp-metric-value {
+        font-size: 18px;
+        font-weight: bold;
+        line-height: 1.1;
+      }
+
+      .twrp-metric-detail {
+        font-size: 11px;
+        opacity: 0.75;
+        margin-top: 2px;
+      }
+
+      .twrp-context-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin: 6px 0 10px;
+      }
+
+      .twrp-context-pill,
+      .twrp-count-pill {
+        display: inline-block;
+        padding: 3px 7px;
+        border: 1px solid #c8a765;
+        border-radius: 999px;
+        background: #fffaf0;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .twrp-section-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        margin: 12px 0 6px;
+      }
+
+      .twrp-section-head .twrp-section-title {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .twrp-section-subtitle {
+        margin-top: 2px;
+        font-size: 11px;
+        opacity: 0.74;
+      }
+
+      .twrp-placement-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 9px;
+      }
+
+      .twrp-placement-card,
+      .twrp-impact-card {
+        border: 1px solid #c8a765;
+        border-radius: 8px;
+        background: #fff7e5;
+        padding: 9px;
+        box-shadow: 0 1px 0 rgba(0,0,0,0.08);
+      }
+
+      .twrp-placement-top {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        margin-bottom: 8px;
+      }
+
+      .twrp-step-badge {
+        min-width: 24px;
+        height: 24px;
+        padding-top: 4px;
+        border-radius: 50%;
+        background: #7d510f;
+        color: #fffaf0;
+        font-weight: bold;
+        text-align: center;
+        line-height: 16px;
+        flex: 0 0 auto;
+      }
+
+      .twrp-relic-block {
+        min-width: 0;
+      }
+
+      .twrp-relic-name {
+        font-weight: bold;
+        font-size: 13px;
+        line-height: 1.25;
+      }
+
+      .twrp-relic-meta {
+        font-size: 11px;
+        opacity: 0.75;
+        margin-top: 1px;
+      }
+
+      .twrp-quality-renowned { color: #8a5a13; }
+      .twrp-quality-superior { color: #5f34a3; }
+      .twrp-quality-enhanced { color: #2f46a3; }
+      .twrp-quality-sturdy { color: #2f855a; }
+      .twrp-quality-shoddy { color: #666; }
+
+      .twrp-target-block {
+        padding: 7px;
+        border-radius: 6px;
+        background: rgba(255,255,255,0.55);
+        border: 1px solid #ead8b3;
+        margin-bottom: 8px;
+      }
+
+      .twrp-target-name {
+        font-weight: bold;
+        overflow-wrap: anywhere;
+      }
+
+      .twrp-score-row {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+
+      .twrp-score-row .twrp-metric-card {
+        padding: 6px;
+      }
+
+      .twrp-score-row .twrp-metric-value {
+        font-size: 14px;
+      }
+
+      .twrp-stat-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        align-items: flex-start;
+      }
+
+      .twrp-stat-pill {
+        display: inline-flex;
+        gap: 4px;
+        align-items: center;
+        padding: 4px 6px;
+        border-radius: 999px;
+        border: 1px solid #d4bf8f;
+        background: #fffaf0;
+        font-size: 11px;
+        line-height: 1.15;
+      }
+
+      .twrp-stat-label {
+        opacity: 0.82;
+      }
+
+      .twrp-stat-barracks { border-color: #bd8b8b; }
+      .twrp-stat-stable { border-color: #8b9abd; }
+      .twrp-stat-garage { border-color: #bda98b; }
+      .twrp-stat-snob { border-color: #a78bbd; }
+
+      .twrp-coverage-details {
+        margin-top: 8px;
+        font-size: 11px;
+      }
+
+      .twrp-coverage-details > summary {
+        cursor: pointer;
+        opacity: 0.82;
+      }
+
+      .twrp-covered-line {
+        padding: 3px 0;
+        border-bottom: 1px solid rgba(189,156,90,0.25);
+      }
+
+      .twrp-impact-preview {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .twrp-impact-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 7px;
+      }
+
+      .twrp-full-impact .twrp-table-wrap {
+        margin-top: 8px;
+      }
+
+      .twrp-compact-table td {
+        vertical-align: middle;
+      }
+
+      .twrp-muted-block {
+        margin-top: 8px;
+        padding: 8px;
+        background: #fffaf0;
+        border: 1px solid #ead8b3;
+        border-radius: 6px;
+        line-height: 1.4;
+      }
+
+      .twrp-scoring-info {
+        margin-top: 10px;
+      }
+
+      @media (max-width: 800px) {
+        .twrp-summary-grid,
+        .twrp-placement-grid,
+        .twrp-impact-preview {
+          grid-template-columns: 1fr;
+        }
+      }
+
     `;
 
     document.head.appendChild(style);
@@ -1929,8 +2265,9 @@ function buildVillageImpactSummary(plan) {
 
     const help = document.createElement("div");
     help.className = "twrp-help";
-    help.textContent =
-			"Loads village coordinates or production data depending on goal, plus relic inventory and current relic overview after a manual click. Recruitment uses free farm by default. Offense uses equal village weighting by default. More planning options and goal types may be added in future updates.";
+    help.innerHTML =
+      "<strong>Plan relic placements.</strong> Choose goal, simulation mode and weighting. " +
+      "Click optimize, review the cards, then copy the BBCode plan when it looks right.";
 
     const grid = document.createElement("div");
     grid.className = "twrp-grid";
