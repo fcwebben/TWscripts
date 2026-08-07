@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.0.1";
+  const SCRIPT_VERSION = "v1.0.2";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -1431,6 +1431,14 @@ function buildVillageImpactSummary(plan) {
     ui.results.appendChild(contextBar);
   }
 
+  function createBbCoordElement(village, className) {
+    return createUiElement(
+      "span",
+      "twrp-bb-code" + (className ? " " + className : ""),
+      formatVillageCoordForCopy(village)
+    );
+  }
+
   function createCoveragePreview(item) {
     const details = document.createElement("details");
     details.className = "twrp-coverage-details";
@@ -1442,7 +1450,7 @@ function buildVillageImpactSummary(plan) {
     const list = createUiElement("div", "twrp-covered-list");
     item.covered.forEach(village => {
       const line = createUiElement("div", "twrp-covered-line");
-      line.textContent = village.coord + " - " + village.name;
+      line.appendChild(createBbCoordElement(village));
       list.appendChild(line);
     });
 
@@ -1475,7 +1483,7 @@ function buildVillageImpactSummary(plan) {
 
       const target = createUiElement("div", "twrp-target-block");
       target.appendChild(createUiElement("div", "twrp-mini-label", "Place at"));
-      target.appendChild(createUiElement("div", "twrp-target-name", item.center.coord + " - " + item.center.name));
+      target.appendChild(createUiElement("div", "twrp-target-name twrp-bb-code", formatVillageCoordForCopy(item.center)));
       card.appendChild(target);
 
       const scoreRow = createUiElement("div", "twrp-score-row");
@@ -1510,7 +1518,7 @@ function buildVillageImpactSummary(plan) {
     impactRows.slice(0, 8).forEach((item, index) => {
       const card = createUiElement("div", "twrp-impact-card");
       const head = createUiElement("div", "twrp-impact-head");
-      head.appendChild(createUiElement("strong", "", (index + 1) + ". " + item.village.coord));
+      head.appendChild(createUiElement("strong", "twrp-bb-code", (index + 1) + ". " + formatVillageCoordForCopy(item.village)));
       head.appendChild(createUiElement("span", "twrp-count-pill", item.relicCount + " relics"));
       card.appendChild(head);
       card.appendChild(createStatPills(Object.keys(item.stats || {}).map(key => ({ key: key, value: item.stats[key] })), false));
@@ -1545,7 +1553,7 @@ function buildVillageImpactSummary(plan) {
     impactRows.forEach((item, index) => {
       const row = document.createElement("tr");
       appendTableCell(row, String(index + 1));
-      appendTableCell(row, item.village.coord, "twrp-left");
+      appendTableCell(row, formatVillageCoordForCopy(item.village), "twrp-left twrp-bb-code");
       appendTableCell(row, String(item.relicCount));
 
       const statsCell = document.createElement("td");
@@ -2172,6 +2180,102 @@ function buildVillageImpactSummary(plan) {
 
       .twrp-scoring-info {
         margin-top: 10px;
+      }
+
+      .twrp-bb-code {
+        display: inline-block;
+        padding: 2px 5px;
+        border: 1px solid #d4bf8f;
+        border-radius: 5px;
+        background: rgba(255,250,240,0.9);
+        font-family: Consolas, Menlo, monospace;
+        font-size: 11px;
+        line-height: 1.25;
+        color: #2f1b00;
+        white-space: nowrap;
+      }
+
+      .twrp-placement-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+      }
+
+      .twrp-placement-card,
+      .twrp-impact-card {
+        padding: 6px;
+        border-radius: 6px;
+      }
+
+      .twrp-placement-top {
+        gap: 6px;
+        margin-bottom: 5px;
+      }
+
+      .twrp-step-badge {
+        min-width: 20px;
+        height: 20px;
+        padding-top: 2px;
+        font-size: 11px;
+        line-height: 16px;
+      }
+
+      .twrp-relic-name {
+        font-size: 12px;
+        line-height: 1.15;
+      }
+
+      .twrp-relic-meta {
+        font-size: 10px;
+      }
+
+      .twrp-target-block {
+        padding: 5px;
+        margin-bottom: 5px;
+      }
+
+      .twrp-target-name {
+        font-size: 11px;
+      }
+
+      .twrp-score-row {
+        gap: 4px;
+        margin-bottom: 5px;
+      }
+
+      .twrp-score-row .twrp-metric-card {
+        padding: 4px;
+      }
+
+      .twrp-score-row .twrp-metric-label {
+        font-size: 9px;
+        margin-bottom: 1px;
+      }
+
+      .twrp-score-row .twrp-metric-value {
+        font-size: 13px;
+      }
+
+      .twrp-score-row .twrp-metric-detail {
+        display: none;
+      }
+
+      .twrp-stat-pill {
+        padding: 3px 5px;
+        font-size: 10px;
+      }
+
+      .twrp-coverage-details {
+        margin-top: 5px;
+      }
+
+      .twrp-covered-line {
+        padding: 2px 0;
+      }
+
+      @media (max-width: 1100px) {
+        .twrp-placement-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
       }
 
       @media (max-width: 800px) {
