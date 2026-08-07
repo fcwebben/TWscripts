@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.0.3";
+  const SCRIPT_VERSION = "v1.0.4-experimental";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -1464,6 +1464,256 @@ function buildVillageImpactSummary(plan) {
     return details;
   }
 
+
+  function buildRelicInventoryUrlForVillage(villageId) {
+    const url = new URL("/game.php", window.location.origin);
+
+    if (
+      typeof game_data !== "undefined" &&
+      game_data.player &&
+      parseInt(game_data.player.sitter || 0, 10) > 0
+    ) {
+      url.searchParams.set("t", String(game_data.player.id));
+    }
+
+    url.searchParams.set("village", String(villageId || getCurrentVillageId()));
+    url.searchParams.set("screen", "relic_system");
+    url.searchParams.set("mode", "inventory");
+
+    return url.pathname + url.search;
+  }
+
+  function cssAttributeEscape(value) {
+    if (window.CSS && typeof window.CSS.escape === "function") {
+      return window.CSS.escape(String(value || ""));
+    }
+
+    return String(value || "")
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"');
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async function waitForCondition(checkFn, timeoutMs, intervalMs) {
+    const started = Date.now();
+
+    while (Date.now() - started <= timeoutMs) {
+      const result = checkFn();
+
+      if (result) {
+        return result;
+      }
+
+      await sleep(intervalMs || 200);
+    }
+
+    return null;
+  }
+
+  function isDirectEquipEligible(item) {
+    const relic = item && item.relic;
+
+    if (!relic || !/^\d+$/.test(String(relic.id || ""))) {
+      return false;
+    }
+
+    if (relic.fromOverview || relic.villageId || relic.equippedAt) {
+      return false;
+    }
+
+    return true;
+  }
+
+  function createEquipFrame() {
+    const oldFrame = document.getElementById("twrp-equip-frame");
+
+    if (oldFrame) {
+      oldFrame.remove();
+    }
+
+    const iframe = document.createElement("iframe");
+    iframe.id = "twrp-equip-frame";
+    iframe.className = "twrp-equip-frame";
+    iframe.setAttribute("aria-hidden", "true");
+    document.body.appendChild(iframe);
+
+    return iframe;
+  }
+
+  async function waitForFrameLoad(iframe, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const timeout = window.setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        reject(new Error("Timed out while loading target village inventory."));
+      }, timeoutMs || 15000);
+
+      iframe.addEventListener("load", () => {
+        if (finished) return;
+        finished = true;
+        window.clearTimeout(timeout);
+        resolve();
+      }, { once: true });
+    });
+  }
+
+  function getRelicImageSelector(relicId) {
+    return '#relics img[data-id="' + cssAttributeEscape(relicId) + '"]';
+  }
+
+  function getVisibleRelicIds(doc) {
+    return Array.from(doc.querySelectorAll("#relics img[data-id]"))
+      .map(img => img.getAttribute("data-id") || "")
+      .join(",");
+  }
+
+  async function findRelicImageAcrossInventoryPages(doc, relicId) {
+    const selector = getRelicImageSelector(relicId);
+
+    for (let page = 0; page < 35; page++) {
+      const image = doc.querySelector(selector);
+
+      if (image) {
+        return image;
+      }
+
+      const next = doc.querySelector("#next_page.arrowRight");
+
+      if (!next) {
+        return null;
+      }
+
+      const before = getVisibleRelicIds(doc);
+      next.click();
+
+      await waitForCondition(() => {
+        const after = getVisibleRelicIds(doc);
+        return after && after !== before;
+      }, 3500, 150);
+    }
+
+    return null;
+  }
+
+  async function equipRecommendedRelic(item, button) {
+    const relic = item && item.relic;
+    const center = item && item.center;
+    const relicId = relic ? String(relic.id || "") : "";
+    const villageId = center ? String(center.id || "") : "";
+
+    if (!relicId || !villageId) {
+      setStatus("Missing relic or target village data.", "error");
+      return;
+    }
+
+    if (!isDirectEquipEligible(item)) {
+      setStatus("This recommendation is not directly equippable because the relic appears to be already placed or unavailable in inventory.", "warn");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "Experimental direct equip. This will try to open the target village inventory in a hidden frame, select the relic and click Equip. Continue?"
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    const previousText = button ? button.textContent : "";
+
+    try {
+      if (button) {
+        button.disabled = true;
+        button.textContent = "Equipping...";
+      }
+
+      setStatus("Loading target village inventory for " + formatVillageCoordForUi(center) + "...", "warn");
+
+      const iframe = createEquipFrame();
+      iframe.src = buildRelicInventoryUrlForVillage(villageId);
+      await waitForFrameLoad(iframe, 18000);
+
+      const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+
+      if (!doc) {
+        throw new Error("Could not access target village inventory frame.");
+      }
+
+      await waitForCondition(() => doc.querySelector("#relics"), 12000, 200);
+
+      const relicImage = await findRelicImageAcrossInventoryPages(doc, relicId);
+
+      if (!relicImage) {
+        throw new Error("Could not find relic ID " + relicId + " in the target village inventory pages.");
+      }
+
+      relicImage.scrollIntoView({ block: "center", inline: "center" });
+      relicImage.click();
+
+      await waitForCondition(() => {
+        return doc.querySelector("#relics .relic-selected img[data-id=\"" + cssAttributeEscape(relicId) + "\"]") ||
+          doc.querySelector("#selected_relic_details #equip_button");
+      }, 6000, 150);
+
+      const equipButton = await waitForCondition(() => {
+        const found = doc.querySelector("#selected_relic_details #equip_button, #equip_button");
+
+        if (!found || found.disabled || found.classList.contains("btn-disabled")) {
+          return null;
+        }
+
+        return found;
+      }, 8000, 200);
+
+      if (!equipButton) {
+        throw new Error("Relic was selected, but no active Equip button was found.");
+      }
+
+      equipButton.click();
+
+      setStatus("Equip clicked for " + relic.name + " at " + formatVillageCoordForUi(center) + ". Verify the result in game.", "success");
+
+      if (button) {
+        button.textContent = "Clicked";
+      }
+
+      window.setTimeout(() => {
+        const frame = document.getElementById("twrp-equip-frame");
+        if (frame) frame.remove();
+      }, 8000);
+    } catch (err) {
+      console.error(SCRIPT_NAME + " direct equip failed:", err);
+      setStatus(err.message || String(err), "error");
+
+      if (button) {
+        button.disabled = false;
+        button.textContent = previousText || "Equip";
+      }
+    }
+  }
+
+  function createPlacementActions(item) {
+    const actions = createUiElement("div", "twrp-placement-actions");
+    const equipButton = createUiElement("button", "btn twrp-equip-btn", "Equip");
+    equipButton.type = "button";
+
+    if (!isDirectEquipEligible(item)) {
+      equipButton.disabled = true;
+      equipButton.textContent = "Not in inventory";
+      equipButton.title = "Direct equip is only available for relics that appear to be unequipped and available in inventory.";
+    } else {
+      equipButton.title = "Experimental: tries to select this relic in the target village inventory and click Equip.";
+      equipButton.addEventListener("click", () => equipRecommendedRelic(item, equipButton));
+    }
+
+    actions.appendChild(equipButton);
+    return actions;
+  }
+
   function renderPlacementCards() {
     ui.results.appendChild(createSectionHeader(
       "Recommended placements",
@@ -1500,6 +1750,7 @@ function buildVillageImpactSummary(plan) {
 
       card.appendChild(createStatPills(item.relevantStats, true));
       card.appendChild(createCoveragePreview(item));
+      card.appendChild(createPlacementActions(item));
 
       grid.appendChild(card);
     });
@@ -2263,6 +2514,33 @@ function buildVillageImpactSummary(plan) {
 
       .twrp-covered-line {
         padding: 2px 0;
+      }
+
+      .twrp-placement-actions {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: 5px;
+      }
+
+      .twrp-equip-btn {
+        font-size: 10px;
+        padding: 3px 8px;
+        line-height: 1.2;
+      }
+
+      .twrp-equip-btn[disabled] {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      .twrp-equip-frame {
+        position: fixed;
+        left: -12000px;
+        top: -12000px;
+        width: 1200px;
+        height: 900px;
+        opacity: 0;
+        pointer-events: none;
       }
 
       @media (max-width: 1100px) {
