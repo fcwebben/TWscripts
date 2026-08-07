@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.1.2";
+  const SCRIPT_VERSION = "v1.1.3";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
@@ -1103,8 +1103,8 @@
   function getRelicIdentityKey(relic) {
     const id = String(relic && relic.id || "");
 
-    if (id && id.indexOf("placed-") !== 0) {
-      return "id:" + id;
+    if (id) {
+      return (id.indexOf("placed-") === 0 ? "placed:" : "id:") + id;
     }
 
     return "sig:" + relicSignature(relic);
@@ -1127,30 +1127,27 @@
 
   function mergePlacedRelicsWithInventory(inventoryRelics, overviewRelics) {
     const merged = [];
-    const seen = new Set();
+    const seenInventoryIds = new Set();
+    const seenPlacedVillageSignatures = new Set();
 
     (inventoryRelics || []).forEach(relic => {
       if (!relic.villageId && !relic.equippedAt) return;
 
       const enriched = enrichPlacedInventoryRelic(relic);
-      const keys = [
-        getRelicIdentityKey(enriched),
-        "village:" + (enriched.villageId || enriched.coord || "") + ":" + relicSignature(enriched)
-      ];
+      const identityKey = getRelicIdentityKey(enriched);
+      const villageSignatureKey = "village:" + (enriched.villageId || enriched.coord || "") + ":" + relicSignature(enriched);
 
-      keys.forEach(key => seen.add(key));
+      seenInventoryIds.add(identityKey);
+      seenPlacedVillageSignatures.add(villageSignatureKey);
       merged.push(enriched);
     });
 
     (overviewRelics || []).forEach(relic => {
-      const keys = [
-        getRelicIdentityKey(relic),
-        "village:" + (relic.villageId || relic.coord || "") + ":" + relicSignature(relic)
-      ];
+      const villageSignatureKey = "village:" + (relic.villageId || relic.coord || "") + ":" + relicSignature(relic);
 
-      if (keys.some(key => seen.has(key))) return;
+      if (seenPlacedVillageSignatures.has(villageSignatureKey)) return;
 
-      keys.forEach(key => seen.add(key));
+      seenPlacedVillageSignatures.add(villageSignatureKey);
       merged.push(Object.assign({}, relic, { fromOverview: true }));
     });
 
@@ -1436,22 +1433,14 @@
 
   function dedupeAvailableRelics(relics) {
     const result = [];
-    const seenIds = new Set();
-    const seenOverviewSignatures = new Set();
+    const seenKeys = new Set();
 
     (relics || []).forEach(relic => {
-      const id = String(relic.id || "");
+      const key = getRelicIdentityKey(relic);
 
-      if (id && id.indexOf("placed-") !== 0) {
-        if (seenIds.has(id)) return;
-        seenIds.add(id);
-        result.push(relic);
-        return;
-      }
+      if (seenKeys.has(key)) return;
 
-      const signature = relicSignature(relic);
-      if (seenOverviewSignatures.has(signature)) return;
-      seenOverviewSignatures.add(signature);
+      seenKeys.add(key);
       result.push(relic);
     });
 
