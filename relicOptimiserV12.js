@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.0.5-experimental";
+  const SCRIPT_VERSION = "v1.0.6-experimental";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -1529,7 +1529,7 @@ function buildVillageImpactSummary(plan) {
     if (!element) return;
 
     const win = frameWindow || window;
-    ["mousedown", "mouseup", "click"].forEach(type => {
+    ["mouseover", "mousedown", "mouseup", "click"].forEach(type => {
       const event = new win.MouseEvent(type, {
         view: win,
         bubbles: true,
@@ -1537,6 +1537,121 @@ function buildVillageImpactSummary(plan) {
       });
       element.dispatchEvent(event);
     });
+  }
+
+  function tryNativeClick(element) {
+    if (!element || typeof element.click !== "function") return;
+
+    try {
+      element.click();
+    } catch (err) {
+      // ignore native click failures
+    }
+  }
+
+  function tryJQueryClick(frameWindow, element) {
+    if (!frameWindow || !element) return false;
+
+    const jq = frameWindow.jQuery || frameWindow.$;
+
+    if (!jq) return false;
+
+    try {
+      jq(element).trigger("mousedown");
+      jq(element).trigger("mouseup");
+      jq(element).trigger("click");
+      return true;
+    } catch (err) {
+      logDirectEquipStep("jquery click failed", err && err.message ? err.message : String(err));
+      return false;
+    }
+  }
+
+  function isRelicSelected(doc, relicId) {
+    if (!doc) return null;
+
+    return doc.querySelector('#relics .relic-selected img[data-id="' + cssAttributeEscape(relicId) + '"]') ||
+      doc.querySelector("#selected_relic_details #equip_button, #equip_button");
+  }
+
+  function tryRelicSystemSelection(frameWindow, relicId, relicImage) {
+    const inventory = frameWindow && frameWindow.RelicSystem && frameWindow.RelicSystem.Inventory;
+
+    if (!inventory) {
+      logDirectEquipStep("RelicSystem.Inventory api missing");
+      return false;
+    }
+
+    const keys = Object.keys(inventory).filter(key => typeof inventory[key] === "function");
+    logDirectEquipStep("RelicSystem.Inventory api methods", keys);
+
+    const methodNames = [
+      "selectRelic",
+      "select_relic",
+      "select",
+      "showRelic",
+      "show_relic",
+      "showRelicDetails",
+      "show_relic_details",
+      "setSelectedRelic",
+      "set_selected_relic",
+      "openRelic",
+      "open_relic"
+    ];
+
+    const argsList = [
+      [String(relicId)],
+      [parseInt(relicId, 10)],
+      [relicImage],
+      [relicImage, String(relicId)],
+      [String(relicId), relicImage]
+    ];
+
+    let called = false;
+
+    methodNames.forEach(name => {
+      if (typeof inventory[name] !== "function") return;
+
+      argsList.forEach(args => {
+        try {
+          inventory[name].apply(inventory, args);
+          called = true;
+          logDirectEquipStep("called RelicSystem.Inventory." + name, args.map(arg => {
+            return arg && arg.nodeType ? "<element>" : arg;
+          }));
+        } catch (err) {
+          // Most guessed signatures will fail. Keep trying.
+        }
+      });
+    });
+
+    return called;
+  }
+
+  async function selectRelicInFrame(frameWindow, doc, relicId, relicImage) {
+    const clickableRelic = relicImage.closest("#relics > div") || relicImage;
+
+    logDirectEquipStep("selection attempt: direct image click");
+    dispatchFrameClick(frameWindow, relicImage);
+    tryNativeClick(relicImage);
+    tryJQueryClick(frameWindow, relicImage);
+
+    let selected = await waitForCondition(() => isRelicSelected(doc, relicId), 2500, 100);
+    if (selected) return selected;
+
+    logDirectEquipStep("selection attempt: wrapper click");
+    dispatchFrameClick(frameWindow, clickableRelic);
+    tryNativeClick(clickableRelic);
+    tryJQueryClick(frameWindow, clickableRelic);
+
+    selected = await waitForCondition(() => isRelicSelected(doc, relicId), 2500, 100);
+    if (selected) return selected;
+
+    logDirectEquipStep("selection attempt: RelicSystem.Inventory api");
+    tryRelicSystemSelection(frameWindow, relicId, relicImage);
+
+    selected = await waitForCondition(() => isRelicSelected(doc, relicId), 3000, 100);
+    return selected;
   }
 
   function isDirectEquipEligible(item) {
@@ -1703,23 +1818,24 @@ function buildVillageImpactSummary(plan) {
       const clickableRelic = relicImage.closest("#relics > div") || relicImage;
       logDirectEquipStep("relic found", {
         relicId: relicId,
+        imageClass: relicImage.className || "",
         clickableClass: clickableRelic.className || ""
       });
 
       relicImage.scrollIntoView({ block: "center", inline: "center" });
       setStatus("Selecting relic " + relic.name + "...", "warn");
-      dispatchFrameClick(frameWindow, clickableRelic);
 
-      const selected = await waitForCondition(() => {
-        return doc.querySelector("#relics .relic-selected img[data-id=\"" + cssAttributeEscape(relicId) + "\"]") ||
-          doc.querySelector("#selected_relic_details #equip_button, #equip_button");
-      }, 8000, 150);
+      const selected = await selectRelicInFrame(frameWindow, doc, relicId, relicImage);
 
       if (!selected) {
-        throw new Error("Relic image was clicked, but the relic was not selected by the game UI.");
+        throw new Error("Relic could not be selected. Tried image click, wrapper click, jQuery click and known RelicSystem.Inventory methods.");
       }
 
-      logDirectEquipStep("relic selected");
+      logDirectEquipStep("relic selected", {
+        selectedTag: selected.tagName || "unknown",
+        selectedId: selected.id || "",
+        selectedClass: selected.className || ""
+      });
 
       const equipButton = await waitForCondition(() => {
         const found = doc.querySelector("#selected_relic_details #equip_button, #equip_button");
