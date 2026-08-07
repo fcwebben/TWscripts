@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.0.4-experimental";
+  const SCRIPT_VERSION = "v1.0.5-experimental";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -1513,6 +1513,32 @@ function buildVillageImpactSummary(plan) {
     return null;
   }
 
+  function logDirectEquipStep(message, data) {
+    try {
+      if (data !== undefined) {
+        console.log(SCRIPT_NAME + " direct equip: " + message, data);
+      } else {
+        console.log(SCRIPT_NAME + " direct equip: " + message);
+      }
+    } catch (err) {
+      // ignore logging failures
+    }
+  }
+
+  function dispatchFrameClick(frameWindow, element) {
+    if (!element) return;
+
+    const win = frameWindow || window;
+    ["mousedown", "mouseup", "click"].forEach(type => {
+      const event = new win.MouseEvent(type, {
+        view: win,
+        bubbles: true,
+        cancelable: true
+      });
+      element.dispatchEvent(event);
+    });
+  }
+
   function isDirectEquipEligible(item) {
     const relic = item && item.relic;
 
@@ -1631,33 +1657,69 @@ function buildVillageImpactSummary(plan) {
         button.textContent = "Equipping...";
       }
 
+      logDirectEquipStep("starting", {
+        relicId: relicId,
+        relicName: relic.name,
+        villageId: villageId,
+        target: formatVillageForUi(center)
+      });
+
       setStatus("Loading target village inventory for " + formatVillageCoordForUi(center) + "...", "warn");
 
       const iframe = createEquipFrame();
-      iframe.src = buildRelicInventoryUrlForVillage(villageId);
+      const targetUrl = buildRelicInventoryUrlForVillage(villageId);
+      logDirectEquipStep("loading iframe", targetUrl);
+      iframe.src = targetUrl;
       await waitForFrameLoad(iframe, 18000);
 
-      const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+      const frameWindow = iframe.contentWindow;
+      const doc = iframe.contentDocument || (frameWindow && frameWindow.document);
 
       if (!doc) {
         throw new Error("Could not access target village inventory frame.");
       }
 
-      await waitForCondition(() => doc.querySelector("#relics"), 12000, 200);
+      logDirectEquipStep("iframe loaded", {
+        href: doc.location ? doc.location.href : "unknown",
+        title: doc.title || ""
+      });
 
+      const relicContainer = await waitForCondition(() => doc.querySelector("#relics"), 12000, 200);
+
+      if (!relicContainer) {
+        throw new Error("Target inventory loaded, but the relic inventory container was not found.");
+      }
+
+      await waitForCondition(() => doc.querySelector("#relics img[data-id]"), 8000, 200);
+      logDirectEquipStep("visible relic ids", getVisibleRelicIds(doc));
+
+      setStatus("Searching inventory pages for relic ID " + relicId + "...", "warn");
       const relicImage = await findRelicImageAcrossInventoryPages(doc, relicId);
 
       if (!relicImage) {
-        throw new Error("Could not find relic ID " + relicId + " in the target village inventory pages.");
+        throw new Error("Could not find relic ID " + relicId + " in the target village inventory pages. Visible relic IDs: " + getVisibleRelicIds(doc));
       }
 
-      relicImage.scrollIntoView({ block: "center", inline: "center" });
-      relicImage.click();
+      const clickableRelic = relicImage.closest("#relics > div") || relicImage;
+      logDirectEquipStep("relic found", {
+        relicId: relicId,
+        clickableClass: clickableRelic.className || ""
+      });
 
-      await waitForCondition(() => {
+      relicImage.scrollIntoView({ block: "center", inline: "center" });
+      setStatus("Selecting relic " + relic.name + "...", "warn");
+      dispatchFrameClick(frameWindow, clickableRelic);
+
+      const selected = await waitForCondition(() => {
         return doc.querySelector("#relics .relic-selected img[data-id=\"" + cssAttributeEscape(relicId) + "\"]") ||
-          doc.querySelector("#selected_relic_details #equip_button");
-      }, 6000, 150);
+          doc.querySelector("#selected_relic_details #equip_button, #equip_button");
+      }, 8000, 150);
+
+      if (!selected) {
+        throw new Error("Relic image was clicked, but the relic was not selected by the game UI.");
+      }
+
+      logDirectEquipStep("relic selected");
 
       const equipButton = await waitForCondition(() => {
         const found = doc.querySelector("#selected_relic_details #equip_button, #equip_button");
@@ -1673,9 +1735,12 @@ function buildVillageImpactSummary(plan) {
         throw new Error("Relic was selected, but no active Equip button was found.");
       }
 
-      equipButton.click();
+      logDirectEquipStep("clicking equip button");
+      setStatus("Clicking Equip for " + relic.name + " at " + formatVillageCoordForUi(center) + "...", "warn");
+      dispatchFrameClick(frameWindow, equipButton);
 
       setStatus("Equip clicked for " + relic.name + " at " + formatVillageCoordForUi(center) + ". Verify the result in game.", "success");
+      logDirectEquipStep("equip clicked");
 
       if (button) {
         button.textContent = "Clicked";
