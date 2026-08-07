@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.1.3";
+  const SCRIPT_VERSION = "v1.1.4";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
@@ -1125,33 +1125,21 @@
     });
   }
 
-  function mergePlacedRelicsWithInventory(inventoryRelics, overviewRelics) {
-    const merged = [];
-    const seenInventoryIds = new Set();
-    const seenPlacedVillageSignatures = new Set();
-
-    (inventoryRelics || []).forEach(relic => {
-      if (!relic.villageId && !relic.equippedAt) return;
-
-      const enriched = enrichPlacedInventoryRelic(relic);
-      const identityKey = getRelicIdentityKey(enriched);
-      const villageSignatureKey = "village:" + (enriched.villageId || enriched.coord || "") + ":" + relicSignature(enriched);
-
-      seenInventoryIds.add(identityKey);
-      seenPlacedVillageSignatures.add(villageSignatureKey);
-      merged.push(enriched);
+  function getPlacedRelicsFromBestSource(inventoryRelics, overviewRelics) {
+    const placedFromOverview = (overviewRelics || []).map(relic => {
+      return Object.assign({}, relic, {
+        fromOverview: true,
+        fromInventory: false
+      });
     });
 
-    (overviewRelics || []).forEach(relic => {
-      const villageSignatureKey = "village:" + (relic.villageId || relic.coord || "") + ":" + relicSignature(relic);
+    if (placedFromOverview.length) {
+      return placedFromOverview;
+    }
 
-      if (seenPlacedVillageSignatures.has(villageSignatureKey)) return;
-
-      seenPlacedVillageSignatures.add(villageSignatureKey);
-      merged.push(Object.assign({}, relic, { fromOverview: true }));
-    });
-
-    return merged;
+    return (inventoryRelics || [])
+      .filter(relic => relic.villageId || relic.equippedAt)
+      .map(enrichPlacedInventoryRelic);
   }
 
 	function countUnlockedRelicSlotsFromOverviewHtml(html) {
@@ -1411,19 +1399,18 @@
     if (mode === "rebuild") {
       const inventoryRelics = state.inventoryRelics.map(relic => {
         return Object.assign({}, relic, {
-          fromInventory: true
+          fromInventory: true,
+          fromOverview: false
         });
       });
 
-      const overviewOnlyRelics = state.placedRelics
-        .filter(relic => !relic.fromInventory)
-        .map(relic => {
-          return Object.assign({}, relic, {
-            fromOverview: true
-          });
+      const placedRelics = state.placedRelics.map(relic => {
+        return Object.assign({}, relic, {
+          fromOverview: true
         });
+      });
 
-      return dedupeAvailableRelics(inventoryRelics.concat(overviewOnlyRelics));
+      return dedupeAvailableRelics(inventoryRelics.concat(placedRelics));
     }
 
     return state.inventoryRelics.filter(relic => {
@@ -1651,10 +1638,10 @@
 	  rebuildVillageIndexes();
 
 	  state.inventoryRelics = extractInventoryRelicsFromHtml(responses[1]);
-		state.placedRelics = mergePlacedRelicsWithInventory(
-			state.inventoryRelics,
-			extractPlacedRelicsFromOverviewHtml(responses[2])
-		);
+      state.placedRelics = getPlacedRelicsFromBestSource(
+        state.inventoryRelics,
+        extractPlacedRelicsFromOverviewHtml(responses[2])
+      );
 		state.unlockedRelicSlots = countUnlockedRelicSlotsFromOverviewHtml(responses[2]);
     applyWorldRelicSettings(detectWorldRelicSettings({
       inventoryRelics: state.inventoryRelics,
