@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.1.1";
+  const SCRIPT_VERSION = "v1.1.2";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
@@ -638,36 +638,46 @@
     const relicAliases = [
       "relic", "relics", "relikvia", "relikviak", "relikviák", "ereklye", "erekl",
       "benefit", "bonus", "haszna", "hasznanak", "hasznának", "effet", "bono", "bonus",
-      "relikt", "relikwia", "reliquia", "reliquie", "reliquia", "релик", "relică", "relicva"
+      "relikt", "relikwia", "reliquia", "reliquie", "релик", "relică", "relicva"
+    ];
+    const exampleAliases = [
+      "possible values", "following values", "következő értékek", "kovetkezo ertekek",
+      "werte", "valeurs", "valores", "valori", "wartosci", "wartości"
     ];
     const elements = Array.from(doc.querySelectorAll("p, li, div, td"));
 
-    function addCandidate(text, sourceWeight) {
+    function addCandidate(text) {
       const clean = cleanText(text);
-      if (!clean || clean.length > 1800) return;
+      if (!clean || clean.length > 900) return;
+      if (!includesAny(clean, capAliases)) return;
+      if (!includesAny(clean, relicAliases)) return;
+      if (includesAny(clean, exampleAliases)) return;
 
-      const values = extractNumericPercentValues(clean);
+      const values = extractNumericPercentValues(clean).filter(value => value >= 5 && value <= 50);
       if (!values.length) return;
 
-      let score = sourceWeight || 0;
-      if (includesAny(clean, capAliases)) score += 6;
-      if (includesAny(clean, relicAliases)) score += 3;
-      if (/\+\s*\d+(?:[.,]\d+)?\s*%/.test(clean)) score -= 2;
+      let score = 0;
+      if (includesAny(clean, capAliases)) score += 10;
+      if (includesAny(clean, relicAliases)) score += 5;
+      if (/\+\s*\d+(?:[.,]\d+)?\s*%/.test(clean)) score -= 5;
 
       values.forEach(value => {
         candidates.push({ value: value, score: score, text: clean });
       });
     }
 
-    elements.forEach(element => addCandidate(element.textContent, 0));
-    addCandidate(doc.body ? doc.body.textContent : html, -3);
+    elements.forEach(element => addCandidate(element.textContent));
 
     candidates.sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
-      return a.value - b.value;
+      if (a.value === 20 && b.value !== 20) return -1;
+      if (b.value === 20 && a.value !== 20) return 1;
+      if (a.value === 10 && b.value !== 10) return -1;
+      if (b.value === 10 && a.value !== 10) return 1;
+      return b.value - a.value;
     });
 
-    if (!candidates.length || candidates[0].score < 4) {
+    if (!candidates.length || candidates[0].score < 10) {
       return null;
     }
 
@@ -1913,7 +1923,7 @@ function formatStatsForCopy(stats, showPlusForPositive) {
     return "-";
   }
 
-  return sorted.map(stat => formatStatLineForCopy(stat, showPlusForPositive)).join("\n");
+  return sorted.map(stat => formatStatLineForCopy(stat, showPlusForPositive)).join("; ");
 }
 
 function formatImpactStatsForCopy(stats) {
@@ -1935,7 +1945,7 @@ function formatImpactStatsForCopy(stats) {
       key: key,
       value: stats[key]
     }, false);
-  }).join("\n");
+  }).join("; ");
 }
 
 function getRelicQualityColor(relic) {
