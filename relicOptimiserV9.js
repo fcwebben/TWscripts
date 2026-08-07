@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.0.2";
+  const SCRIPT_VERSION = "v1.0.3";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -1431,12 +1431,19 @@ function buildVillageImpactSummary(plan) {
     ui.results.appendChild(contextBar);
   }
 
-  function createBbCoordElement(village, className) {
-    return createUiElement(
-      "span",
-      "twrp-bb-code" + (className ? " " + className : ""),
-      formatVillageCoordForCopy(village)
-    );
+  function formatVillageCoordForUi(village) {
+    return village && village.coord ? village.coord : "-";
+  }
+
+  function formatVillageForUi(village) {
+    const coord = formatVillageCoordForUi(village);
+    const name = cleanText(village && village.name);
+
+    if (!name || name === coord) {
+      return coord;
+    }
+
+    return coord + " - " + name;
   }
 
   function createCoveragePreview(item) {
@@ -1449,8 +1456,7 @@ function buildVillageImpactSummary(plan) {
 
     const list = createUiElement("div", "twrp-covered-list");
     item.covered.forEach(village => {
-      const line = createUiElement("div", "twrp-covered-line");
-      line.appendChild(createBbCoordElement(village));
+      const line = createUiElement("div", "twrp-covered-line", formatVillageForUi(village));
       list.appendChild(line);
     });
 
@@ -1483,7 +1489,7 @@ function buildVillageImpactSummary(plan) {
 
       const target = createUiElement("div", "twrp-target-block");
       target.appendChild(createUiElement("div", "twrp-mini-label", "Place at"));
-      target.appendChild(createUiElement("div", "twrp-target-name twrp-bb-code", formatVillageCoordForCopy(item.center)));
+      target.appendChild(createUiElement("div", "twrp-target-name", formatVillageForUi(item.center)));
       card.appendChild(target);
 
       const scoreRow = createUiElement("div", "twrp-score-row");
@@ -1518,7 +1524,7 @@ function buildVillageImpactSummary(plan) {
     impactRows.slice(0, 8).forEach((item, index) => {
       const card = createUiElement("div", "twrp-impact-card");
       const head = createUiElement("div", "twrp-impact-head");
-      head.appendChild(createUiElement("strong", "twrp-bb-code", (index + 1) + ". " + formatVillageCoordForCopy(item.village)));
+      head.appendChild(createUiElement("strong", "", (index + 1) + ". " + formatVillageCoordForUi(item.village)));
       head.appendChild(createUiElement("span", "twrp-count-pill", item.relicCount + " relics"));
       card.appendChild(head);
       card.appendChild(createStatPills(Object.keys(item.stats || {}).map(key => ({ key: key, value: item.stats[key] })), false));
@@ -1553,7 +1559,7 @@ function buildVillageImpactSummary(plan) {
     impactRows.forEach((item, index) => {
       const row = document.createElement("tr");
       appendTableCell(row, String(index + 1));
-      appendTableCell(row, formatVillageCoordForCopy(item.village), "twrp-left twrp-bb-code");
+      appendTableCell(row, formatVillageCoordForUi(item.village), "twrp-left");
       appendTableCell(row, String(item.relicCount));
 
       const statsCell = document.createElement("td");
@@ -2182,19 +2188,6 @@ function buildVillageImpactSummary(plan) {
         margin-top: 10px;
       }
 
-      .twrp-bb-code {
-        display: inline-block;
-        padding: 2px 5px;
-        border: 1px solid #d4bf8f;
-        border-radius: 5px;
-        background: rgba(255,250,240,0.9);
-        font-family: Consolas, Menlo, monospace;
-        font-size: 11px;
-        line-height: 1.25;
-        color: #2f1b00;
-        white-space: nowrap;
-      }
-
       .twrp-placement-grid {
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 6px;
@@ -2202,13 +2195,13 @@ function buildVillageImpactSummary(plan) {
 
       .twrp-placement-card,
       .twrp-impact-card {
-        padding: 6px;
+        padding: 5px;
         border-radius: 6px;
       }
 
       .twrp-placement-top {
         gap: 6px;
-        margin-bottom: 5px;
+        margin-bottom: 4px;
       }
 
       .twrp-step-badge {
@@ -2229,12 +2222,12 @@ function buildVillageImpactSummary(plan) {
       }
 
       .twrp-target-block {
-        padding: 5px;
-        margin-bottom: 5px;
+        padding: 4px 5px;
+        margin-bottom: 4px;
       }
 
       .twrp-target-name {
-        font-size: 11px;
+        font-size: 10px;
       }
 
       .twrp-score-row {
@@ -2265,7 +2258,7 @@ function buildVillageImpactSummary(plan) {
       }
 
       .twrp-coverage-details {
-        margin-top: 5px;
+        margin-top: 4px;
       }
 
       .twrp-covered-line {
@@ -2458,7 +2451,7 @@ function buildVillageImpactSummary(plan) {
     const countWrap = document.createElement("div");
     const countLabel = document.createElement("label");
     countLabel.className = "twrp-label";
-    countLabel.textContent = "Max Relic Slots";
+    countLabel.textContent = "Relic Slots";
 
     const countInput = document.createElement("input");
     countInput.className = "twrp-input";
