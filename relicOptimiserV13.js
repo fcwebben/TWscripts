@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.0.6-experimental";
+  const SCRIPT_VERSION = "v1.0.7-experimental";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const BENEFIT_CAP = 20;
@@ -1654,6 +1654,43 @@ function buildVillageImpactSummary(plan) {
     return selected;
   }
 
+  function findEquipConfirmationButton(frameWindow, frameDoc) {
+    const roots = [
+      { label: "frame", doc: frameDoc, win: frameWindow },
+      { label: "parent", doc: document, win: window }
+    ];
+
+    for (let i = 0; i < roots.length; i++) {
+      const root = roots[i];
+
+      if (!root.doc) continue;
+
+      const button = root.doc.querySelector(
+        "#confirmation-box .evt-confirm-btn, " +
+        "#confirmation-box .btn-confirm-yes, " +
+        ".confirmation-box .evt-confirm-btn, " +
+        ".confirmation-box .btn-confirm-yes"
+      );
+
+      if (button && !button.disabled) {
+        const message = root.doc.querySelector("#confirmation-msg, .confirmation-msg");
+
+        return {
+          button: button,
+          label: root.label,
+          win: root.win || window,
+          message: cleanText(message ? message.textContent : "")
+        };
+      }
+    }
+
+    return null;
+  }
+
+  async function waitForEquipConfirmation(frameWindow, frameDoc) {
+    return waitForCondition(() => findEquipConfirmationButton(frameWindow, frameDoc), 8000, 150);
+  }
+
   function isDirectEquipEligible(item) {
     const relic = item && item.relic;
 
@@ -1855,11 +1892,30 @@ function buildVillageImpactSummary(plan) {
       setStatus("Clicking Equip for " + relic.name + " at " + formatVillageCoordForUi(center) + "...", "warn");
       dispatchFrameClick(frameWindow, equipButton);
 
-      setStatus("Equip clicked for " + relic.name + " at " + formatVillageCoordForUi(center) + ". Verify the result in game.", "success");
-      logDirectEquipStep("equip clicked");
+      logDirectEquipStep("equip clicked, waiting for confirmation");
+      setStatus("Waiting for equip confirmation dialog...", "warn");
+
+      const confirmation = await waitForEquipConfirmation(frameWindow, doc);
+
+      if (!confirmation) {
+        throw new Error("Equip was clicked, but no confirmation dialog was found. The relic may still require manual confirmation.");
+      }
+
+      logDirectEquipStep("confirmation found", {
+        location: confirmation.label,
+        message: confirmation.message
+      });
+
+      setStatus("Confirming equip for " + relic.name + " at " + formatVillageCoordForUi(center) + "...", "warn");
+      dispatchFrameClick(confirmation.win, confirmation.button);
+      tryNativeClick(confirmation.button);
+      tryJQueryClick(confirmation.win, confirmation.button);
+
+      setStatus("Equip confirmed for " + relic.name + " at " + formatVillageCoordForUi(center) + ". Verify the result in game.", "success");
+      logDirectEquipStep("confirmation clicked");
 
       if (button) {
-        button.textContent = "Clicked";
+        button.textContent = "Confirmed";
       }
 
       window.setTimeout(() => {
