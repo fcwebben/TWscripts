@@ -1073,6 +1073,211 @@ function formatImpactStats(stats) {
     .join(", ");
 }
 
+
+const STAT_COPY_ORDER = {
+  barracks_speed: 10,
+  barracks_cost: 11,
+  stable_speed: 20,
+  stable_cost: 21,
+  workshop_speed: 30,
+  workshop_cost: 31,
+  academy_speed: 40,
+  academy_cost: 41,
+  axe_attack: 100,
+  axe_offdef: 101,
+  spear_attack: 110,
+  spear_offdef: 111,
+  sword_attack: 120,
+  sword_offdef: 121,
+  archer_attack: 130,
+  archer_offdef: 131,
+  light_attack: 200,
+  light_offdef: 201,
+  marcher_attack: 210,
+  marcher_offdef: 211,
+  heavy_attack: 220,
+  heavy_offdef: 221,
+  ram_attack: 300,
+  ram_damage: 301,
+  catapult_attack: 310,
+  catapult_damage: 311
+};
+
+const STAT_COPY_LABELS = {
+  barracks_speed: "Barracks speed",
+  barracks_cost: "Barracks cost",
+  stable_speed: "Stable speed",
+  stable_cost: "Stable cost",
+  workshop_speed: "Workshop speed",
+  workshop_cost: "Workshop cost",
+  academy_speed: "Academy speed",
+  academy_cost: "Academy cost"
+};
+
+function getStatCopyOrder(key) {
+  return STAT_COPY_ORDER[key] !== undefined ? STAT_COPY_ORDER[key] : 999;
+}
+
+function sortStatsForCopy(stats) {
+  return (stats || []).slice().sort((a, b) => {
+    const keyA = a.key || "";
+    const keyB = b.key || "";
+    const orderA = getStatCopyOrder(keyA);
+    const orderB = getStatCopyOrder(keyB);
+
+    if (orderA !== orderB) return orderA - orderB;
+    return getStatCopyLabel(keyA).localeCompare(getStatCopyLabel(keyB));
+  });
+}
+
+function getStatBuildingIcon(key) {
+  const normalized = String(key || "");
+
+  if (
+    normalized.indexOf("barracks_") === 0 ||
+    normalized.indexOf("axe_") === 0 ||
+    normalized.indexOf("spear_") === 0 ||
+    normalized.indexOf("sword_") === 0 ||
+    normalized.indexOf("archer_") === 0
+  ) {
+    return "barracks";
+  }
+
+  if (
+    normalized.indexOf("stable_") === 0 ||
+    normalized.indexOf("light_") === 0 ||
+    normalized.indexOf("marcher_") === 0 ||
+    normalized.indexOf("heavy_") === 0 ||
+    normalized.indexOf("spy_") === 0
+  ) {
+    return "stable";
+  }
+
+  if (
+    normalized.indexOf("workshop_") === 0 ||
+    normalized.indexOf("ram_") === 0 ||
+    normalized.indexOf("catapult_") === 0
+  ) {
+    return "garage";
+  }
+
+  if (normalized.indexOf("academy_") === 0) {
+    return "snob";
+  }
+
+  return "main";
+}
+
+function getStatCopyLabel(key) {
+  return STAT_COPY_LABELS[key] || getStatDisplayName(key);
+}
+
+function isCostStat(key) {
+  return /_cost$/.test(String(key || ""));
+}
+
+function formatPercentCompact(value) {
+  const rounded = Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+  if (Number.isInteger(rounded)) {
+    return String(rounded);
+  }
+
+  return String(rounded).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function formatStatLineForCopy(stat, showPlusForPositive) {
+  if (!stat) return "-";
+
+  const key = stat.key || "";
+  const icon = getStatBuildingIcon(key);
+  const label = getStatCopyLabel(key);
+  const value = formatPercentCompact(stat.value);
+  const sign = isCostStat(key) ? "-" : (showPlusForPositive ? "+" : "");
+
+  return "[building]" + icon + "[/building] " + label + " " + sign + value + "%";
+}
+
+function formatStatsForCopy(stats, showPlusForPositive) {
+  const sorted = sortStatsForCopy(stats);
+
+  if (!sorted.length) {
+    return "-";
+  }
+
+  return sorted.map(stat => formatStatLineForCopy(stat, showPlusForPositive)).join("\n");
+}
+
+function formatImpactStatsForCopy(stats) {
+  const sorted = Object.keys(stats || {})
+    .sort((a, b) => {
+      const orderA = getStatCopyOrder(a);
+      const orderB = getStatCopyOrder(b);
+
+      if (orderA !== orderB) return orderA - orderB;
+      return getStatCopyLabel(a).localeCompare(getStatCopyLabel(b));
+    });
+
+  if (!sorted.length) {
+    return "-";
+  }
+
+  return sorted.map(key => {
+    return formatStatLineForCopy({
+      key: key,
+      value: stats[key]
+    }, false);
+  }).join("\n");
+}
+
+function getRelicQualityColor(relic) {
+  const text = cleanText((relic && (relic.quality || relic.name)) || "").toLowerCase();
+
+  if (text.indexOf("renowned") >= 0) return "#b7791f";
+  if (text.indexOf("superior") >= 0) return "#6a3bb4";
+  if (text.indexOf("enhanced") >= 0) return "#3b4cb4";
+  if (text.indexOf("sturdy") >= 0) return "#2f855a";
+  if (text.indexOf("shoddy") >= 0) return "#777777";
+
+  return "#3b4cb4";
+}
+
+function getRelicBuildingIcon(relic, stats) {
+  const sortedStats = sortStatsForCopy(stats || []);
+
+  if (sortedStats.length) {
+    return getStatBuildingIcon(sortedStats[0].key);
+  }
+
+  const name = cleanText(relic && relic.name).toLowerCase();
+
+  if (name.indexOf("horse") >= 0) return "stable";
+  if (name.indexOf("dummy") >= 0) return "barracks";
+  if (name.indexOf("workshop") >= 0) return "garage";
+  if (name.indexOf("academy") >= 0) return "snob";
+
+  return "main";
+}
+
+function bbEscape(value) {
+  return String(value || "")
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")");
+}
+
+function formatRelicForCopy(relic, stats) {
+  const icon = getRelicBuildingIcon(relic, stats);
+  const color = getRelicQualityColor(relic);
+
+  return "[building]" + icon + "[/building] [b][color=" + color + "]" + bbEscape(relic.name) + "[/color][/b]";
+}
+
+function formatVillageCoordForCopy(village) {
+  const coord = village && village.coord ? village.coord : "";
+
+  return coord ? "[coord]" + coord + "[/coord]" : "-";
+}
+
 function buildVillageImpactSummary(plan) {
   const impactMap = new Map();
 
@@ -1319,59 +1524,59 @@ function buildVillageImpactSummary(plan) {
     }
 
     const lines = [];
-    lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
+
+    lines.push("[size=14]" + SCRIPT_NAME + " " + SCRIPT_VERSION + "[/size]");
     lines.push("");
+    lines.push("[b][size=12]Relic Placements[/size][/b]");
+    lines.push("");
+    lines.push("[table]");
+    lines.push("[**]#[||]Relic[||]Village[||]Range[||]Coverage[||]Score[||]Waste[||]Stats[/**]");
 
     state.plan.forEach(item => {
-      lines.push(
-        item.step +
-          ". " +
-          item.relic.name +
-          " -> " +
-          item.center.name +
-          " [" +
-          item.center.coord +
-          "]"
-      );
-      lines.push(
-        "   Range: " +
-          item.relic.range +
-          ", covered: " +
-          item.covered.length +
-          ", score: " +
-          formatScore(item.score) +
-          ", waste: " +
-          formatScore(item.wastedScore)
-      );
-      lines.push("   Stats: " + formatStatList(item.relevantStats));
-      lines.push("");
+      const cells = [
+        item.step,
+        formatRelicForCopy(item.relic, item.relevantStats),
+        formatVillageCoordForCopy(item.center),
+        item.relic.range,
+        item.covered.length,
+        formatScore(item.score),
+        formatScore(item.wastedScore),
+        formatStatsForCopy(item.relevantStats, true)
+      ];
+
+      lines.push("[*]" + cells.join("[|]"));
     });
-		
-		const impactRows = buildVillageImpactSummary(state.plan);
 
-		if (impactRows.length) {
-			lines.push("");
-			lines.push("Village impact summary");
-			lines.push("");
+    lines.push("[/table]");
 
-			impactRows.forEach(item => {
-				lines.push(
-					item.village.name +
-						" | Relics: " +
-						item.relicCount +
-						" | " +
-						formatImpactStats(item.stats)
-				);
-			});
+    const impactRows = buildVillageImpactSummary(state.plan);
 
-			lines.push("");
-		}
+    if (impactRows.length) {
+      lines.push("");
+      lines.push("[b][size=12]Village impact summary[/size][/b]");
+      lines.push("");
+      lines.push("[table]");
+      lines.push("[**]#[||]Village[||]Affecting Relics[||]Stats[/**]");
+
+      impactRows.forEach((item, index) => {
+        const cells = [
+          index + 1,
+          formatVillageCoordForCopy(item.village),
+          item.relicCount,
+          formatImpactStatsForCopy(item.stats)
+        ];
+
+        lines.push("[*]" + cells.join("[|]"));
+      });
+
+      lines.push("[/table]");
+    }
 
     const text = lines.join("\n");
 
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text)
-        .then(() => setStatus("Plan copied.", "success"))
+        .then(() => setStatus("BBCode plan copied.", "success"))
         .catch(() => fallbackCopy(text));
       return;
     }
