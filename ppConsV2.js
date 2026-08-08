@@ -23,7 +23,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Long Construction Queue";
-  const SCRIPT_VERSION = "v1.0.2";
+  const SCRIPT_VERSION = "v1.0.3";
   const BOX_ID = "twactics-long-construction-queue";
   const STYLE_ID = "twactics-long-construction-queue-style";
   const DEFAULT_MAX_ROWS = 20;
@@ -170,7 +170,7 @@
   }
 
   function patternToRegex(pattern, mode) {
-    const timeSource = "(\\d{1,2}:\\d{2}:\\d{2}(?::\\d{1,3})?)";
+    const timeSource = "(\\d{1,2}:\\d{2}(?::\\d{2})?(?::\\d{1,3})?)";
     const dateSource = "(\\d{1,2}[./]\\d{1,2}(?:[./]\\d{2,4})?\\.?)";
 
     let escaped = escapeRegExp(pattern || "");
@@ -197,13 +197,13 @@
   }
 
   function parseTimeParts(timeText) {
-    const match = String(timeText || "").match(/(\d{1,2}):(\d{2}):(\d{2})(?::\d{1,3})?/);
+    const match = String(timeText || "").match(/(\d{1,2}):(\d{2})(?::(\d{2}))?(?::\d{1,3})?/);
     if (!match) return null;
 
     return {
       hours: parseInt(match[1], 10),
       minutes: parseInt(match[2], 10),
-      seconds: parseInt(match[3], 10)
+      seconds: match[3] !== undefined ? parseInt(match[3], 10) : 0
     };
   }
 
@@ -262,7 +262,7 @@
       return parseExplicitDateWithTime(serverNow, match[1], match[2]);
     }
 
-    const timeMatch = text.match(/(\d{1,2}:\d{2}:\d{2}(?::\d{1,3})?)/);
+    const timeMatch = text.match(/(\d{1,2}:\d{2}(?::\d{2})?(?::\d{1,3})?)/);
     const dateMatch = text.match(/(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\.?)/);
 
     if (dateMatch && timeMatch) {
@@ -423,6 +423,26 @@
     return rows;
   }
 
+  function mergeRows(primaryRows, secondaryRows) {
+    const merged = [];
+    const seen = new Set();
+
+    (primaryRows || []).concat(secondaryRows || []).forEach(item => {
+      const key = [
+        item.villageId || item.villageName || "",
+        item.queuePosition || "",
+        item.building || "",
+        item.finishTimestamp || ""
+      ].join("|");
+
+      if (seen.has(key)) return;
+      seen.add(key);
+      merged.push(item);
+    });
+
+    return merged;
+  }
+
   async function loadConstructionRows() {
     const url = buildGameUrl({
       screen: "overview_villages",
@@ -432,10 +452,22 @@
 
     state.sourceUrl = url;
 
-    const html = await fetchHtml(url);
-    const doc = parseHtml(html);
     const serverNow = parseServerNow();
-    return collectConstructionOrdersFromDoc(doc, serverNow);
+    const currentRows = collectConstructionOrdersFromDoc(document, serverNow);
+
+    try {
+      const html = await fetchHtml(url);
+      const doc = parseHtml(html);
+      const fetchedRows = collectConstructionOrdersFromDoc(doc, serverNow);
+
+      if (fetchedRows.length || !currentRows.length) {
+        return mergeRows(fetchedRows, currentRows);
+      }
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not load all-pages Buildings overview, using current page instead:", err);
+    }
+
+    return currentRows;
   }
 
   function getBuildDurationSeconds(item) {
