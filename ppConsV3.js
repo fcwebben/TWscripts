@@ -23,7 +23,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Long Construction Queue";
-  const SCRIPT_VERSION = "v1.0.3";
+  const SCRIPT_VERSION = "v1.0.4";
   const BOX_ID = "twactics-long-construction-queue";
   const STYLE_ID = "twactics-long-construction-queue-style";
   const DEFAULT_MAX_ROWS = 20;
@@ -112,6 +112,34 @@
     });
 
     return url.pathname + url.search;
+  }
+
+  function getRequiredOverviewUrl() {
+    return buildGameUrl({
+      screen: "overview_villages",
+      mode: "buildings",
+      page: -1
+    });
+  }
+
+  function isOnRequiredOverviewPage() {
+    return (
+      getParam("screen") === "overview_villages" &&
+      getParam("mode") === "buildings" &&
+      String(getParam("page")) === "-1"
+    );
+  }
+
+  function redirectToRequiredOverviewPage() {
+    const targetUrl = getRequiredOverviewUrl();
+    if (window.location.pathname + window.location.search !== targetUrl) {
+      window.location.assign(targetUrl);
+    }
+  }
+
+  if (!isOnRequiredOverviewPage()) {
+    redirectToRequiredOverviewPage();
+    return;
   }
 
   async function fetchHtml(url) {
@@ -269,8 +297,8 @@
       return parseExplicitDateWithTime(serverNow, dateMatch[1], timeMatch[1]);
     }
 
-    const todayAliases = ["today", "idag", "heute", "ma", "aujourd", "hoy", "oggi", "dzis", "dziś", "vandaag", "bugun", "bugün"];
-    const tomorrowAliases = ["tomorrow", "imorgon", "morgen", "holnap", "demain", "mañana", "manana", "amanha", "amanhã", "domani", "jutro", "yarin", "yarın"];
+    const todayAliases = ["today", "idag", "heute", "ma", "aujourd", "hoy", "oggi", "dzis", "dziÅ", "vandaag", "bugun", "bugÃ¼n"];
+    const tomorrowAliases = ["tomorrow", "imorgon", "morgen", "holnap", "demain", "maÃ±ana", "manana", "amanha", "amanhÃ£", "domani", "jutro", "yarin", "yarÄ±n"];
 
     if (timeMatch && includesAny(text, todayAliases)) {
       return buildDateWithTime(serverNow, timeMatch[1], 0);
@@ -444,30 +472,10 @@
   }
 
   async function loadConstructionRows() {
-    const url = buildGameUrl({
-      screen: "overview_villages",
-      mode: "buildings",
-      page: -1
-    });
-
-    state.sourceUrl = url;
+    state.sourceUrl = window.location.pathname + window.location.search;
 
     const serverNow = parseServerNow();
-    const currentRows = collectConstructionOrdersFromDoc(document, serverNow);
-
-    try {
-      const html = await fetchHtml(url);
-      const doc = parseHtml(html);
-      const fetchedRows = collectConstructionOrdersFromDoc(doc, serverNow);
-
-      if (fetchedRows.length || !currentRows.length) {
-        return mergeRows(fetchedRows, currentRows);
-      }
-    } catch (err) {
-      console.warn(SCRIPT_NAME + " could not load all-pages Buildings overview, using current page instead:", err);
-    }
-
-    return currentRows;
+    return collectConstructionOrdersFromDoc(document, serverNow);
   }
 
   function getBuildDurationSeconds(item) {
@@ -570,8 +578,7 @@
 
   async function loadAndRender() {
     try {
-      ui.loadButton.disabled = true;
-      setStatus("Loading Buildings overview and checking queued construction orders...", "warn");
+      setStatus("Loading queued construction orders from the all-pages Buildings overview...", "warn");
 
       const rows = await loadConstructionRows();
       state.rows = rows;
@@ -585,67 +592,7 @@
     } catch (err) {
       console.error(SCRIPT_NAME + " failed:", err);
       setStatus(err.message || String(err), "error");
-    } finally {
-      ui.loadButton.disabled = false;
     }
-  }
-
-  function copyResults() {
-    const displayRows = getDisplayRows(state.rows || []);
-
-    if (!displayRows.length) {
-      setStatus("No rows to copy.", "warn");
-      return;
-    }
-
-    const lines = [];
-    lines.push("[size=14]" + SCRIPT_NAME + " " + SCRIPT_VERSION + "[/size]");
-    lines.push("[i]Top " + displayRows.length + " building orders with the longest estimated build duration. Sorted from longest to shortest.[/i]");
-    lines.push("");
-    lines.push("[table]");
-    lines.push("[**]#[||]Village[||]Queue[||]Building[||]Build duration[||]Finish time[||]Finishes in[/**]");
-
-    displayRows.forEach((item, index) => {
-      lines.push(
-        "[*]" +
-        [
-          index + 1,
-          item.villageName,
-          item.queuePosition,
-          item.building,
-          formatDuration(getBuildDurationSeconds(item)),
-          formatDateTime(item.finishDate),
-          formatDuration(item.remainingSeconds)
-        ].join("[|]")
-      );
-    });
-
-    lines.push("[/table]");
-
-    const text = lines.join("\n");
-
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text)
-        .then(() => setStatus("BBCode copied.", "success"))
-        .catch(() => fallbackCopy(text));
-      return;
-    }
-
-    fallbackCopy(text);
-  }
-
-  function fallbackCopy(text) {
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.style.position = "fixed";
-    textarea.style.left = "-9999px";
-    textarea.style.top = "-9999px";
-    document.body.appendChild(textarea);
-    textarea.focus();
-    textarea.select();
-    const copied = document.execCommand("copy");
-    textarea.remove();
-    setStatus(copied ? "Copied." : "Could not copy.", copied ? "success" : "error");
   }
 
   function setStatus(message, type) {
@@ -830,32 +777,13 @@
     help.className = "twlcq-help";
     help.textContent = "Shows the top 20 building orders with the longest estimated build duration. It checks all queue positions and sorts by the item's own duration, not by when it finishes in the full village queue.";
 
-    const controls = document.createElement("div");
-    controls.className = "twlcq-controls";
-
-    const loadButton = document.createElement("button");
-    loadButton.type = "button";
-    loadButton.className = "btn";
-    loadButton.textContent = "Load longest build times";
-    loadButton.addEventListener("click", loadAndRender);
-
-    const copyButton = document.createElement("button");
-    copyButton.type = "button";
-    copyButton.className = "btn";
-    copyButton.textContent = "Copy BBCode";
-    copyButton.addEventListener("click", copyResults);
-
-    controls.appendChild(loadButton);
-    controls.appendChild(copyButton);
-
     const status = document.createElement("div");
     status.className = "twlcq-status";
-    status.textContent = "Ready. Click Load longest build times.";
+    status.textContent = "Loading queued construction orders...";
 
     const results = document.createElement("div");
 
     body.appendChild(help);
-    body.appendChild(controls);
     body.appendChild(status);
     body.appendChild(results);
 
@@ -865,12 +793,11 @@
     const target = document.querySelector("#contentContainer") || document.querySelector("#mobileContent") || document.querySelector("#content_value") || document.body;
     target.prepend(box);
 
-    ui.loadButton = loadButton;
-    ui.copyButton = copyButton;
     ui.status = status;
     ui.results = results;
   }
 
   createWidget();
-  console.log(SCRIPT_NAME + " " + SCRIPT_VERSION + " loaded", { mode: TIME_SOURCE });
+  loadAndRender();
+  console.log(SCRIPT_NAME + " " + SCRIPT_VERSION + " loaded", { mode: TIME_SOURCE, autoLoad: true });
 })();
