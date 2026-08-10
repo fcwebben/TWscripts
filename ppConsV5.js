@@ -3,6 +3,7 @@
  * License: MIT
  *
  * Twactics Long Construction Queue
+ * Script created by Twactics (zidrox)
  *
  * Shows the top 15 construction queue entries with the longest estimated duration across villages.
  * The script reads the Buildings overview and checks every queued building order in each village.
@@ -24,7 +25,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Long Construction Queue";
-  const SCRIPT_VERSION = "v1.0.0";
+  const SCRIPT_VERSION = "v1.0.6";
   const BOX_ID = "twactics-long-construction-queue";
   const STYLE_ID = "twactics-long-construction-queue-style";
   const DEFAULT_MAX_ROWS = 15;
@@ -864,10 +865,12 @@
       .twlcq-field input,
       .twlcq-field select {
         width: 150px;
-        padding: 4px;
+        min-height: 32px;
+        padding: 6px 7px;
         border: 1px solid #7d510f;
         background: #fffaf0;
         color: #2f1b00;
+        line-height: 18px;
       }
 
       .twlcq-field input[type="number"] { width: 90px; }
@@ -919,6 +922,15 @@
       }
 
       .twlcq-muted { opacity: 0.75; }
+
+      .twlcq-created-by {
+        margin: 8px 0 0;
+        padding-top: 6px;
+        border-top: 1px solid #bd9c5a;
+        font-size: 11px;
+        opacity: 0.8;
+        text-align: right;
+      }
 
       .twlcq-table-wrap {
         max-height: 520px;
@@ -1066,10 +1078,15 @@
 
     const results = document.createElement("div");
 
+    const createdBy = document.createElement("div");
+    createdBy.className = "twlcq-created-by";
+    createdBy.textContent = "Script created by Twactics (zidrox)";
+
     body.appendChild(help);
     body.appendChild(settingsPanel);
     body.appendChild(status);
     body.appendChild(results);
+    body.appendChild(createdBy);
 
     box.appendChild(header);
     box.appendChild(body);
