@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.1.4";
+  const SCRIPT_VERSION = "v1.1.1";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
@@ -1007,6 +1007,17 @@
     return parseRangeText(root.textContent || "", true);
   }
 
+  function getOverviewRelicId(slot) {
+    const link = slot && slot.querySelector ? slot.querySelector("[data-relic-id]") : null;
+    const value = cleanText(link ? link.getAttribute("data-relic-id") : "");
+
+    if (/^\d+$/.test(value)) {
+      return value;
+    }
+
+    return "";
+  }
+
   function extractPlacedRelicsFromOverviewHtml(html) {
     const doc = parseHtml(html);
     const relics = [];
@@ -1017,6 +1028,7 @@
 
       const nameEl = description.querySelector("strong");
       const name = cleanText(nameEl ? nameEl.textContent : "Placed relic");
+      const overviewRelicId = getOverviewRelicId(slot);
 
       const locationLink = description.querySelector(".location a[href*='screen=info_village']");
       const locationText = cleanText(locationLink ? locationLink.textContent : "");
@@ -1071,7 +1083,8 @@
       }
 
       relics.push({
-        id: "placed-" + index + "-" + coordData.coord + "-" + name,
+        id: overviewRelicId || ("placed-" + index + "-" + coordData.coord + "-" + name),
+        overviewRelicId: overviewRelicId,
         name: name,
         range: range,
         villageId: String(villageId),
@@ -1395,14 +1408,49 @@
     };
   }
 
+  function getPlacedOverviewRelicIds() {
+    const ids = new Set();
+
+    (state.placedRelics || []).forEach(relic => {
+      const id = String((relic && (relic.overviewRelicId || relic.id)) || "");
+
+      if (id && id.indexOf("placed-") !== 0) {
+        ids.add(id);
+      }
+    });
+
+    return ids;
+  }
+
+  function isLooseInventoryRelic(relic) {
+    return !(relic && (relic.villageId || relic.equippedAt || (relic.raw && relic.raw.inactive_until)));
+  }
+
+  function isInventoryRelicAvailableForRebuild(relic, overviewRelicIds) {
+    const id = String((relic && relic.id) || "");
+
+    if (isLooseInventoryRelic(relic)) {
+      return true;
+    }
+
+    if (id && overviewRelicIds && overviewRelicIds.has(id)) {
+      return true;
+    }
+
+    return false;
+  }
+
   function getAvailableRelics(mode) {
     if (mode === "rebuild") {
-      const inventoryRelics = state.inventoryRelics.map(relic => {
-        return Object.assign({}, relic, {
-          fromInventory: true,
-          fromOverview: false
+      const overviewRelicIds = getPlacedOverviewRelicIds();
+      const inventoryRelics = state.inventoryRelics
+        .filter(relic => isInventoryRelicAvailableForRebuild(relic, overviewRelicIds))
+        .map(relic => {
+          return Object.assign({}, relic, {
+            fromInventory: true,
+            fromOverview: false
+          });
         });
-      });
 
       const placedRelics = state.placedRelics.map(relic => {
         return Object.assign({}, relic, {
@@ -1413,9 +1461,7 @@
       return dedupeAvailableRelics(inventoryRelics.concat(placedRelics));
     }
 
-    return state.inventoryRelics.filter(relic => {
-      return !relic.villageId && !relic.equippedAt;
-    });
+    return state.inventoryRelics.filter(isLooseInventoryRelic);
   }
 
   function dedupeAvailableRelics(relics) {
@@ -1654,6 +1700,7 @@
 	  console.log(SCRIPT_NAME + " villages:", state.villages);
 	  console.log(SCRIPT_NAME + " inventory relics:", state.inventoryRelics);
 	  console.log(SCRIPT_NAME + " placed relics:", state.placedRelics);
+      console.log(SCRIPT_NAME + " placed overview relic ids:", Array.from(getPlacedOverviewRelicIds()));
     console.log(SCRIPT_NAME + " world relic settings:", state.worldRelicSettings);
 
 	  return {
