@@ -9,7 +9,7 @@
  *
  * This script:
  * - Reads village coordinates from Overview pages
- * - Reads farm data from Overview -> Production when needed for recruitment
+ * - Reads farm, merchant and building-level data from Overview pages when needed for planning
  * - Reads relic data from Treasury -> Inventory
  * - Reads placed relics from Treasury -> Overview
  * - Calculates suggested relic placements after a manual user click
@@ -45,7 +45,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.1.1";
+  const SCRIPT_VERSION = "v1.1.2";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
@@ -83,6 +83,30 @@
     academy_speed: 0.10
   };
 
+  const MERCHANT_WEIGHTS = {
+    merchant_travel_speed: 1.0,
+    merchant_capacity: 1.0
+  };
+
+  const HAUL_WEIGHTS = {
+    haul_capacity: 1.0
+  };
+
+  const PRODUCTION_WEIGHTS = {
+    wood_production: 1.0,
+    clay_production: 1.0,
+    iron_production: 1.0
+  };
+
+  const CONSTRUCTION_WEIGHTS = {
+    construction_speed: 1.0
+  };
+
+  const NOBLE_WEIGHTS = {
+    academy_speed: 1.0,
+    noble_refund: 0.75
+  };
+
   const RELEVANT_INTERNAL_STAT_KEYS = {
     barracks_speed: true,
     stable_speed: true,
@@ -91,6 +115,14 @@
     barracks_cost: true,
     stable_cost: true,
     workshop_cost: true,
+    merchant_travel_speed: true,
+    merchant_capacity: true,
+    haul_capacity: true,
+    wood_production: true,
+    clay_production: true,
+    iron_production: true,
+    construction_speed: true,
+    noble_refund: true,
     spear_attack: true,
     spear_offdef: true,
     sword_attack: true,
@@ -121,6 +153,14 @@
     barracks_cost: "Barracks cost reduction",
     stable_cost: "Stable cost reduction",
     workshop_cost: "Workshop cost reduction",
+    merchant_travel_speed: "Merchant travel speed",
+    merchant_capacity: "Merchant capacity",
+    haul_capacity: "Haul capacity",
+    wood_production: "Wood production",
+    clay_production: "Clay production",
+    iron_production: "Iron production",
+    construction_speed: "Construction speed",
+    noble_refund: "Nobleman refund",
     spear_attack: "Spear fighter attack",
     spear_offdef: "Spear fighter off/def",
     sword_attack: "Swordsman attack",
@@ -168,7 +208,10 @@
     dummy: { b_recruitment_building: "barracks_speed" },
     horseshoe: { b_recruitment_building: "stable_speed" },
     wheel: { b_recruitment_building: "workshop_speed" },
-    handsaw: { b_recruitment_cost: "workshop_cost" }
+    handsaw: { b_recruitment_cost: "workshop_cost" },
+    axe: { b_wood: "wood_production" },
+    chisel: { b_stone: "clay_production" },
+    pickaxe: { b_iron: "iron_production" }
   };
 
   const SUB_STAT_KEYS_BY_ID = {
@@ -184,6 +227,10 @@
     10: "barracks_speed",
     11: "stable_speed",
     12: "workshop_speed",
+    13: "haul_capacity",
+    14: "clay_production",
+    15: "wood_production",
+    16: "iron_production",
     19: "barracks_cost",
     20: "stable_cost",
     21: "workshop_cost",
@@ -205,7 +252,11 @@
     37: "heavy_defense",
     38: "catapult_defense",
     39: "ram_defense",
-    43: "academy_speed"
+    40: "construction_speed",
+    41: "merchant_travel_speed",
+    42: "merchant_capacity",
+    43: "academy_speed",
+    44: "noble_refund"
   };
 
   const UNIT_ALIASES = {
@@ -226,6 +277,21 @@
     stable: ["stable", "istálló", "istallo", "ecurie", "écurie", "establo", "estabulo", "estábulo", "scuderia", "stajnia", "stal", "stall", "stalla", "ahır", "ahir", "конюшня"],
     workshop: ["workshop", "műhely", "muhely", "atelier", "taller", "oficina", "officina", "warsztat", "werkplaats", "verkstad", "værksted", "dielna", "radionica", "atölye", "atolye", "мастерская"],
     academy: ["academy", "akadémia", "akademia", "academie", "académie", "academia", "accademia", "akademie", "akademi", "академия"]
+  };
+
+  const MERCHANT_ALIASES = {
+    merchant: ["merchant", "merchants", "trader", "traders", "market merchant", "handlare", "köpman", "kopman", "handelsman", "kereskedo", "kereskedő", "kereskedok", "kereskedők", "händler", "haendler", "marchand", "marchands", "comerciante", "comerciantes", "mercador", "mercadores", "mercante", "mercanti", "kupiec", "kupcy", "handelaar", "handelaars", "tüccar", "tuccar", "торговец", "торговцы"],
+    travelSpeed: ["merchant travel speed", "merchant speed", "trader speed", "travel speed", "movement speed", "resehastighet", "utazási sebesség", "utazasi sebesseg", "vitesse de déplacement", "vitesse de deplacement", "velocidad de viaje", "velocidade de viagem", "reisegeschwindigkeit", "szybkość podróży", "szybkosc podrozy"],
+    capacity: ["merchant capacity", "trader capacity", "carry capacity", "carrying capacity", "transport capacity", "kapacitet", "bärkapacitet", "barkapacitet", "teherbírás", "teherbiras", "capacité", "capacite", "capacidad", "capacidade", "kapazität", "kapazitaet", "pojemność", "pojemnosc", "draagcapaciteit"]
+  };
+
+  const ECONOMY_STAT_ALIASES = {
+    haul: ["haul capacity", "loot capacity", "carry capacity", "plunder capacity", "bärkapacitet", "barkapacitet", "teherbírás", "teherbiras"],
+    wood: ["wood production", "timber production", "wood", "timber", "fakiter", "fakitermelés", "holzproduktion", "production de bois", "producción de madera", "producao de madeira", "produkcja drewna"],
+    clay: ["clay production", "stone production", "clay", "stone", "agyagkitermelés", "agyagkiter", "lehmproduktion", "production d'argile", "producción de arcilla", "producao de argila", "produkcja gliny"],
+    iron: ["iron production", "iron", "vaskitermelés", "vaskiter", "eisenproduktion", "production de fer", "producción de hierro", "producao de ferro", "produkcja żelaza", "produkcja zelaza"],
+    constructionSpeed: ["construction speed", "building speed", "build speed", "építési sebesség", "epitesi sebesseg", "baugeschwindigkeit", "vitesse de construction", "velocidad de construcción", "velocidade de construção", "szybkość budowy", "szybkosc budowy"],
+    nobleRefund: ["refund on nobleman production", "nobleman production", "nobleman refund", "noble refund", "refund", "snob", "academy refund"]
   };
 
   const STAT_ACTION_ALIASES = {
@@ -251,6 +317,7 @@
       benefitCapSource: "fallback",
       detectedRanges: []
     },
+    targetCoords: new Set(),
 		logs: []
 	};
 
@@ -357,6 +424,14 @@
 		  page: -1
 		});
 	  }
+
+    if (goal === "production") {
+      return buildGameUrl({
+        screen: "overview_villages",
+        mode: "buildings",
+        page: -1
+      });
+    }
 
 	  return buildGameUrl({
 		screen: "overview_villages",
@@ -770,6 +845,15 @@
       return MAIN_RELIC_STAT_KEYS[type][effectType];
     }
 
+    if (effectType === "b_haul") return "haul_capacity";
+    if (effectType === "b_wood") return "wood_production";
+    if (effectType === "b_stone") return "clay_production";
+    if (effectType === "b_iron") return "iron_production";
+    if (effectType === "b_building") return "construction_speed";
+    if (effectType === "b_merchant" && includesAny(text, MERCHANT_ALIASES.capacity)) return "merchant_capacity";
+    if (effectType === "b_merchant") return "merchant_travel_speed";
+    if (effectType === "b_noblerefund") return "noble_refund";
+
     if (effectType === "b_unitstat" && RELIC_TYPE_UNIT_KEYS[type]) {
       const unit = RELIC_TYPE_UNIT_KEYS[type];
 
@@ -812,6 +896,18 @@
       return "";
     }
 
+    if (includesAny(text, MERCHANT_ALIASES.merchant)) {
+      if (includesAny(text, MERCHANT_ALIASES.capacity)) return normalizeKeyValue("merchant_capacity", value, text);
+      if (includesAny(text, MERCHANT_ALIASES.travelSpeed)) return normalizeKeyValue("merchant_travel_speed", value, text);
+    }
+
+    if (includesAny(text, ECONOMY_STAT_ALIASES.haul)) return normalizeKeyValue("haul_capacity", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.wood)) return normalizeKeyValue("wood_production", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.clay)) return normalizeKeyValue("clay_production", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.iron)) return normalizeKeyValue("iron_production", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.constructionSpeed)) return normalizeKeyValue("construction_speed", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.nobleRefund)) return normalizeKeyValue("noble_refund", value, text);
+
     if (includesAny(text, STAT_ACTION_ALIASES.speed)) {
       if (includesAny(text, BUILDING_ALIASES.barracks)) return normalizeKeyValue("barracks_speed", value, text);
       if (includesAny(text, BUILDING_ALIASES.stable)) return normalizeKeyValue("stable_speed", value, text);
@@ -839,6 +935,11 @@
 
   function getRelevantWeights(goal) {
     if (goal === "offense") return OFFENSE_WEIGHTS;
+    if (goal === "merchants") return MERCHANT_WEIGHTS;
+    if (goal === "haul") return HAUL_WEIGHTS;
+    if (goal === "production") return PRODUCTION_WEIGHTS;
+    if (goal === "construction") return CONSTRUCTION_WEIGHTS;
+    if (goal === "noble") return NOBLE_WEIGHTS;
     return RECRUITMENT_WEIGHTS;
   }
 
@@ -878,9 +979,47 @@
     return farm.max > 0;
   }
 
+  function parseMerchantText(value) {
+    const ratio = parseFarmText(value);
+
+    return {
+      available: ratio.used,
+      total: ratio.max
+    };
+  }
+
+  function looksLikeMerchantText(value) {
+    const merchants = parseMerchantText(value);
+    return merchants.total > 0;
+  }
+
+  function getBuildingLevelFromRow(row, buildingKey) {
+    if (!row || !buildingKey) return 0;
+
+    const cell = row.querySelector(".b_" + buildingKey);
+    if (!cell) return 0;
+
+    const hidden = cell.querySelector(".hidden");
+    const text = hidden ? hidden.textContent : cell.textContent;
+    return parseNumber(text);
+  }
+
   function findFarmColumnIndex(table) {
     const aliases = [
       "farm", "farm space", "population", "pop", "tanya", "ferme", "granja", "fazenda", "fattoria", "bauernhof", "zagroda", "boerderij", "bondgård", "gård", "gård", "çiftlik", "ciftlik", "ферма", "ферма", "ฟาร์ม"
+    ];
+
+    for (let i = 0; i < aliases.length; i++) {
+      const index = getColumnIndexByHeader(table, aliases[i]);
+      if (index >= 0) return index;
+    }
+
+    return -1;
+  }
+
+  function findMerchantColumnIndex(table) {
+    const aliases = [
+      "merchant", "merchants", "trader", "traders", "market", "handlare", "köpman", "kopman", "kereskedő", "kereskedo", "kereskedők", "kereskedok", "händler", "haendler", "marchand", "marchands", "comerciante", "comerciantes", "mercador", "mercadores", "mercante", "mercanti", "kupiec", "kupcy", "handelaar", "handelaars", "tüccar", "tuccar", "торговец", "торговцы"
     ];
 
     for (let i = 0; i < aliases.length; i++) {
@@ -907,12 +1046,49 @@
     return null;
   }
 
+  function getMerchantCellFromRow(row, merchantIndex, farmIndex) {
+    const cells = Array.from(row.children);
+
+    if (merchantIndex >= 0 && cells[merchantIndex] && looksLikeMerchantText(cells[merchantIndex].textContent)) {
+      return cells[merchantIndex];
+    }
+
+    for (let i = 0; i < cells.length; i++) {
+      if (i === farmIndex) continue;
+
+      const merchants = parseMerchantText(cells[i].textContent);
+      if (merchants.total > 0 && merchants.total <= 1000) {
+        return cells[i];
+      }
+    }
+
+    return null;
+  }
+
+  function getHeaderSearchText(header) {
+    const parts = [
+      header && header.textContent,
+      header && header.getAttribute && header.getAttribute("title"),
+      header && header.getAttribute && header.getAttribute("aria-label")
+    ];
+
+    if (header && header.querySelectorAll) {
+      Array.from(header.querySelectorAll("[title], [data-title], img[alt]")).forEach(element => {
+        parts.push(element.getAttribute("title"));
+        parts.push(element.getAttribute("data-title"));
+        parts.push(element.getAttribute("alt"));
+      });
+    }
+
+    return normalizeSearchText(parts.filter(Boolean).join(" "));
+  }
+
   function getColumnIndexByHeader(table, label) {
     const headers = Array.from(table.querySelectorAll("thead th"));
-    const normalizedLabel = label.toLowerCase();
+    const normalizedLabel = normalizeSearchText(label);
 
     for (let i = 0; i < headers.length; i++) {
-      if (cleanText(headers[i].textContent).toLowerCase().includes(normalizedLabel)) {
+      if (getHeaderSearchText(headers[i]).includes(normalizedLabel)) {
         return i;
       }
     }
@@ -933,6 +1109,7 @@
     if (!table) return villages;
 
     const farmIndex = findFarmColumnIndex(table);
+    const merchantIndex = findMerchantColumnIndex(table);
 
     Array.from(table.querySelectorAll("tbody tr")).forEach(row => {
       if (row.querySelector("th")) return;
@@ -957,6 +1134,12 @@
 
       const farmCell = getFarmCellFromRow(row, farmIndex);
       const farm = parseFarmText(farmCell ? farmCell.textContent : "");
+      const merchantCell = getMerchantCellFromRow(row, merchantIndex, farmIndex);
+      const merchants = parseMerchantText(merchantCell ? merchantCell.textContent : "");
+      const woodLevel = getBuildingLevelFromRow(row, "wood");
+      const clayLevel = getBuildingLevelFromRow(row, "stone");
+      const ironLevel = getBuildingLevelFromRow(row, "iron");
+      const academyLevel = getBuildingLevelFromRow(row, "snob");
 
       villages.push({
         id: String(villageId),
@@ -967,7 +1150,14 @@
         href: link.getAttribute("href") || "",
         farmUsed: farm.used,
         farmMax: farm.max,
-        farmFree: farm.free
+        farmFree: farm.free,
+        merchantsAvailable: merchants.available,
+        merchantsTotal: merchants.total,
+        woodLevel: woodLevel,
+        clayLevel: clayLevel,
+        ironLevel: ironLevel,
+        academyLevel: academyLevel,
+        pitsTotal: woodLevel + clayLevel + ironLevel
       });
     });
 
@@ -1211,6 +1401,18 @@
 	  return Math.max(0, ...state.villages.map(village => village.farmFree || 0));
 	}
 
+  function getHighestFarmUsed() {
+    return Math.max(0, ...state.villages.map(village => village.farmUsed || 0));
+  }
+
+  function getHighestMerchantTotal() {
+    return Math.max(0, ...state.villages.map(village => village.merchantsTotal || 0));
+  }
+
+  function getHighestPitsTotal() {
+    return Math.max(0, ...state.villages.map(village => village.pitsTotal || 0));
+  }
+
 	function getVillageWeight(village, weighting) {
 	  if (weighting === "freeFarm") {
 		const highestFreeFarm = getHighestFarmFree();
@@ -1231,6 +1433,36 @@
 
 		return 1;
 	  }
+
+    if (weighting === "fullFarm") {
+      const highestFarmUsed = getHighestFarmUsed();
+
+      if (highestFarmUsed > 0) {
+        return (village.farmUsed || 0) / highestFarmUsed;
+      }
+
+      return 1;
+    }
+
+    if (weighting === "merchantTotal") {
+      const highestMerchantTotal = getHighestMerchantTotal();
+
+      if (highestMerchantTotal > 0) {
+        return (village.merchantsTotal || 0) / highestMerchantTotal;
+      }
+
+      return 1;
+    }
+
+    if (weighting === "highestPits") {
+      const highestPitsTotal = getHighestPitsTotal();
+
+      if (highestPitsTotal > 0) {
+        return (village.pitsTotal || 0) / highestPitsTotal;
+      }
+
+      return 1;
+    }
 
 	  return 1;
 	}
@@ -1264,6 +1496,9 @@
     const weightCache = new Map();
     const highestFreeFarm = getHighestFarmFree();
     const highestFarmMax = getHighestFarmMax();
+    const highestFarmUsed = getHighestFarmUsed();
+    const highestMerchantTotal = getHighestMerchantTotal();
+    const highestPitsTotal = getHighestPitsTotal();
 
     state.villages.forEach(village => {
       [2, 3, 4].forEach(range => {
@@ -1276,6 +1511,12 @@
         weight = (village.farmFree || 0) / highestFreeFarm;
       } else if (weighting === "farmCap" && highestFarmMax > 0) {
         weight = (village.farmMax || 0) / highestFarmMax;
+      } else if (weighting === "fullFarm" && highestFarmUsed > 0) {
+        weight = (village.farmUsed || 0) / highestFarmUsed;
+      } else if (weighting === "merchantTotal" && highestMerchantTotal > 0) {
+        weight = (village.merchantsTotal || 0) / highestMerchantTotal;
+      } else if (weighting === "highestPits" && highestPitsTotal > 0) {
+        weight = (village.pitsTotal || 0) / highestPitsTotal;
       }
 
       weightCache.set(village.coord, weight);
@@ -1304,6 +1545,14 @@
     }
 
     return getVillageWeight(village, weighting);
+  }
+
+  function getScoringVillageWeight(village, goal, weighting, optimizationContext) {
+    if (goal === "noble" && state.targetCoords && state.targetCoords.size) {
+      return state.targetCoords.has(village.coord) ? 1 : 0;
+    }
+
+    return getCachedVillageWeight(village, weighting, optimizationContext);
   }
 
   function applyRelicToBonuses(relic, center, bonusMap, goalAgnostic, optimizationContext) {
@@ -1373,7 +1622,7 @@
     }
 
     covered.forEach(village => {
-      const villageWeight = getCachedVillageWeight(village, weighting, optimizationContext);
+      const villageWeight = getScoringVillageWeight(village, goal, weighting, optimizationContext);
       const bonuses = bonusMap.get(village.coord) || {};
 
       relevantStats.forEach(stat => {
@@ -1669,6 +1918,8 @@
 
 	  if (goal === "offense") {
 		setStatus("Loading village coordinates, inventory and overview data...", "warn");
+	  } else if (goal === "production") {
+    setStatus("Loading building levels, inventory and overview data...", "warn");
 	  } else {
 		setStatus("Loading production, inventory and overview data...", "warn");
 	  }
@@ -1711,6 +1962,11 @@
 	  };
 	}
 
+  function parseTargetCoordsInput(value) {
+    const matches = String(value || "").match(/\d{1,3}\|\d{1,3}/g) || [];
+    return Array.from(new Set(matches));
+  }
+
   async function loadAndOptimize() {
     try {
       ui.loadButton.disabled = true;
@@ -1718,6 +1974,13 @@
       const goal = ui.goalSelect.value;
 			const mode = ui.modeSelect.value;
 			const weighting = ui.weightSelect.value;
+
+      state.targetCoords = new Set(parseTargetCoordsInput(ui.nobleTargetInput ? ui.nobleTargetInput.value : ""));
+      if (goal === "noble" && state.targetCoords.size < 1) {
+        setStatus("Choose at least one target village coordinate for Noble Recruitment, for example 510|510.", "error");
+        ui.loadButton.disabled = false;
+        return;
+      }
 
 			const urls = await loadAllData(goal);
 			const maxPlacements = Math.max(1, Math.min(10, parseInt(ui.countInput.value, 10) || state.unlockedRelicSlots || 10));
@@ -1781,6 +2044,14 @@
   barracks_cost: "Barracks cost reduction",
   stable_cost: "Stable cost reduction",
   workshop_cost: "Workshop cost reduction",
+  merchant_travel_speed: "Merchant travel speed",
+  merchant_capacity: "Merchant capacity",
+  haul_capacity: "Haul capacity",
+  wood_production: "Wood production",
+  clay_production: "Clay production",
+  iron_production: "Iron production",
+  construction_speed: "Construction speed",
+  noble_refund: "Nobleman refund",
 
   axe_attack: "Axeman attack",
   axe_offdef: "Axeman off/def",
@@ -1824,6 +2095,14 @@ const STAT_COPY_ORDER = {
   workshop_cost: 31,
   academy_speed: 40,
   academy_cost: 41,
+  noble_refund: 42,
+  construction_speed: 50,
+  merchant_travel_speed: 60,
+  merchant_capacity: 61,
+  haul_capacity: 70,
+  wood_production: 80,
+  clay_production: 81,
+  iron_production: 82,
   axe_attack: 100,
   axe_offdef: 101,
   spear_attack: 110,
@@ -1852,7 +2131,15 @@ const STAT_COPY_LABELS = {
   workshop_speed: "Workshop speed",
   workshop_cost: "Workshop cost",
   academy_speed: "Academy speed",
-  academy_cost: "Academy cost"
+  academy_cost: "Academy cost",
+  noble_refund: "Nobleman refund",
+  construction_speed: "Construction speed",
+  merchant_travel_speed: "Merchant travel speed",
+  merchant_capacity: "Merchant capacity",
+  haul_capacity: "Haul capacity",
+  wood_production: "Wood production",
+  clay_production: "Clay production",
+  iron_production: "Iron production"
 };
 
 function getStatCopyOrder(key) {
@@ -1902,8 +2189,28 @@ function getStatBuildingIcon(key) {
     return "garage";
   }
 
-  if (normalized.indexOf("academy_") === 0) {
+  if (normalized.indexOf("academy_") === 0 || normalized.indexOf("noble_") === 0) {
     return "snob";
+  }
+
+  if (normalized.indexOf("merchant_") === 0 || normalized.indexOf("haul_") === 0) {
+    return "market";
+  }
+
+  if (normalized.indexOf("wood_") === 0) {
+    return "wood";
+  }
+
+  if (normalized.indexOf("clay_") === 0) {
+    return "stone";
+  }
+
+  if (normalized.indexOf("iron_") === 0) {
+    return "iron";
+  }
+
+  if (normalized.indexOf("construction_") === 0) {
+    return "main";
   }
 
   return "main";
@@ -1995,7 +2302,11 @@ function getRelicBuildingIcon(relic, stats) {
   if (name.indexOf("horse") >= 0) return "stable";
   if (name.indexOf("dummy") >= 0) return "barracks";
   if (name.indexOf("workshop") >= 0) return "garage";
-  if (name.indexOf("academy") >= 0) return "snob";
+  if (name.indexOf("academy") >= 0 || name.indexOf("noble") >= 0) return "snob";
+  if (name.indexOf("merchant") >= 0 || name.indexOf("haul") >= 0) return "market";
+  if (name.indexOf("axe") >= 0) return "wood";
+  if (name.indexOf("chisel") >= 0) return "stone";
+  if (name.indexOf("pickaxe") >= 0) return "iron";
 
   return "main";
 }
@@ -2072,6 +2383,11 @@ function buildVillageImpactSummary(plan) {
 
   function getGoalLabel(goal) {
     if (goal === "offense") return "Offense";
+    if (goal === "merchants") return "Merchant logistics";
+    if (goal === "haul") return "Haul capacity";
+    if (goal === "production") return "Resource production";
+    if (goal === "construction") return "Construction speed";
+    if (goal === "noble") return "Noble Recruitment";
     return "Recruitment";
   }
 
@@ -2084,6 +2400,9 @@ function buildVillageImpactSummary(plan) {
   function getWeightingLabel(weighting) {
     if (weighting === "freeFarm") return "Free farm";
     if (weighting === "farmCap") return "Farm cap";
+    if (weighting === "fullFarm") return "Full farm";
+    if (weighting === "merchantTotal") return "Merchant count";
+    if (weighting === "highestPits") return "Highest pits";
     return "Equal";
   }
 
@@ -3121,7 +3440,12 @@ function buildVillageImpactSummary(plan) {
 
     [
       { value: "recruitment", text: "Recruitment output" },
-      { value: "offense", text: "Offensive strength" }
+      { value: "offense", text: "Offensive strength" },
+      { value: "merchants", text: "Merchant logistics" },
+      { value: "haul", text: "Haul capacity" },
+      { value: "production", text: "Resource production" },
+      { value: "construction", text: "Construction speed" },
+      { value: "noble", text: "Noble Recruitment" }
     ].forEach(optionData => {
       const option = document.createElement("option");
       option.value = optionData.value;
@@ -3167,6 +3491,9 @@ function buildVillageImpactSummary(plan) {
     [
       { value: "farmCap", text: "Farm capacity" },
       { value: "freeFarm", text: "Free farm" },
+      { value: "fullFarm", text: "Full farm" },
+      { value: "merchantTotal", text: "Merchant count" },
+      { value: "highestPits", text: "Highest pits" },
       { value: "equal", text: "Equal weight" }
     ].forEach(optionData => {
       const option = document.createElement("option");
@@ -3177,15 +3504,31 @@ function buildVillageImpactSummary(plan) {
 		
 		weightSelect.value = "freeFarm";
 
-		goalSelect.addEventListener("change", function () {
-			if (goalSelect.value === "recruitment") {
-				weightSelect.value = "freeFarm";
-			}
+    function syncGoalDefaults() {
+      modeSelect.value = "rebuild";
 
-			if (goalSelect.value === "offense") {
-				weightSelect.value = "equal";
-			}
-		});
+      if (goalSelect.value === "recruitment") {
+        weightSelect.value = "freeFarm";
+      } else if (goalSelect.value === "offense") {
+        weightSelect.value = "equal";
+      } else if (goalSelect.value === "merchants") {
+        weightSelect.value = "merchantTotal";
+      } else if (goalSelect.value === "haul") {
+        weightSelect.value = "fullFarm";
+      } else if (goalSelect.value === "production") {
+        weightSelect.value = "highestPits";
+      } else if (goalSelect.value === "construction") {
+        weightSelect.value = "equal";
+      } else if (goalSelect.value === "noble") {
+        weightSelect.value = "equal";
+      }
+
+      if (ui.nobleTargetWrap) {
+        ui.nobleTargetWrap.style.display = goalSelect.value === "noble" ? "block" : "none";
+      }
+    }
+
+		goalSelect.addEventListener("change", syncGoalDefaults);
 
     weightWrap.appendChild(weightLabel);
     weightWrap.appendChild(weightSelect);
@@ -3232,11 +3575,31 @@ function buildVillageImpactSummary(plan) {
     capWrap.appendChild(capLabel);
     capWrap.appendChild(capInput);
 
+    const nobleTargetWrap = document.createElement("div");
+    nobleTargetWrap.className = "twrp-noble-target-wrap";
+    nobleTargetWrap.style.display = "none";
+
+    const nobleTargetLabel = document.createElement("label");
+    nobleTargetLabel.className = "twrp-label";
+    nobleTargetLabel.textContent = "Noble target villages";
+
+    const nobleTargetInput = document.createElement("textarea");
+    nobleTargetInput.className = "twrp-input";
+    nobleTargetInput.rows = 3;
+    nobleTargetInput.placeholder = "One or more coords, e.g. 510|510, 511|510";
+
+    const nobleTargetHelp = createUiElement("small", "twrp-muted", "Only these villages are scored. Relics may be placed in nearby villages as long as the targets are affected.");
+
+    nobleTargetWrap.appendChild(nobleTargetLabel);
+    nobleTargetWrap.appendChild(nobleTargetInput);
+    nobleTargetWrap.appendChild(nobleTargetHelp);
+
     grid.appendChild(goalWrap);
     grid.appendChild(modeWrap);
     grid.appendChild(weightWrap);
     grid.appendChild(countWrap);
     grid.appendChild(capWrap);
+    grid.appendChild(nobleTargetWrap);
 
     const buttons = document.createElement("div");
     buttons.className = "twrp-buttons";
@@ -3283,6 +3646,8 @@ function buildVillageImpactSummary(plan) {
 		ui.countInput = countInput;
     ui.capInput = capInput;
     ui.capInputWasEdited = false;
+    ui.nobleTargetWrap = nobleTargetWrap;
+    ui.nobleTargetInput = nobleTargetInput;
 		ui.loadButton = loadButton;
 		ui.copyButton = copyButton;
 		ui.status = status;
@@ -3292,6 +3657,7 @@ function buildVillageImpactSummary(plan) {
 			return countInputWasEdited;
 		});
 
+    syncGoalDefaults();
 		makeDraggable(box, header);
   }
 
