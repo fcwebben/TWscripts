@@ -25,7 +25,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Long Construction Queue";
-  const SCRIPT_VERSION = "v1.0.7";
+  const SCRIPT_VERSION = "v1.0.0";
   const BOX_ID = "twactics-long-construction-queue";
   const STYLE_ID = "twactics-long-construction-queue-style";
   const DEFAULT_MAX_ROWS = 15;
