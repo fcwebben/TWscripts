@@ -4,14 +4,15 @@
  *
  * Twactics Long Construction Queue
  *
- * Shows the top 20 individual building orders with the longest estimated build duration across villages.
+ * Shows the top 15 construction queue entries with the longest estimated duration across villages.
  * The script reads the Buildings overview and checks every queued building order in each village.
  *
  * This script:
  * - Reads visible/loaded construction queue data from Overview -> Buildings
  * - Checks every queued building order, not only the first order in the queue
  * - Estimates each queue item's own build duration from the finish-time gap inside the village queue
- * - Sorts results by longest estimated build duration first
+ * - Can also sort villages by total queue duration
+ * - Sorts results by longest duration first
  *
  * This script does NOT:
  * - Start, cancel, reorder, or confirm construction orders
@@ -23,17 +24,26 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Long Construction Queue";
-  const SCRIPT_VERSION = "v1.0.4";
+  const SCRIPT_VERSION = "v1.0.5";
   const BOX_ID = "twactics-long-construction-queue";
   const STYLE_ID = "twactics-long-construction-queue-style";
-  const DEFAULT_MAX_ROWS = 20;
+  const DEFAULT_MAX_ROWS = 15;
+  const SETTINGS_KEY = "twacticsLongConstructionQueueSettings";
+  const SORT_BY_SINGLE = "single";
+  const SORT_BY_TOTAL = "total";
 
-  const TIME_SOURCE = "individual-build-duration";
+  const DEFAULT_SETTINGS = {
+    sortBy: SORT_BY_SINGLE,
+    redWarningHours: 12,
+    orangeWarningHours: 8,
+    yellowWarningHours: 5
+  };
 
   const state = {
     rows: [],
     maxRows: DEFAULT_MAX_ROWS,
-    sourceUrl: ""
+    sourceUrl: "",
+    settings: loadSavedSettings()
   };
 
   const ui = {};
@@ -45,7 +55,8 @@
   window.twacticsLongConstructionQueue = {
     state: state,
     close: closeWidget,
-    reload: loadAndRender
+    reload: loadAndRender,
+    saveSettings: saveCurrentSettingsFromUi
   };
 
   function cleanText(value) {
@@ -478,6 +489,91 @@
     return collectConstructionOrdersFromDoc(document, serverNow);
   }
 
+  function parsePositiveNumber(value, fallback) {
+    const parsed = parseFloat(String(value || "").replace(",", "."));
+    if (isNaN(parsed) || parsed < 0) return fallback;
+    return parsed;
+  }
+
+  function normalizeSettings(settings) {
+    const merged = Object.assign({}, DEFAULT_SETTINGS, settings || {});
+
+    return {
+      sortBy: merged.sortBy === SORT_BY_TOTAL ? SORT_BY_TOTAL : SORT_BY_SINGLE,
+      redWarningHours: parsePositiveNumber(merged.redWarningHours, DEFAULT_SETTINGS.redWarningHours),
+      orangeWarningHours: parsePositiveNumber(merged.orangeWarningHours, DEFAULT_SETTINGS.orangeWarningHours),
+      yellowWarningHours: parsePositiveNumber(merged.yellowWarningHours, DEFAULT_SETTINGS.yellowWarningHours)
+    };
+  }
+
+  function validateSettings(settings) {
+    if (!settings) return "Missing settings.";
+    if (!(settings.redWarningHours > settings.orangeWarningHours)) {
+      return "Red warning must be higher than Orange warning.";
+    }
+    if (!(settings.orangeWarningHours > settings.yellowWarningHours)) {
+      return "Orange warning must be higher than Yellow warning.";
+    }
+    if (settings.yellowWarningHours < 0) {
+      return "Yellow warning cannot be below 0.";
+    }
+    return "";
+  }
+
+  function loadSavedSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return normalizeSettings(DEFAULT_SETTINGS);
+
+      const saved = normalizeSettings(JSON.parse(raw));
+      if (validateSettings(saved)) return normalizeSettings(DEFAULT_SETTINGS);
+
+      return saved;
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not load saved settings:", err);
+      return normalizeSettings(DEFAULT_SETTINGS);
+    }
+  }
+
+  function saveSettings(settings) {
+    const normalized = normalizeSettings(settings);
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(normalized));
+    state.settings = normalized;
+    syncSettingsPanel();
+    return normalized;
+  }
+
+  function getSettingsFromUi() {
+    return normalizeSettings({
+      sortBy: ui.sortBySelect ? ui.sortBySelect.value : state.settings.sortBy,
+      redWarningHours: ui.redWarningInput ? ui.redWarningInput.value : state.settings.redWarningHours,
+      orangeWarningHours: ui.orangeWarningInput ? ui.orangeWarningInput.value : state.settings.orangeWarningHours,
+      yellowWarningHours: ui.yellowWarningInput ? ui.yellowWarningInput.value : state.settings.yellowWarningHours
+    });
+  }
+
+  function syncSettingsPanel() {
+    if (!ui.sortBySelect) return;
+    ui.sortBySelect.value = state.settings.sortBy;
+    ui.redWarningInput.value = state.settings.redWarningHours;
+    ui.orangeWarningInput.value = state.settings.orangeWarningHours;
+    ui.yellowWarningInput.value = state.settings.yellowWarningHours;
+  }
+
+  function saveCurrentSettingsFromUi() {
+    const nextSettings = getSettingsFromUi();
+    const validationError = validateSettings(nextSettings);
+
+    if (validationError) {
+      setStatus(validationError, "error");
+      return;
+    }
+
+    saveSettings(nextSettings);
+    setStatus("Settings saved. Reloading construction queue data...", "success");
+    loadAndRender();
+  }
+
   function getBuildDurationSeconds(item) {
     if (item && item.buildDurationSeconds !== undefined && item.buildDurationSeconds !== null) {
       return Number(item.buildDurationSeconds) || 0;
@@ -486,41 +582,105 @@
     return Number(item && item.remainingSeconds) || 0;
   }
 
-  function getDisplayRows(rows) {
+  function getSortDurationSeconds(item) {
+    if (state.settings.sortBy === SORT_BY_TOTAL) {
+      return Number(item && item.totalQueueDurationSeconds) || 0;
+    }
+
+    return getBuildDurationSeconds(item);
+  }
+
+  function getSortDurationLabel() {
+    if (state.settings.sortBy === SORT_BY_TOTAL) {
+      return "total village queue duration";
+    }
+
+    return "single building duration";
+  }
+
+  function buildTotalQueueRows(rows) {
+    const grouped = new Map();
+
+    (rows || []).forEach(item => {
+      const key = item.villageId || item.villageName || "unknown";
+
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          villageId: item.villageId,
+          villageName: item.villageName,
+          villageHref: item.villageHref,
+          orderCount: 0,
+          totalQueueDurationSeconds: 0,
+          remainingSeconds: 0,
+          finishDate: null,
+          finishTimestamp: 0,
+          queuePosition: "-",
+          building: "Total queue"
+        });
+      }
+
+      const group = grouped.get(key);
+      group.orderCount += 1;
+      group.totalQueueDurationSeconds += getBuildDurationSeconds(item);
+
+      if ((item.finishTimestamp || 0) > group.finishTimestamp) {
+        group.finishTimestamp = item.finishTimestamp || 0;
+        group.finishDate = item.finishDate || null;
+        group.remainingSeconds = item.remainingSeconds || 0;
+      }
+    });
+
+    return Array.from(grouped.values());
+  }
+
+  function getSortableRows(rows) {
+    if (state.settings.sortBy === SORT_BY_TOTAL) {
+      return buildTotalQueueRows(rows);
+    }
+
+    return (rows || []).slice();
+  }
+
+  function sortRows(rows) {
     return (rows || [])
       .slice()
       .sort((a, b) => {
-        const diff = getBuildDurationSeconds(b) - getBuildDurationSeconds(a);
+        const diff = getSortDurationSeconds(b) - getSortDurationSeconds(a);
         if (diff !== 0) return diff;
         return (b.remainingSeconds || 0) - (a.remainingSeconds || 0);
-      })
-      .slice(0, state.maxRows || DEFAULT_MAX_ROWS);
+      });
   }
 
-  function getRowClass(item, index) {
-    if (index < 5) return "twlcq-row-critical";
-    if (index < 10) return "twlcq-row-warning";
+  function getDisplayRows(rows) {
+    return sortRows(getSortableRows(rows)).slice(0, state.maxRows || DEFAULT_MAX_ROWS);
+  }
+
+  function getRowClass(item) {
+    const hours = getSortDurationSeconds(item) / 3600;
+
+    if (hours >= state.settings.redWarningHours) return "twlcq-row-critical";
+    if (hours >= state.settings.orangeWarningHours) return "twlcq-row-orange";
+    if (hours >= state.settings.yellowWarningHours) return "twlcq-row-warning";
     return "";
   }
 
   function renderRows(rows) {
-    const sorted = (rows || []).slice().sort((a, b) => {
-      const diff = getBuildDurationSeconds(b) - getBuildDurationSeconds(a);
-      if (diff !== 0) return diff;
-      return (b.remainingSeconds || 0) - (a.remainingSeconds || 0);
-    });
-    const displayRows = getDisplayRows(rows);
-    const villageCount = new Set(displayRows.map(item => item.villageId || item.villageName)).size;
+    const sortableRows = getSortableRows(rows);
+    const sorted = sortRows(sortableRows);
+    const displayRows = sorted.slice(0, state.maxRows || DEFAULT_MAX_ROWS);
+    const villageCount = new Set((rows || []).map(item => item.villageId || item.villageName)).size;
+    const totalQueuedOrders = (rows || []).length;
+    const sortLabel = getSortDurationLabel();
 
     ui.results.innerHTML = "";
 
     const summary = document.createElement("div");
     summary.className = "twlcq-summary";
     summary.innerHTML =
-      "Showing the <strong>" + displayRows.length + "</strong> building order(s) with the longest estimated build duration" +
-      " from <strong>" + sorted.length + "</strong> total queued order(s)" +
+      "Showing the <strong>top " + displayRows.length + "</strong> result(s) by <strong>" + escapeHtml(sortLabel) + "</strong>" +
+      " from <strong>" + totalQueuedOrders + "</strong> total queued order(s)" +
       " in <strong>" + villageCount + "</strong> village(s). " +
-      "<span class='twlcq-muted'>Sorted by the building order's own duration, not by queue position or final finish time.</span>";
+      "<span class='twlcq-muted'>Red: " + state.settings.redWarningHours + "h+, Orange: " + state.settings.orangeWarningHours + "h+, Yellow: " + state.settings.yellowWarningHours + "h+.</span>";
     ui.results.appendChild(summary);
 
     if (!displayRows.length) {
@@ -536,37 +696,62 @@
 
     const table = document.createElement("table");
     table.className = "twlcq-table";
-    table.innerHTML =
-      "<thead>" +
-        "<tr>" +
-          "<th>#</th>" +
-          "<th class='twlcq-left'>Village</th>" +
-          "<th>Queue</th>" +
-          "<th class='twlcq-left'>Building</th>" +
-          "<th>Build duration</th>" +
-          "<th>Finish time</th>" +
-          "<th>Finishes in</th>" +
-        "</tr>" +
-      "</thead>";
+
+    if (state.settings.sortBy === SORT_BY_TOTAL) {
+      table.innerHTML =
+        "<thead>" +
+          "<tr>" +
+            "<th>#</th>" +
+            "<th class='twlcq-left'>Village</th>" +
+            "<th>Orders</th>" +
+            "<th>Total queue duration</th>" +
+            "<th>Last finish</th>" +
+            "<th>Queue finishes in</th>" +
+          "</tr>" +
+        "</thead>";
+    } else {
+      table.innerHTML =
+        "<thead>" +
+          "<tr>" +
+            "<th>#</th>" +
+            "<th class='twlcq-left'>Village</th>" +
+            "<th>Queue</th>" +
+            "<th class='twlcq-left'>Building</th>" +
+            "<th>Build duration</th>" +
+            "<th>Finish time</th>" +
+            "<th>Finishes in</th>" +
+          "</tr>" +
+        "</thead>";
+    }
 
     const tbody = document.createElement("tbody");
 
     displayRows.forEach((item, index) => {
       const tr = document.createElement("tr");
-      tr.className = getRowClass(item, index);
+      tr.className = getRowClass(item);
 
-      const buildingHtml = item.imageSrc
-        ? "<img class='twlcq-building-icon' src='" + escapeHtml(item.imageSrc) + "' alt=''> " + escapeHtml(item.building)
-        : escapeHtml(item.building);
+      if (state.settings.sortBy === SORT_BY_TOTAL) {
+        tr.innerHTML =
+          "<td>" + (index + 1) + "</td>" +
+          "<td class='twlcq-left'><a href='" + escapeHtml(item.villageHref || "#") + "' target='_blank' rel='noreferrer noopener'>" + escapeHtml(item.villageName) + "</a></td>" +
+          "<td>" + item.orderCount + "</td>" +
+          "<td><strong>" + escapeHtml(formatDuration(getSortDurationSeconds(item))) + "</strong></td>" +
+          "<td>" + escapeHtml(formatDateTime(item.finishDate)) + "</td>" +
+          "<td>" + escapeHtml(formatDuration(item.remainingSeconds)) + "</td>";
+      } else {
+        const buildingHtml = item.imageSrc
+          ? "<img class='twlcq-building-icon' src='" + escapeHtml(item.imageSrc) + "' alt=''> " + escapeHtml(item.building)
+          : escapeHtml(item.building);
 
-      tr.innerHTML =
-        "<td>" + (index + 1) + "</td>" +
-        "<td class='twlcq-left'><a href='" + escapeHtml(item.villageHref || "#") + "' target='_blank' rel='noreferrer noopener'>" + escapeHtml(item.villageName) + "</a></td>" +
-        "<td>" + item.queuePosition + "</td>" +
-        "<td class='twlcq-left'>" + buildingHtml + "</td>" +
-        "<td><strong>" + escapeHtml(formatDuration(getBuildDurationSeconds(item))) + "</strong></td>" +
-        "<td>" + escapeHtml(formatDateTime(item.finishDate)) + "</td>" +
-        "<td>" + escapeHtml(formatDuration(item.remainingSeconds)) + "</td>";
+        tr.innerHTML =
+          "<td>" + (index + 1) + "</td>" +
+          "<td class='twlcq-left'><a href='" + escapeHtml(item.villageHref || "#") + "' target='_blank' rel='noreferrer noopener'>" + escapeHtml(item.villageName) + "</a></td>" +
+          "<td>" + item.queuePosition + "</td>" +
+          "<td class='twlcq-left'>" + buildingHtml + "</td>" +
+          "<td><strong>" + escapeHtml(formatDuration(getSortDurationSeconds(item))) + "</strong></td>" +
+          "<td>" + escapeHtml(formatDateTime(item.finishDate)) + "</td>" +
+          "<td>" + escapeHtml(formatDuration(item.remainingSeconds)) + "</td>";
+      }
 
       tbody.appendChild(tr);
     });
@@ -586,7 +771,7 @@
       renderRows(rows);
 
       setStatus(
-        "Loaded " + rows.length + " queued building order(s). Showing top " + (state.maxRows || DEFAULT_MAX_ROWS) + " longest estimated build durations.",
+        "Loaded " + rows.length + " queued building order(s). Showing top " + (state.maxRows || DEFAULT_MAX_ROWS) + " by " + getSortDurationLabel() + ".",
         "success"
       );
     } catch (err) {
@@ -640,14 +825,25 @@
         line-height: 1;
       }
 
-      .twlcq-close {
+      .twlcq-header-actions {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .twlcq-icon-button {
+        min-width: 22px;
+        height: 22px;
         border: 1px solid #7d510f;
         background: #f4e4bc;
         color: #2f1b00;
         border-radius: 3px;
         cursor: pointer;
         font-weight: bold;
+        line-height: 1;
       }
+
+      .twlcq-icon-button:hover { background: #fff4d5; }
 
       .twlcq-body { padding: 10px; }
 
@@ -665,12 +861,35 @@
         margin-bottom: 4px;
       }
 
-      .twlcq-field input {
-        width: 110px;
+      .twlcq-field input,
+      .twlcq-field select {
+        width: 150px;
         padding: 4px;
         border: 1px solid #7d510f;
         background: #fffaf0;
         color: #2f1b00;
+      }
+
+      .twlcq-field input[type="number"] { width: 90px; }
+
+      .twlcq-settings-panel {
+        display: none;
+        margin: 8px 0;
+        padding: 8px;
+        border: 1px solid #bd9c5a;
+        background: #fff4d5;
+        border-radius: 4px;
+      }
+
+      .twlcq-settings-panel.twlcq-settings-open { display: block; }
+
+      .twlcq-save-settings {
+        padding: 4px 8px;
+        border: 1px solid #7d510f;
+        background: #c1a264;
+        color: #fff;
+        cursor: pointer;
+        font-weight: bold;
       }
 
       .twlcq-help {
@@ -732,6 +951,7 @@
 
       .twlcq-table tr:nth-child(even) td { background: #f0e2be; }
       .twlcq-table tr.twlcq-row-warning td { background: #fff293 !important; }
+      .twlcq-table tr.twlcq-row-orange td { background: #f7c46c !important; }
       .twlcq-table tr.twlcq-row-critical td { background: #f2b6a0 !important; }
       .twlcq-left { text-align: left !important; }
       .twlcq-building-icon { width: 18px; height: 18px; vertical-align: middle; margin-right: 4px; }
@@ -750,6 +970,49 @@
     delete window.twacticsLongConstructionQueue;
   }
 
+  function createSettingsPanel() {
+    const panel = document.createElement("div");
+    panel.className = "twlcq-settings-panel";
+
+    panel.innerHTML =
+      "<div class='twlcq-controls'>" +
+        "<div class='twlcq-field'>" +
+          "<label>Sort by</label>" +
+          "<select class='twlcq-sort-by'>" +
+            "<option value='" + SORT_BY_SINGLE + "'>Single building duration</option>" +
+            "<option value='" + SORT_BY_TOTAL + "'>Total building queue</option>" +
+          "</select>" +
+        "</div>" +
+        "<div class='twlcq-field'>" +
+          "<label>Red warning (h)+</label>" +
+          "<input class='twlcq-red-warning' type='number' min='0' step='0.25'>" +
+        "</div>" +
+        "<div class='twlcq-field'>" +
+          "<label>Orange warning (h)+</label>" +
+          "<input class='twlcq-orange-warning' type='number' min='0' step='0.25'>" +
+        "</div>" +
+        "<div class='twlcq-field'>" +
+          "<label>Yellow warning (h)+</label>" +
+          "<input class='twlcq-yellow-warning' type='number' min='0' step='0.25'>" +
+        "</div>" +
+        "<button type='button' class='twlcq-save-settings'>Save settings</button>" +
+      "</div>" +
+      "<div class='twlcq-muted'>Settings are saved locally in this browser. Saving reloads the current queue list automatically.</div>";
+
+    ui.sortBySelect = panel.querySelector(".twlcq-sort-by");
+    ui.redWarningInput = panel.querySelector(".twlcq-red-warning");
+    ui.orangeWarningInput = panel.querySelector(".twlcq-orange-warning");
+    ui.yellowWarningInput = panel.querySelector(".twlcq-yellow-warning");
+
+    const saveButton = panel.querySelector(".twlcq-save-settings");
+    saveButton.addEventListener("click", saveCurrentSettingsFromUi);
+
+    ui.settingsPanel = panel;
+    syncSettingsPanel();
+
+    return panel;
+  }
+
   function createWidget() {
     addStyles();
 
@@ -763,19 +1026,39 @@
     header.className = "twlcq-header";
     header.innerHTML = "<h3>" + escapeHtml(SCRIPT_NAME + " " + SCRIPT_VERSION) + "</h3>";
 
+    const headerActions = document.createElement("div");
+    headerActions.className = "twlcq-header-actions";
+
+    const settingsButton = document.createElement("button");
+    settingsButton.type = "button";
+    settingsButton.className = "twlcq-icon-button";
+    settingsButton.title = "Settings";
+    settingsButton.textContent = "⚙";
+    settingsButton.addEventListener("click", function () {
+      if (ui.settingsPanel) {
+        ui.settingsPanel.classList.toggle("twlcq-settings-open");
+      }
+    });
+
     const closeButton = document.createElement("button");
     closeButton.type = "button";
-    closeButton.className = "twlcq-close";
+    closeButton.className = "twlcq-icon-button";
+    closeButton.title = "Close";
     closeButton.textContent = "x";
     closeButton.addEventListener("click", closeWidget);
-    header.appendChild(closeButton);
+
+    headerActions.appendChild(settingsButton);
+    headerActions.appendChild(closeButton);
+    header.appendChild(headerActions);
 
     const body = document.createElement("div");
     body.className = "twlcq-body";
 
     const help = document.createElement("p");
     help.className = "twlcq-help";
-    help.textContent = "Shows the top 20 building orders with the longest estimated build duration. It checks all queue positions and sorts by the item's own duration, not by when it finishes in the full village queue.";
+    help.textContent = "Shows the top 15 construction queue entries. Default sorting is by single building duration. Use the settings icon to switch to total village queue duration or adjust warning thresholds.";
+
+    const settingsPanel = createSettingsPanel();
 
     const status = document.createElement("div");
     status.className = "twlcq-status";
@@ -784,6 +1067,7 @@
     const results = document.createElement("div");
 
     body.appendChild(help);
+    body.appendChild(settingsPanel);
     body.appendChild(status);
     body.appendChild(results);
 
@@ -799,5 +1083,5 @@
 
   createWidget();
   loadAndRender();
-  console.log(SCRIPT_NAME + " " + SCRIPT_VERSION + " loaded", { mode: TIME_SOURCE, autoLoad: true });
+  console.log(SCRIPT_NAME + " " + SCRIPT_VERSION + " loaded", { settings: state.settings, autoLoad: true });
 })();
