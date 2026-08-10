@@ -25,7 +25,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Long Construction Queue";
-  const SCRIPT_VERSION = "v1.0.6";
+  const SCRIPT_VERSION = "v1.0.7";
   const BOX_ID = "twactics-long-construction-queue";
   const STYLE_ID = "twactics-long-construction-queue-style";
   const DEFAULT_MAX_ROWS = 15;
@@ -874,6 +874,8 @@
       }
 
       .twlcq-field input[type="number"] { width: 90px; }
+
+      .twlcq-field select.twlcq-sort-by { width: 230px; }
 
       .twlcq-settings-panel {
         display: none;
