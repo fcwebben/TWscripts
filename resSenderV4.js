@@ -81,7 +81,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.2";
+  const SCRIPT_VERSION = "v1.0.3";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
@@ -669,6 +669,20 @@
     return state.incoming.get(coord) || { wood: 0, clay: 0, iron: 0 };
   }
 
+  function logOverflowDebug(targetCoord, details) {
+    try {
+      if (console && console.groupCollapsed) {
+        console.groupCollapsed(SCRIPT_NAME + " overflow debug: " + targetCoord);
+        console.log(details);
+        console.groupEnd();
+      } else {
+        console.log(SCRIPT_NAME + " overflow debug: " + targetCoord, details);
+      }
+    } catch (err) {
+      console.log(SCRIPT_NAME + " overflow debug failed", err);
+    }
+  }
+
   function getDesiredNeedForTarget(tab, targetCoord, plannedByTarget) {
     const base = {
       wood: Math.max(0, parseNumber(tab.wood, 0)),
@@ -692,11 +706,49 @@
       need = Object.assign({}, base);
     }
 
-    if (state.settings.overflowProtection && target && target.warehouse) {
-      const limit = Math.floor(target.warehouse * 0.95);
-      need.wood = Math.min(need.wood, Math.max(0, limit - target.wood - incoming.wood - alreadyPlanned.wood));
-      need.clay = Math.min(need.clay, Math.max(0, limit - target.clay - incoming.clay - alreadyPlanned.clay));
-      need.iron = Math.min(need.iron, Math.max(0, limit - target.iron - incoming.iron - alreadyPlanned.iron));
+    const needBeforeOverflow = Object.assign({}, need);
+
+    if (state.settings.overflowProtection) {
+      const debug = {
+        targetCoord: targetCoord,
+        mode: state.settings.resourceMode,
+        enteredTargetAmount: Object.assign({}, base),
+        targetCurrent: target ? { wood: target.wood || 0, clay: target.clay || 0, iron: target.iron || 0 } : null,
+        incoming: Object.assign({}, incoming),
+        alreadyPlanned: Object.assign({}, alreadyPlanned),
+        needBeforeOverflow: Object.assign({}, needBeforeOverflow),
+        warehouse: target && target.warehouse ? target.warehouse : 0,
+        limitPercent: 95,
+        applied: false
+      };
+
+      if (target && target.warehouse) {
+        const limit = Math.floor(target.warehouse * 0.95);
+        const maxAllowed = {
+          wood: Math.max(0, limit - target.wood - incoming.wood - alreadyPlanned.wood),
+          clay: Math.max(0, limit - target.clay - incoming.clay - alreadyPlanned.clay),
+          iron: Math.max(0, limit - target.iron - incoming.iron - alreadyPlanned.iron)
+        };
+
+        need.wood = Math.min(need.wood, maxAllowed.wood);
+        need.clay = Math.min(need.clay, maxAllowed.clay);
+        need.iron = Math.min(need.iron, maxAllowed.iron);
+
+        debug.applied = true;
+        debug.warehouseLimit = limit;
+        debug.maxAllowedByOverflow = maxAllowed;
+        debug.needAfterOverflow = Object.assign({}, need);
+        debug.reduced = {
+          wood: Math.max(0, needBeforeOverflow.wood - need.wood),
+          clay: Math.max(0, needBeforeOverflow.clay - need.clay),
+          iron: Math.max(0, needBeforeOverflow.iron - need.iron)
+        };
+      } else {
+        debug.reason = "Target village or warehouse capacity was not found, so overflow protection could not be applied for this target.";
+        debug.needAfterOverflow = Object.assign({}, need);
+      }
+
+      logOverflowDebug(targetCoord, debug);
     }
 
     return need;
@@ -852,12 +904,40 @@
     return data;
   }
 
+  function removeRequestedRow(button) {
+    if (!button) return;
+    const rowElement = button.closest("tr");
+    if (rowElement) rowElement.remove();
+    renumberResultRows();
+  }
+
+  function renumberResultRows() {
+    if (!ui.results) return;
+    Array.from(ui.results.querySelectorAll(".twrr-result-row")).forEach((row, index) => {
+      const indexCell = row.querySelector(".twrr-row-index");
+      if (indexCell) indexCell.textContent = String(index + 1);
+    });
+  }
+
   function postResourceRequest(row, button) {
     if (!row || !row.targetId || !row.requests.length) return;
 
     const data = buildPostDataForRow(row);
 
-    if (button) button.disabled = true;
+    console.log(SCRIPT_NAME + " request debug", {
+      targetCoord: row.targetCoord,
+      targetId: row.targetId,
+      planned: row.planned,
+      missing: row.missing,
+      requests: row.requests,
+      postData: data
+    });
+
+    if (button) {
+      button.disabled = true;
+      button.value = "requesting...";
+      button.classList.add("twrr-requesting");
+    }
 
     TribalWars.post("market", {
       village: row.targetId,
@@ -866,26 +946,18 @@
     }, data, function (response) {
       const message = response && (response.success || response.message) || "Request sent.";
       if (typeof UI !== "undefined" && UI.SuccessMessage) UI.SuccessMessage(message, 1500);
-      if (button) {
-        button.value = "requested";
-        button.classList.add("twrr-done");
-      }
+      console.log(SCRIPT_NAME + " request success", { targetCoord: row.targetCoord, response: response });
+      removeRequestedRow(button);
     }, function (error) {
       console.error(SCRIPT_NAME + " request failed:", error);
       if (typeof UI !== "undefined" && UI.ErrorMessage) UI.ErrorMessage("Request failed.", 2000);
-      if (button) button.disabled = false;
+      if (button) {
+        button.disabled = false;
+        button.value = "request";
+        button.classList.remove("twrr-requesting");
+        button.focus();
+      }
     });
-  }
-
-  async function requestAllRows() {
-    if (!state.lastPlan.length) return;
-    if (!window.confirm("Request resources for all visible planned target villages?")) return;
-
-    const rows = state.lastPlan.filter(row => row.total > 0 && row.requests.length > 0);
-    for (let i = 0; i < rows.length; i++) {
-      postResourceRequest(rows[i]);
-      await wait(220);
-    }
   }
 
   function getActiveTab() {
@@ -1105,6 +1177,19 @@
         border-radius: 3px;
       }
       .twrr-button:hover { background: #9e7e3d; }
+      .twrr-button:focus,
+      .twrr-button:focus-visible {
+        outline: 3px solid #ffe066;
+        outline-offset: 2px;
+        box-shadow: 0 0 0 2px #603000;
+        background: #9e7e3d;
+      }
+      .twrr-row-request:focus,
+      .twrr-row-request:focus-visible {
+        outline: 3px solid #00b7ff;
+        outline-offset: 2px;
+        box-shadow: 0 0 0 2px #ffffff, 0 0 0 4px #003c5f;
+      }
       .twrr-button-secondary { background: #7d510f; }
       .twrr-button-danger { background: #8f342b; }
       .twrr-status {
@@ -1390,7 +1475,7 @@
 
     const help = document.createElement("p");
     help.className = "twrr-help";
-    help.textContent = "Plan resource requests from origin villages to target villages. Use pasted coords or village groups, then request manually per target or all planned targets.";
+    help.textContent = "Plan resource requests from origin villages to target villages. Use pasted coords or village groups, then request manually per target.";
 
     const settingsPanel = createSettingsPanel();
 
@@ -1530,13 +1615,33 @@
     }, 50);
   }
 
+  function getNextRequestButton(currentButton) {
+    if (!ui.results) return null;
+    const buttons = Array.from(ui.results.querySelectorAll(".twrr-row-request"));
+    if (!buttons.length) return null;
+
+    const index = buttons.indexOf(currentButton);
+
+    for (let i = Math.max(index + 1, 0); i < buttons.length; i++) {
+      if (!buttons[i].disabled) return buttons[i];
+    }
+
+    for (let i = 0; i < Math.max(index, 0); i++) {
+      if (!buttons[i].disabled) return buttons[i];
+    }
+
+    return null;
+  }
+
   function focusNextRequestButton(currentButton) {
+    const next = getNextRequestButton(currentButton);
+
     window.setTimeout(function () {
-      const buttons = getEnabledRequestButtons();
-      if (!buttons.length) return;
-      const index = buttons.indexOf(currentButton);
-      const next = index >= 0 ? buttons[Math.min(index + 1, buttons.length - 1)] : buttons[0];
-      next.focus();
+      if (next && document.body.contains(next) && !next.disabled) {
+        next.focus();
+      } else {
+        focusFirstRequestButton();
+      }
     }, 50);
   }
 
@@ -1588,16 +1693,6 @@
       return;
     }
 
-    const actions = document.createElement("div");
-    actions.className = "twrr-actions";
-    const requestAll = document.createElement("button");
-    requestAll.type = "button";
-    requestAll.className = "twrr-button";
-    requestAll.textContent = "Request all visible";
-    requestAll.addEventListener("click", requestAllRows);
-    actions.appendChild(requestAll);
-    ui.results.appendChild(actions);
-
     const wrap = document.createElement("div");
     wrap.className = "twrr-table-wrap";
 
@@ -1617,9 +1712,10 @@
 
     result.rows.forEach((row, index) => {
       const tr = document.createElement("tr");
+      tr.className = "twrr-result-row";
       const disabled = row.total <= 0 || !row.requests.length;
       tr.innerHTML =
-        "<td>" + (index + 1) + "</td>" +
+        "<td class='twrr-row-index'>" + (index + 1) + "</td>" +
         "<td class='twrr-left'><a href='" + escapeHtml(buildGameUrl({ screen: "info_village", id: row.targetId })) + "' target='_blank' rel='noreferrer noopener'>" + escapeHtml(row.targetCoord) + "</a></td>" +
         "<td>" + formatSendResourcesHtml(row) + "</td>" +
         "<td>" + row.requestCount + "</td>" +
