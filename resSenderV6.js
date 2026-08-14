@@ -13,8 +13,8 @@
  * - Reads visible/loaded village resource, merchant and warehouse data from Overview -> Production
  * - Reads incoming resource transports from Overview -> Transports -> Incoming
  * - Reads static village groups from Overview -> Groups
- * - Builds a manual request plan based on the player's resource inputs
- * - Can request exact amounts per target or fill targets up to desired amounts including current/incoming resources
+ * - Builds a manual request plan based on the player's exact resource inputs per target
+ * - Can optionally cap planned requests with overflow protection using current resources and incoming transports
  * - Uses TribalWars.scriptData as supported user-data input when enabled in the Script Library
  * - Saves in-UI changes locally in the browser as a convenience fallback
  *
@@ -33,7 +33,6 @@
  * Expected TribalWars.scriptData format:
  * {
  *   "settings": {
- *     "resourceMode": "exact",
  *     "reserveMerchants": 0,
  *     "reserveWarehousePercent": 5,
  *     "maxDistance": 50,
@@ -54,9 +53,6 @@
  * }
  *
  * Options:
- * - settings.resourceMode: "exact" or "fill"
- *   - exact: request exactly the entered resource amounts for each target, ignoring current and incoming resources
- *   - fill: request only what each target is missing after current resources and incoming transports
  * - settings.reserveMerchants: number of merchants to keep unused in every origin village
  * - settings.reserveWarehousePercent: percent of each origin village's warehouse to keep as local reserve
  * - settings.maxDistance: maximum allowed field distance between origin and target
@@ -81,14 +77,13 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.4";
+  const SCRIPT_VERSION = "v1.0.5";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
   const DATA_VERSION = 1;
 
   const DEFAULT_SETTINGS = {
-    resourceMode: "exact",
     reserveMerchants: 0,
     reserveWarehousePercent: 5,
     maxDistance: 50,
@@ -306,10 +301,6 @@
     // TribalWars.scriptData is the official imported configuration. Local storage is a convenience for UI saves.
     const merged = Object.assign({}, defaults, localData || {}, scriptData || {});
 
-    // Backward compatibility with early versions where resourceMode was stored per tab.
-    if ((!merged.settings || !merged.settings.resourceMode) && merged.tabs && merged.tabs[0] && merged.tabs[0].resourceMode) {
-      merged.settings = Object.assign({}, merged.settings || {}, { resourceMode: merged.tabs[0].resourceMode });
-    }
 
     return normalizeUserData(merged);
   }
@@ -318,7 +309,6 @@
     const source = Object.assign({}, DEFAULT_SETTINGS, input || {});
 
     return {
-      resourceMode: source.resourceMode === "fill" ? "fill" : "exact",
       reserveMerchants: Math.max(0, parseNumber(source.reserveMerchants, DEFAULT_SETTINGS.reserveMerchants)),
       reserveWarehousePercent: clampNumber(source.reserveWarehousePercent, 0, 100, DEFAULT_SETTINGS.reserveWarehousePercent),
       maxDistance: clampNumber(source.maxDistance, 0, 1000, DEFAULT_SETTINGS.maxDistance),
@@ -763,20 +753,6 @@
     return state.incoming.get(coord) || { wood: 0, clay: 0, iron: 0 };
   }
 
-  function logOverflowDebug(targetCoord, details) {
-    try {
-      if (console && console.groupCollapsed) {
-        console.groupCollapsed(SCRIPT_NAME + " overflow debug: " + targetCoord);
-        console.log(details);
-        console.groupEnd();
-      } else {
-        console.log(SCRIPT_NAME + " overflow debug: " + targetCoord, details);
-      }
-    } catch (err) {
-      console.log(SCRIPT_NAME + " overflow debug failed", err);
-    }
-  }
-
   function getDesiredNeedForTarget(tab, targetCoord, plannedByTarget) {
     const base = {
       wood: Math.max(0, parseNumber(tab.wood, 0)),
@@ -787,67 +763,23 @@
     const target = state.production.get(targetCoord);
     const incoming = getIncomingForCoord(targetCoord);
     const alreadyPlanned = plannedByTarget.get(targetCoord) || { wood: 0, clay: 0, iron: 0 };
+    const need = Object.assign({}, base);
 
-    let need;
-
-    if (state.settings.resourceMode === "fill") {
-      need = {
-        wood: Math.max(0, base.wood - ((target && target.wood) || 0) - incoming.wood - alreadyPlanned.wood),
-        clay: Math.max(0, base.clay - ((target && target.clay) || 0) - incoming.clay - alreadyPlanned.clay),
-        iron: Math.max(0, base.iron - ((target && target.iron) || 0) - incoming.iron - alreadyPlanned.iron)
-      };
-    } else {
-      need = Object.assign({}, base);
-    }
-
-    const needBeforeOverflow = Object.assign({}, need);
-
-    if (state.settings.overflowProtection) {
-      const debug = {
-        targetCoord: targetCoord,
-        mode: state.settings.resourceMode,
-        enteredTargetAmount: Object.assign({}, base),
-        targetCurrent: target ? { wood: target.wood || 0, clay: target.clay || 0, iron: target.iron || 0 } : null,
-        incoming: Object.assign({}, incoming),
-        alreadyPlanned: Object.assign({}, alreadyPlanned),
-        needBeforeOverflow: Object.assign({}, needBeforeOverflow),
-        warehouse: target && target.warehouse ? target.warehouse : 0,
-        limitPercent: 95,
-        applied: false
+    if (state.settings.overflowProtection && target && target.warehouse) {
+      const limit = Math.floor(target.warehouse * 0.95);
+      const maxAllowed = {
+        wood: Math.max(0, limit - target.wood - incoming.wood - alreadyPlanned.wood),
+        clay: Math.max(0, limit - target.clay - incoming.clay - alreadyPlanned.clay),
+        iron: Math.max(0, limit - target.iron - incoming.iron - alreadyPlanned.iron)
       };
 
-      if (target && target.warehouse) {
-        const limit = Math.floor(target.warehouse * 0.95);
-        const maxAllowed = {
-          wood: Math.max(0, limit - target.wood - incoming.wood - alreadyPlanned.wood),
-          clay: Math.max(0, limit - target.clay - incoming.clay - alreadyPlanned.clay),
-          iron: Math.max(0, limit - target.iron - incoming.iron - alreadyPlanned.iron)
-        };
-
-        need.wood = Math.min(need.wood, maxAllowed.wood);
-        need.clay = Math.min(need.clay, maxAllowed.clay);
-        need.iron = Math.min(need.iron, maxAllowed.iron);
-
-        debug.applied = true;
-        debug.warehouseLimit = limit;
-        debug.maxAllowedByOverflow = maxAllowed;
-        debug.needAfterOverflow = Object.assign({}, need);
-        debug.reduced = {
-          wood: Math.max(0, needBeforeOverflow.wood - need.wood),
-          clay: Math.max(0, needBeforeOverflow.clay - need.clay),
-          iron: Math.max(0, needBeforeOverflow.iron - need.iron)
-        };
-      } else {
-        debug.reason = "Target village or warehouse capacity was not found, so overflow protection could not be applied for this target.";
-        debug.needAfterOverflow = Object.assign({}, need);
-      }
-
-      logOverflowDebug(targetCoord, debug);
+      need.wood = Math.min(need.wood, maxAllowed.wood);
+      need.clay = Math.min(need.clay, maxAllowed.clay);
+      need.iron = Math.min(need.iron, maxAllowed.iron);
     }
 
     return need;
   }
-
   function getOriginAvailability(originCoord, originState) {
     const origin = state.production.get(originCoord);
     if (!origin) return null;
@@ -1072,11 +1004,10 @@
     if (!ui.settingsPanel) return;
 
     state.settings = normalizeSettings({
-      resourceMode: ui.resourceModeInput ? ui.resourceModeInput.value : state.settings.resourceMode,
       reserveMerchants: ui.reserveMerchantsInput && ui.reserveMerchantsInput.value,
       reserveWarehousePercent: ui.reserveWarehouseInput && ui.reserveWarehouseInput.value,
       maxDistance: ui.maxDistanceInput && ui.maxDistanceInput.value,
-      overflowProtection: ui.overflowProtectionInput ? ui.overflowProtectionInput.value === "true" : state.settings.overflowProtection
+      overflowProtection: ui.overflowProtectionInput ? ui.overflowProtectionInput.checked === true : state.settings.overflowProtection
     });
   }
 
@@ -1095,11 +1026,10 @@
 
   function syncSettingsToUi() {
     if (!ui.settingsPanel) return;
-    ui.resourceModeInput.value = state.settings.resourceMode;
     ui.reserveMerchantsInput.value = state.settings.reserveMerchants;
     ui.reserveWarehouseInput.value = state.settings.reserveWarehousePercent;
     ui.maxDistanceInput.value = state.settings.maxDistance;
-    ui.overflowProtectionInput.value = state.settings.overflowProtection ? "true" : "false";
+    ui.overflowProtectionInput.checked = state.settings.overflowProtection === true;
   }
 
   function getActiveTabDisplayName(index) {
@@ -1243,6 +1173,20 @@
         background: #fffaf0;
         color: #2f1b00;
       }
+      .twrr-checkbox-label {
+        display: flex !important;
+        align-items: center;
+        gap: 6px;
+        min-height: 32px;
+        margin-bottom: 0 !important;
+      }
+      .twrr-checkbox-label input[type="checkbox"] {
+        width: auto;
+        min-height: auto;
+        padding: 0;
+        border: 0;
+        background: transparent;
+      }
       .twrr-field textarea { min-height: 88px; resize: vertical; font-family: monospace; }
       .twrr-resource-grid { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
       .twrr-coords-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
@@ -1380,14 +1324,10 @@
     panel.className = "twrr-settings-panel";
     panel.innerHTML =
       "<div class='twrr-grid'>" +
-        "<div class='twrr-field'><label>Resource mode</label><select class='twrr-resource-mode'>" +
-          "<option value='exact'>Request exact amount</option>" +
-          "<option value='fill'>Fill to amount incl. current/incoming</option>" +
-        "</select></div>" +
         "<div class='twrr-field'><label>Reserve merchants</label><input class='twrr-reserve-merchants' type='number' min='0' step='1'></div>" +
         "<div class='twrr-field'><label>Reserve warehouse (%)</label><input class='twrr-reserve-warehouse' type='number' min='0' max='100' step='0.25'></div>" +
         "<div class='twrr-field'><label>Max distance</label><input class='twrr-max-distance' type='number' min='0' step='0.1'></div>" +
-        "<div class='twrr-field'><label>Overflow protection <span class='twrr-tooltip' title='When enabled, the plan will not request resources that would push a target village above 95% warehouse capacity after current resources, incoming transports and planned requests.'>?</span></label><select class='twrr-overflow-protection'><option value='true'>Enabled</option><option value='false'>Disabled</option></select></div>" +
+        "<div class='twrr-field'><label class='twrr-checkbox-label'><input class='twrr-overflow-protection' type='checkbox'> <span>Overflow protection</span> <span class='twrr-tooltip' title='When enabled, the plan will not request resources that would push a target village above 95% warehouse capacity after current resources, incoming transports and planned requests.'>?</span></label></div>" +
       "</div>" +
       "<div class='twrr-actions'>" +
         "<button type='button' class='twrr-button twrr-save-settings'>Save settings</button>" +
@@ -1396,7 +1336,6 @@
       "<div class='twrr-muted'>The script reads TribalWars.scriptData on startup. Save updates TribalWars.scriptData for the current run and stores a local browser fallback. For Script Library persistence, copy the exported JSON into the script user-data field.</div>" +
       "<textarea class='twrr-export' readonly></textarea>";
 
-    ui.resourceModeInput = panel.querySelector(".twrr-resource-mode");
     ui.reserveMerchantsInput = panel.querySelector(".twrr-reserve-merchants");
     ui.reserveWarehouseInput = panel.querySelector(".twrr-reserve-warehouse");
     ui.maxDistanceInput = panel.querySelector(".twrr-max-distance");
@@ -1762,7 +1701,6 @@
     const summary = document.createElement("div");
     summary.className = "twrr-summary";
     summary.innerHTML =
-      "<strong>Mode:</strong> " + (state.settings.resourceMode === "fill" ? "Fill to amount including current/incoming" : "Request exact amount") + " · " +
       "<strong>Origins:</strong> " + coords.origins.length + " · " +
       "<strong>Targets:</strong> " + coords.targets.length + " · " +
       "<strong>Max distance:</strong> " + state.settings.maxDistance + " · " +
