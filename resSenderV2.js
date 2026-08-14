@@ -7,7 +7,7 @@
  *
  * Helps players request resources from origin villages to target villages using the Market request/call action.
  * The script reads village/resource data from Overview -> Production, incoming transports from Overview -> Transports,
- * and can use either pasted coordinates or selected village groups as origin/target sources.
+ * and can use pasted coordinates or selected village groups as origin/target sources.
  *
  * This script:
  * - Reads visible/loaded village resource, merchant and warehouse data from Overview -> Production
@@ -24,14 +24,20 @@
  * - Automatically request resources without a manual user click
  * - Use external servers or external files
  *
+ * Important Script Library user-data note:
+ * If the "This script supports user data" option is enabled, players can store personal settings
+ * as a JSON object for this script. Each time a player runs the script from the quickbar,
+ * TribalWars.scriptData is available before the script executes.
+ * Please document the expected format and available options in your script description.
+ *
  * Expected TribalWars.scriptData format:
  * {
  *   "settings": {
+ *     "resourceMode": "exact",
  *     "reserveMerchants": 0,
  *     "reserveWarehousePercent": 5,
  *     "maxDistance": 50,
- *     "overflowProtection": true,
- *     "merchantCapacity": 1000
+ *     "overflowProtection": true
  *   },
  *   "tabs": [
  *     {
@@ -39,11 +45,8 @@
  *       "wood": 120000,
  *       "clay": 150000,
  *       "iron": 150000,
- *       "resourceMode": "exact",
- *       "originSource": "coords",
  *       "originCoords": "500|500 501|500",
  *       "originGroupId": "",
- *       "targetSource": "coords",
  *       "targetCoords": "510|510 511|510",
  *       "targetGroupId": ""
  *     }
@@ -51,27 +54,45 @@
  * }
  *
  * Options:
- * - resourceMode: "exact" or "fill"
+ * - settings.resourceMode: "exact" or "fill"
  *   - exact: request exactly the entered resource amounts for each target, ignoring current and incoming resources
  *   - fill: request only what each target is missing after current resources and incoming transports
- * - originSource / targetSource: "coords" or "group"
+ * - settings.reserveMerchants: number of merchants to keep unused in every origin village
+ * - settings.reserveWarehousePercent: percent of each origin village's warehouse to keep as local reserve
+ * - settings.maxDistance: maximum allowed field distance between origin and target
+ * - settings.overflowProtection: true/false. When enabled, planned requests cannot push targets above 95% warehouse capacity.
+ * - tabs[].originCoords / tabs[].targetCoords: pasted coordinates. Selecting a group fills these fields automatically.
+ * - tabs[].originGroupId / tabs[].targetGroupId: selected group IDs, saved together with the visible coordinates.
+ */
+
+/*
+ * Disclaimer:
+ * By uploading a user-generated mod for use with Tribal Wars, the creator grants
+ * InnoGames a perpetual, irrevocable, worldwide, royalty-free, non-exclusive
+ * license to use, reproduce, distribute, publicly display, modify, and create
+ * derivative works of the mod. This license permits InnoGames to incorporate the
+ * mod into any aspect of the game and its related services, including promotional
+ * and commercial endeavors, without any requirement for compensation or
+ * attribution to the uploader. The uploader represents and warrants that they
+ * have the legal right to grant this license and that the mod does not infringe
+ * upon any third-party rights. German law applies.
  */
 (function () {
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.0";
+  const SCRIPT_VERSION = "v1.0.1";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
   const DATA_VERSION = 1;
 
   const DEFAULT_SETTINGS = {
+    resourceMode: "exact",
     reserveMerchants: 0,
     reserveWarehousePercent: 5,
     maxDistance: 50,
-    overflowProtection: true,
-    merchantCapacity: 1000
+    overflowProtection: true
   };
 
   const DEFAULT_TAB = {
@@ -79,11 +100,8 @@
     wood: 120000,
     clay: 150000,
     iron: 150000,
-    resourceMode: "exact",
-    originSource: "coords",
     originCoords: "",
     originGroupId: "",
-    targetSource: "coords",
     targetCoords: "",
     targetGroupId: ""
   };
@@ -285,35 +303,42 @@
     const localData = getLocalSavedData();
 
     // TribalWars.scriptData is the official imported configuration. Local storage is a convenience for UI saves.
-    return normalizeUserData(Object.assign({}, defaults, localData || {}, scriptData || {}));
+    const merged = Object.assign({}, defaults, localData || {}, scriptData || {});
+
+    // Backward compatibility with early versions where resourceMode was stored per tab.
+    if ((!merged.settings || !merged.settings.resourceMode) && merged.tabs && merged.tabs[0] && merged.tabs[0].resourceMode) {
+      merged.settings = Object.assign({}, merged.settings || {}, { resourceMode: merged.tabs[0].resourceMode });
+    }
+
+    return normalizeUserData(merged);
   }
 
   function normalizeSettings(input) {
     const source = Object.assign({}, DEFAULT_SETTINGS, input || {});
-    const merchantCapacity = parseNumber(
-      source.merchantCapacity,
-      getDetectedMerchantCapacity()
-    );
 
     return {
+      resourceMode: source.resourceMode === "fill" ? "fill" : "exact",
       reserveMerchants: Math.max(0, parseNumber(source.reserveMerchants, DEFAULT_SETTINGS.reserveMerchants)),
       reserveWarehousePercent: clampNumber(source.reserveWarehousePercent, 0, 100, DEFAULT_SETTINGS.reserveWarehousePercent),
       maxDistance: clampNumber(source.maxDistance, 0, 1000, DEFAULT_SETTINGS.maxDistance),
-      overflowProtection: source.overflowProtection !== false,
-      merchantCapacity: Math.max(1, merchantCapacity || DEFAULT_SETTINGS.merchantCapacity)
+      overflowProtection: source.overflowProtection !== false
     };
   }
 
   function getDetectedMerchantCapacity() {
     if (typeof game_data !== "undefined") {
       if (game_data.market && game_data.market.merchant_capacity) {
-        return parseNumber(game_data.market.merchant_capacity, DEFAULT_SETTINGS.merchantCapacity);
+        return parseNumber(game_data.market.merchant_capacity, 1000);
       }
       if (game_data.world_config && game_data.world_config.merchant_capacity) {
-        return parseNumber(game_data.world_config.merchant_capacity, DEFAULT_SETTINGS.merchantCapacity);
+        return parseNumber(game_data.world_config.merchant_capacity, 1000);
       }
     }
-    return DEFAULT_SETTINGS.merchantCapacity;
+    return 1000;
+  }
+
+  function getMerchantCapacity() {
+    return Math.max(1, getDetectedMerchantCapacity());
   }
 
   function normalizeTab(input, index) {
@@ -324,11 +349,8 @@
       wood: Math.max(0, parseNumber(source.wood, DEFAULT_TAB.wood)),
       clay: Math.max(0, parseNumber(source.clay, DEFAULT_TAB.clay)),
       iron: Math.max(0, parseNumber(source.iron, DEFAULT_TAB.iron)),
-      resourceMode: source.resourceMode === "fill" ? "fill" : "exact",
-      originSource: source.originSource === "group" ? "group" : "coords",
       originCoords: cleanText(source.originCoords),
       originGroupId: cleanText(source.originGroupId),
-      targetSource: source.targetSource === "group" ? "group" : "coords",
       targetCoords: cleanText(source.targetCoords),
       targetGroupId: cleanText(source.targetGroupId)
     };
@@ -596,18 +618,50 @@
   }
 
   async function resolveTabCoords(tab) {
-    const originCoords = tab.originSource === "group"
-      ? await getCoordsFromGroup(tab.originGroupId)
-      : parseCoordList(tab.originCoords);
-
-    const targetCoords = tab.targetSource === "group"
-      ? await getCoordsFromGroup(tab.targetGroupId)
-      : parseCoordList(tab.targetCoords);
-
     return {
-      origins: originCoords,
-      targets: targetCoords
+      origins: parseCoordList(tab.originCoords),
+      targets: parseCoordList(tab.targetCoords)
     };
+  }
+
+  async function fillCoordsFromSelectedGroup(kind) {
+    const tab = getActiveTab();
+    if (!tab || !ui.activePanel) return;
+
+    const isOrigin = kind === "origin";
+    const select = ui.activePanel.querySelector(isOrigin ? ".twrr-origin-group" : ".twrr-target-group");
+    const textarea = ui.activePanel.querySelector(isOrigin ? ".twrr-origin-coords" : ".twrr-target-coords");
+    const groupId = cleanText(select && select.value);
+
+    if (isOrigin) {
+      tab.originGroupId = groupId;
+    } else {
+      tab.targetGroupId = groupId;
+    }
+
+    if (!groupId) {
+      saveUiState({ persist: true });
+      return;
+    }
+
+    try {
+      setStatus("Loading " + (isOrigin ? "origin" : "target") + " group coordinates...", "warn");
+      const coords = await getCoordsFromGroup(groupId);
+      const coordText = coords.join(" ");
+      if (textarea) textarea.value = coordText;
+
+      if (isOrigin) {
+        tab.originCoords = coordText;
+      } else {
+        tab.targetCoords = coordText;
+      }
+
+      saveUiState({ persist: true });
+      setStatus("Loaded " + coords.length + " coordinate(s) from selected group.", "success");
+    } catch (err) {
+      console.error(SCRIPT_NAME + " could not load group coordinates:", err);
+      setStatus(err.message || String(err), "error");
+    }
   }
 
   function getIncomingForCoord(coord) {
@@ -627,7 +681,7 @@
 
     let need;
 
-    if (tab.resourceMode === "fill") {
+    if (state.settings.resourceMode === "fill") {
       need = {
         wood: Math.max(0, base.wood - ((target && target.wood) || 0) - incoming.wood - alreadyPlanned.wood),
         clay: Math.max(0, base.clay - ((target && target.clay) || 0) - incoming.clay - alreadyPlanned.clay),
@@ -662,7 +716,7 @@
         wood: Math.max(0, origin.wood - reserveAmount),
         clay: Math.max(0, origin.clay - reserveAmount),
         iron: Math.max(0, origin.iron - reserveAmount),
-        merchantCapacityLeft: merchantsAvailable * state.settings.merchantCapacity
+        merchantCapacityLeft: merchantsAvailable * getMerchantCapacity()
       });
     }
 
@@ -838,21 +892,24 @@
     return state.tabs[state.activeTabIndex];
   }
 
-  function saveUiState() {
+  function saveUiState(options) {
+    const shouldPersist = !options || options.persist !== false;
     readSettingsFromUi();
     readActiveTabFromUi();
-    persistUserData();
+    if (shouldPersist) {
+      persistUserData();
+    }
   }
 
   function readSettingsFromUi() {
     if (!ui.settingsPanel) return;
 
     state.settings = normalizeSettings({
+      resourceMode: ui.resourceModeInput ? ui.resourceModeInput.value : state.settings.resourceMode,
       reserveMerchants: ui.reserveMerchantsInput && ui.reserveMerchantsInput.value,
       reserveWarehousePercent: ui.reserveWarehouseInput && ui.reserveWarehouseInput.value,
       maxDistance: ui.maxDistanceInput && ui.maxDistanceInput.value,
-      overflowProtection: ui.overflowProtectionInput ? ui.overflowProtectionInput.value === "true" : state.settings.overflowProtection,
-      merchantCapacity: ui.merchantCapacityInput && ui.merchantCapacityInput.value
+      overflowProtection: ui.overflowProtectionInput ? ui.overflowProtectionInput.value === "true" : state.settings.overflowProtection
     });
   }
 
@@ -860,26 +917,63 @@
     const tab = getActiveTab();
     if (!ui.activePanel || !tab) return;
 
-    tab.name = cleanText(ui.activePanel.querySelector(".twrr-tab-name").value) || tab.name;
     tab.wood = parseNumber(ui.activePanel.querySelector(".twrr-wood").value, tab.wood);
     tab.clay = parseNumber(ui.activePanel.querySelector(".twrr-clay").value, tab.clay);
     tab.iron = parseNumber(ui.activePanel.querySelector(".twrr-iron").value, tab.iron);
-    tab.resourceMode = ui.activePanel.querySelector(".twrr-resource-mode").value === "fill" ? "fill" : "exact";
-    tab.originSource = ui.activePanel.querySelector(".twrr-origin-source").value === "group" ? "group" : "coords";
     tab.originCoords = cleanText(ui.activePanel.querySelector(".twrr-origin-coords").value);
     tab.originGroupId = cleanText(ui.activePanel.querySelector(".twrr-origin-group").value);
-    tab.targetSource = ui.activePanel.querySelector(".twrr-target-source").value === "group" ? "group" : "coords";
     tab.targetCoords = cleanText(ui.activePanel.querySelector(".twrr-target-coords").value);
     tab.targetGroupId = cleanText(ui.activePanel.querySelector(".twrr-target-group").value);
   }
 
   function syncSettingsToUi() {
     if (!ui.settingsPanel) return;
+    ui.resourceModeInput.value = state.settings.resourceMode;
     ui.reserveMerchantsInput.value = state.settings.reserveMerchants;
     ui.reserveWarehouseInput.value = state.settings.reserveWarehousePercent;
     ui.maxDistanceInput.value = state.settings.maxDistance;
     ui.overflowProtectionInput.value = state.settings.overflowProtection ? "true" : "false";
-    ui.merchantCapacityInput.value = state.settings.merchantCapacity;
+  }
+
+  function getActiveTabDisplayName(index) {
+    const tab = state.tabs[index];
+    return tab && cleanText(tab.name) || ("Tab " + (index + 1));
+  }
+
+  function renameTab(index) {
+    if (!state.tabs[index]) return;
+    const current = getActiveTabDisplayName(index);
+    const value = window.prompt("Rename tab", current);
+    if (value === null) return;
+
+    const nextName = cleanText(value);
+    if (!nextName) return;
+
+    state.tabs[index].name = nextName;
+    persistUserData();
+    renderTabs();
+  }
+
+  function removeTab(index) {
+    if (state.tabs.length <= 1) {
+      setStatus("At least one tab is required.", "error");
+      return;
+    }
+
+    if (!window.confirm("Remove this tab?")) return;
+
+    state.tabs.splice(index, 1);
+    state.activeTabIndex = Math.max(0, Math.min(state.activeTabIndex, state.tabs.length - 1));
+    persistUserData();
+    renderTabs();
+    renderActivePanel();
+  }
+
+  async function calculateAndSaveActiveTab() {
+    saveUiState({ persist: true });
+    renderTabs();
+    setStatus("Tab saved to runtime user data and local browser fallback. Calculating requests...", "success");
+    await calculateActiveTab({ persist: false });
   }
 
   function addStyles() {
@@ -927,15 +1021,37 @@
       .twrr-body { padding: 10px; }
       .twrr-help { margin: 0 0 8px; line-height: 1.35; }
       .twrr-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
-      .twrr-tab-button {
-        padding: 5px 8px;
+      .twrr-tab-wrap {
+        display: inline-flex;
+        align-items: center;
         border: 1px solid #7d510f;
         background: #fff4d5;
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .twrr-tab-wrap.twrr-active { background: #c1a264; font-weight: bold; }
+      .twrr-tab-main,
+      .twrr-tab-icon,
+      .twrr-tab-add {
+        border: 0;
+        background: transparent;
         color: #2f1b00;
         cursor: pointer;
-        border-radius: 3px;
+        min-height: 28px;
       }
-      .twrr-tab-button.twrr-active { background: #c1a264; font-weight: bold; }
+      .twrr-tab-main { padding: 5px 8px; }
+      .twrr-tab-icon { width: 25px; border-left: 1px solid #bd9c5a; }
+      .twrr-tab-remove { color: #8f342b; }
+      .twrr-tab-add {
+        padding: 5px 10px;
+        border: 1px solid #7d510f;
+        background: #fff4d5;
+        border-radius: 3px;
+        font-weight: bold;
+      }
+      .twrr-tab-main:hover,
+      .twrr-tab-icon:hover,
+      .twrr-tab-add:hover { background: #f4e4bc; }
       .twrr-panel, .twrr-settings-panel {
         margin: 8px 0;
         padding: 8px;
@@ -961,7 +1077,22 @@
         color: #2f1b00;
       }
       .twrr-field textarea { min-height: 88px; resize: vertical; font-family: monospace; }
-      .twrr-resource-grid { grid-template-columns: repeat(4, minmax(140px, 1fr)); }
+      .twrr-resource-grid { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
+      .twrr-coords-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
+      .twrr-under-textarea { margin-top: 6px; }
+      .twrr-tooltip {
+        display: inline-block;
+        margin-left: 4px;
+        width: 15px;
+        height: 15px;
+        line-height: 15px;
+        text-align: center;
+        border-radius: 50%;
+        border: 1px solid #7d510f;
+        background: #f4e4bc;
+        cursor: help;
+      }
+      .twrr-save-disclaimer { margin-top: 4px; line-height: 1.35; }
       .twrr-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
       .twrr-button {
         padding: 5px 9px;
@@ -1063,33 +1194,36 @@
     panel.className = "twrr-settings-panel";
     panel.innerHTML =
       "<div class='twrr-grid'>" +
+        "<div class='twrr-field'><label>Resource mode</label><select class='twrr-resource-mode'>" +
+          "<option value='exact'>Request exact amount</option>" +
+          "<option value='fill'>Fill to amount incl. current/incoming</option>" +
+        "</select></div>" +
         "<div class='twrr-field'><label>Reserve merchants</label><input class='twrr-reserve-merchants' type='number' min='0' step='1'></div>" +
         "<div class='twrr-field'><label>Reserve warehouse (%)</label><input class='twrr-reserve-warehouse' type='number' min='0' max='100' step='0.25'></div>" +
         "<div class='twrr-field'><label>Max distance</label><input class='twrr-max-distance' type='number' min='0' step='0.1'></div>" +
-        "<div class='twrr-field'><label>Merchant capacity</label><input class='twrr-merchant-capacity' type='number' min='1' step='1'></div>" +
-        "<div class='twrr-field'><label>Overflow protection</label><select class='twrr-overflow-protection'><option value='true'>Enabled</option><option value='false'>Disabled</option></select></div>" +
+        "<div class='twrr-field'><label>Overflow protection <span class='twrr-tooltip' title='When enabled, the plan will not request resources that would push a target village above 95% warehouse capacity after current resources, incoming transports and planned requests.'>?</span></label><select class='twrr-overflow-protection'><option value='true'>Enabled</option><option value='false'>Disabled</option></select></div>" +
       "</div>" +
       "<div class='twrr-actions'>" +
         "<button type='button' class='twrr-button twrr-save-settings'>Save settings</button>" +
         "<button type='button' class='twrr-button twrr-button-secondary twrr-export-json'>Export user data JSON</button>" +
       "</div>" +
-      "<div class='twrr-muted'>The script reads TribalWars.scriptData on startup. The in-script Save button also saves locally in this browser and updates TribalWars.scriptData for the current run.</div>" +
+      "<div class='twrr-muted'>The script reads TribalWars.scriptData on startup. Save updates TribalWars.scriptData for the current run and stores a local browser fallback. For Script Library persistence, copy the exported JSON into the script user-data field.</div>" +
       "<textarea class='twrr-export' readonly></textarea>";
 
+    ui.resourceModeInput = panel.querySelector(".twrr-resource-mode");
     ui.reserveMerchantsInput = panel.querySelector(".twrr-reserve-merchants");
     ui.reserveWarehouseInput = panel.querySelector(".twrr-reserve-warehouse");
     ui.maxDistanceInput = panel.querySelector(".twrr-max-distance");
-    ui.merchantCapacityInput = panel.querySelector(".twrr-merchant-capacity");
     ui.overflowProtectionInput = panel.querySelector(".twrr-overflow-protection");
     ui.exportTextarea = panel.querySelector(".twrr-export");
 
     panel.querySelector(".twrr-save-settings").addEventListener("click", function () {
-      saveUiState();
+      saveUiState({ persist: true });
       setStatus("Settings saved. Recalculate the active tab when ready.", "success");
     });
 
     panel.querySelector(".twrr-export-json").addEventListener("click", function () {
-      saveUiState();
+      saveUiState({ persist: true });
       ui.exportTextarea.value = exportUserData();
       ui.exportTextarea.classList.toggle("twrr-open");
       ui.exportTextarea.focus();
@@ -1105,26 +1239,53 @@
     ui.tabs.innerHTML = "";
 
     state.tabs.forEach((tab, index) => {
+      const wrap = document.createElement("div");
+      wrap.className = "twrr-tab-wrap" + (index === state.activeTabIndex ? " twrr-active" : "");
+
       const button = document.createElement("button");
       button.type = "button";
-      button.className = "twrr-tab-button" + (index === state.activeTabIndex ? " twrr-active" : "");
+      button.className = "twrr-tab-main";
       button.textContent = tab.name || ("Tab " + (index + 1));
       button.addEventListener("click", function () {
-        saveUiState();
+        saveUiState({ persist: true });
         state.activeTabIndex = index;
         renderTabs();
         renderActivePanel();
       });
-      ui.tabs.appendChild(button);
+
+      const renameButton = document.createElement("button");
+      renameButton.type = "button";
+      renameButton.className = "twrr-tab-icon";
+      renameButton.title = "Rename tab";
+      renameButton.textContent = "✎";
+      renameButton.addEventListener("click", function (event) {
+        event.stopPropagation();
+        renameTab(index);
+      });
+
+      const removeButton = document.createElement("button");
+      removeButton.type = "button";
+      removeButton.className = "twrr-tab-icon twrr-tab-remove";
+      removeButton.title = "Remove tab";
+      removeButton.textContent = "🗑";
+      removeButton.addEventListener("click", function (event) {
+        event.stopPropagation();
+        removeTab(index);
+      });
+
+      wrap.appendChild(button);
+      wrap.appendChild(renameButton);
+      wrap.appendChild(removeButton);
+      ui.tabs.appendChild(wrap);
     });
 
     const addButton = document.createElement("button");
     addButton.type = "button";
-    addButton.className = "twrr-tab-button";
+    addButton.className = "twrr-tab-add";
     addButton.textContent = "+";
     addButton.title = "Add tab";
     addButton.addEventListener("click", function () {
-      saveUiState();
+      saveUiState({ persist: true });
       state.tabs.push(normalizeTab(Object.assign({}, DEFAULT_TAB, { name: "Tab " + (state.tabs.length + 1) }), state.tabs.length));
       state.activeTabIndex = state.tabs.length - 1;
       persistUserData();
@@ -1142,68 +1303,41 @@
     panel.className = "twrr-panel";
     panel.innerHTML =
       "<div class='twrr-grid twrr-resource-grid'>" +
-        "<div class='twrr-field'><label>Tab name</label><input class='twrr-tab-name' type='text' value='" + escapeHtml(tab.name) + "'></div>" +
         "<div class='twrr-field'><label><span class='icon header wood'></span> Wood</label><input class='twrr-wood' type='number' min='0' step='100' value='" + escapeHtml(tab.wood) + "'></div>" +
         "<div class='twrr-field'><label><span class='icon header stone'></span> Clay</label><input class='twrr-clay' type='number' min='0' step='100' value='" + escapeHtml(tab.clay) + "'></div>" +
         "<div class='twrr-field'><label><span class='icon header iron'></span> Iron</label><input class='twrr-iron' type='number' min='0' step='100' value='" + escapeHtml(tab.iron) + "'></div>" +
       "</div>" +
-      "<div class='twrr-grid'>" +
-        "<div class='twrr-field'><label>Resource mode</label><select class='twrr-resource-mode'>" +
-          "<option value='exact'" + (tab.resourceMode === "exact" ? " selected" : "") + ">Request exact amount</option>" +
-          "<option value='fill'" + (tab.resourceMode === "fill" ? " selected" : "") + ">Fill to amount incl. current/incoming</option>" +
-        "</select></div>" +
-        "<div class='twrr-field'><label>Origin source</label><select class='twrr-origin-source'>" +
-          "<option value='coords'" + (tab.originSource === "coords" ? " selected" : "") + ">Pasted coords</option>" +
-          "<option value='group'" + (tab.originSource === "group" ? " selected" : "") + ">Village group</option>" +
-        "</select></div>" +
-        "<div class='twrr-field'><label>Origin group</label><select class='twrr-origin-group'>" + createGroupOptions(tab.originGroupId) + "</select></div>" +
-        "<div class='twrr-field'><label>Target source</label><select class='twrr-target-source'>" +
-          "<option value='coords'" + (tab.targetSource === "coords" ? " selected" : "") + ">Pasted coords</option>" +
-          "<option value='group'" + (tab.targetSource === "group" ? " selected" : "") + ">Village group</option>" +
-        "</select></div>" +
-        "<div class='twrr-field'><label>Target group</label><select class='twrr-target-group'>" + createGroupOptions(tab.targetGroupId) + "</select></div>" +
-      "</div>" +
-      "<div class='twrr-grid'>" +
-        "<div class='twrr-field'><label>Origin coords</label><textarea class='twrr-origin-coords'>" + escapeHtml(tab.originCoords) + "</textarea></div>" +
-        "<div class='twrr-field'><label>Target coords</label><textarea class='twrr-target-coords'>" + escapeHtml(tab.targetCoords) + "</textarea></div>" +
+      "<div class='twrr-grid twrr-coords-grid'>" +
+        "<div class='twrr-field'><label>Origin coords</label><textarea class='twrr-origin-coords'>" + escapeHtml(tab.originCoords) + "</textarea><select class='twrr-origin-group twrr-under-textarea'>" + createGroupOptions(tab.originGroupId) + "</select></div>" +
+        "<div class='twrr-field'><label>Target coords</label><textarea class='twrr-target-coords'>" + escapeHtml(tab.targetCoords) + "</textarea><select class='twrr-target-group twrr-under-textarea'>" + createGroupOptions(tab.targetGroupId) + "</select></div>" +
       "</div>" +
       "<div class='twrr-actions'>" +
-        "<button type='button' class='twrr-button twrr-calculate'>Calculate requests</button>" +
-        "<button type='button' class='twrr-button twrr-button-secondary twrr-save-tab'>Save tab</button>" +
-        "<button type='button' class='twrr-button twrr-button-danger twrr-remove-tab'>Remove tab</button>" +
-      "</div>";
+        "<button type='button' class='twrr-button twrr-save-calculate'>Calculate & Save tab</button>" +
+        "<button type='button' class='twrr-button twrr-button-secondary twrr-calculate'>Calculate</button>" +
+      "</div>" +
+      "<div class='twrr-muted twrr-save-disclaimer'>Calculate & Save tab stores this tab's resources, coordinates and selected groups in the script data object for the current run and in the local browser fallback. To persist through the Script Library user-data feature, export/copy the JSON into the script user-data field.</div>";
 
     ui.panelWrap.appendChild(panel);
     ui.activePanel = panel;
 
-    panel.querySelector(".twrr-calculate").addEventListener("click", calculateActiveTab);
-    panel.querySelector(".twrr-save-tab").addEventListener("click", function () {
-      saveUiState();
-      renderTabs();
-      setStatus("Tab saved locally and applied to runtime user data.", "success");
-    });
-    panel.querySelector(".twrr-remove-tab").addEventListener("click", function () {
-      if (state.tabs.length <= 1) {
-        setStatus("At least one tab is required.", "error");
-        return;
-      }
-      if (!window.confirm("Remove this tab?")) return;
-      state.tabs.splice(state.activeTabIndex, 1);
-      state.activeTabIndex = Math.max(0, state.activeTabIndex - 1);
-      persistUserData();
-      renderTabs();
-      renderActivePanel();
+    panel.querySelector(".twrr-save-calculate").addEventListener("click", calculateAndSaveActiveTab);
+    panel.querySelector(".twrr-calculate").addEventListener("click", function () {
+      calculateActiveTab({ persist: false });
     });
 
-    panel.querySelectorAll("input, textarea, select").forEach(input => {
+    panel.querySelector(".twrr-origin-group").addEventListener("change", function () {
+      fillCoordsFromSelectedGroup("origin");
+    });
+    panel.querySelector(".twrr-target-group").addEventListener("change", function () {
+      fillCoordsFromSelectedGroup("target");
+    });
+
+    panel.querySelectorAll("input, textarea").forEach(input => {
       input.addEventListener("change", function () {
-        readActiveTabFromUi();
-        persistUserData();
-        renderTabs();
+        saveUiState({ persist: false });
       });
       input.addEventListener("input", function () {
-        readActiveTabFromUi();
-        persistUserData();
+        saveUiState({ persist: false });
       });
     });
   }
@@ -1318,9 +1452,10 @@
     }
   }
 
-  async function calculateActiveTab() {
+  async function calculateActiveTab(options) {
     try {
-      saveUiState();
+      const shouldPersist = !options || options.persist !== false;
+      saveUiState({ persist: shouldPersist });
       const tab = getActiveTab();
       setStatus("Resolving origin and target coordinates...", "warn");
       const coords = await resolveTabCoords(tab);
@@ -1361,7 +1496,7 @@
     const summary = document.createElement("div");
     summary.className = "twrr-summary";
     summary.innerHTML =
-      "<strong>Mode:</strong> " + (tab.resourceMode === "fill" ? "Fill to amount including current/incoming" : "Request exact amount") + " · " +
+      "<strong>Mode:</strong> " + (state.settings.resourceMode === "fill" ? "Fill to amount including current/incoming" : "Request exact amount") + " · " +
       "<strong>Origins:</strong> " + coords.origins.length + " · " +
       "<strong>Targets:</strong> " + coords.targets.length + " · " +
       "<strong>Max distance:</strong> " + state.settings.maxDistance + " · " +
