@@ -81,7 +81,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.3";
+  const SCRIPT_VERSION = "v1.0.4";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
@@ -495,6 +495,17 @@
     const merchants = parseMerchants(row);
     const warehouse = parseWarehouse(row);
 
+    if (warehouse && (wood > warehouse * 2 || clay > warehouse * 2 || iron > warehouse * 2)) {
+      console.warn(SCRIPT_NAME + " production parse looks suspicious", {
+        coord: coord,
+        wood: wood,
+        clay: clay,
+        iron: iron,
+        warehouse: warehouse,
+        rowText: cleanText(row.textContent).slice(0, 500)
+      });
+    }
+
     return {
       coord: coord,
       id: villageId,
@@ -508,11 +519,87 @@
     };
   }
 
+  function parseFirstNumber(value, fallback) {
+    const match = String(value === undefined || value === null ? "" : value).match(/-?\d[\d.,]*/);
+    if (!match) return fallback || 0;
+    return parseNumber(match[0], fallback || 0);
+  }
+
+  function hasAnyClass(element, classNames) {
+    if (!element || !element.classList) return false;
+    return classNames.some(className => element.classList.contains(className));
+  }
+
+  const RESOURCE_MARKER_CLASSES = ["wood", "stone", "clay", "iron"];
+
+  function getResourceMarkersInCell(cell) {
+    if (!cell || !cell.querySelectorAll) return [];
+    return Array.from(cell.querySelectorAll(".wood, .stone, .clay, .iron"))
+      .filter(element => hasAnyClass(element, RESOURCE_MARKER_CLASSES));
+  }
+
+  function getTextBetweenElements(container, startElement, endElement) {
+    try {
+      const doc = container.ownerDocument || document;
+      const range = doc.createRange();
+      range.setStartAfter(startElement);
+
+      if (endElement) {
+        range.setEndBefore(endElement);
+      } else {
+        range.setEnd(container, container.childNodes.length);
+      }
+
+      return cleanText(range.toString());
+    } catch (err) {
+      return "";
+    }
+  }
+
   function parseResourceFromRow(row, resourceClass) {
-    const el = row.querySelector("." + resourceClass);
-    if (!el) return 0;
-    const cell = el.closest("td") || el;
-    return parseNumber(cell.textContent, 0);
+    const markers = Array.from(row.querySelectorAll("." + resourceClass));
+
+    for (let i = 0; i < markers.length; i++) {
+      const marker = markers[i];
+      const markerText = cleanText(marker.textContent);
+      const markerDirectValue = parseFirstNumber(markerText, 0);
+
+      if (markerDirectValue > 0 && markerText.replace(/[\d.,\s-]/g, "") === "") {
+        return markerDirectValue;
+      }
+
+      const cell = marker.closest("td") || marker.parentElement;
+      if (!cell) continue;
+
+      if (cell !== marker) {
+        const resourceMarkers = getResourceMarkersInCell(cell);
+        const index = resourceMarkers.indexOf(marker);
+
+        if (index >= 0) {
+          const nextMarker = resourceMarkers[index + 1] || null;
+          const segmentText = getTextBetweenElements(cell, marker, nextMarker);
+          const segmentValue = parseFirstNumber(segmentText, 0);
+
+          if (segmentValue > 0) {
+            return segmentValue;
+          }
+
+          const cellNumbers = cleanText(cell.textContent).match(/-?\d[\d.,]*/g) || [];
+          if (cellNumbers[index]) {
+            return parseNumber(cellNumbers[index], 0);
+          }
+        }
+      }
+
+      const cellText = cleanText(cell.textContent);
+      const cellNumbers = cellText.match(/-?\d[\d.,]*/g) || [];
+
+      if (cellNumbers.length === 1 && !/\d{1,3}\|\d{1,3}/.test(cellText)) {
+        return parseNumber(cellNumbers[0], 0);
+      }
+    }
+
+    return 0;
   }
 
   function parseMerchants(row) {
@@ -537,9 +624,16 @@
     cells.forEach(cell => {
       const text = cleanText(cell.textContent);
       if (!text) return;
+      if (/\d{1,3}\|\d{1,3}/.test(text)) return;
+      if (cell.querySelector(".quickedit-vn, .quickedit-label")) return;
       if (cell.querySelector(".wood, .stone, .clay, .iron")) return;
       if (/\d+\s*\/\s*\d+/.test(text)) return;
-      const value = parseNumber(text, 0);
+      if ((cell.querySelector("a[href*='market']") || "") && /\d/.test(text)) return;
+
+      const numbers = text.match(/\d[\d.,]*/g) || [];
+      if (numbers.length !== 1) return;
+
+      const value = parseNumber(numbers[0], 0);
       if (value >= 1000) candidates.push(value);
     });
 
