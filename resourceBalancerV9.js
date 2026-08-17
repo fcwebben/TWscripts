@@ -46,7 +46,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.3";
+  const SCRIPT_VERSION = "1.7.4";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
 
@@ -1818,22 +1818,34 @@
     const csrf = getCsrfToken();
     if (csrf) options.h = csrf;
 
+    const debugPayload = Object.assign({}, data);
+
     console.log(SCRIPT_NAME + " grouped request", {
       target: targetPlan.target.coord,
       targetId: targetPlan.target.id,
       origins: targetPlan.launches.map(launch => ({
         coord: launch.origin.coord,
         id: launch.origin.id,
-        resources: launch.resources,
+        resources: Object.assign({}, launch.resources),
         merchantsUsed: launch.merchantsUsed
       })),
       total: targetPlan.total,
       merchantsUsed: targetPlan.merchantsUsed,
-      data: data
+      payload: debugPayload,
+      payloadOriginCount: targetPlan.launches.length,
+      payloadResourceKeys: Object.keys(debugPayload).length
     });
 
     try {
       const response = await postMarketAction(options, data);
+
+      console.log(SCRIPT_NAME + " grouped request response", {
+        target: targetPlan.target.coord,
+        targetId: targetPlan.target.id,
+        success: !responseHasError(response),
+        message: getResponseMessage(response, "Resources requested."),
+        response: response
+      });
 
       if (typeof UI !== "undefined" && UI.SuccessMessage) {
         UI.SuccessMessage(getResponseMessage(response, "Resources requested."), 1500);
