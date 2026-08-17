@@ -14,6 +14,7 @@
  * - Reads incoming resource transports from Overview -> Transports -> Incoming
  * - Reads static village groups from Overview -> Groups
  * - Builds a manual request plan based on the player's exact resource inputs per target
+ * - Reserves origin resources and merchant capacity across the whole calculated plan
  * - Can optionally cap planned requests with overflow protection using current resources and incoming transports
  * - Uses TribalWars.scriptData as supported user-data input when enabled in the Script Library
  * - Saves in-UI changes locally in the browser as a convenience fallback
@@ -77,7 +78,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.5";
+  const SCRIPT_VERSION = "v1.0.0";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
@@ -831,6 +832,28 @@
     return Math.max(0, Math.round((amounts && amounts.wood || 0) + (amounts && amounts.clay || 0) + (amounts && amounts.iron || 0)));
   }
 
+  function getUsableMerchantCapacity(capacityLeft) {
+    const merchantCapacity = getMerchantCapacity();
+    return Math.floor(Math.max(0, Number(capacityLeft || 0)) / merchantCapacity) * merchantCapacity;
+  }
+
+  function getMerchantCapacityCost(amounts) {
+    const total = totalAmounts(amounts);
+    if (total <= 0) return 0;
+
+    const merchantCapacity = getMerchantCapacity();
+    return Math.ceil(total / merchantCapacity) * merchantCapacity;
+  }
+
+  function reserveOriginForSend(origin, send) {
+    const merchantCost = getMerchantCapacityCost(send);
+
+    subtractAmounts(origin, send);
+    origin.merchantCapacityLeft = Math.max(0, origin.merchantCapacityLeft - merchantCost);
+
+    return merchantCost;
+  }
+
   function buildRequestPlan(tab, coords) {
     const originCoords = coords.origins.filter(coord => state.production.has(coord));
     const targetCoords = coords.targets.filter(coord => state.production.has(coord));
@@ -858,7 +881,8 @@
         if (totalAmounts(need) <= 0) return;
 
         const origin = getOriginAvailability(originItem.coord, originState);
-        if (!origin || origin.merchantCapacityLeft <= 0) return;
+        const usableMerchantCapacity = origin ? getUsableMerchantCapacity(origin.merchantCapacityLeft) : 0;
+        if (!origin || usableMerchantCapacity <= 0) return;
 
         let send = {
           wood: Math.min(need.wood, origin.wood),
@@ -866,13 +890,15 @@
           iron: Math.min(need.iron, origin.iron)
         };
 
-        send = scaleAmountsToCapacity(send, origin.merchantCapacityLeft);
+        send = scaleAmountsToCapacity(send, usableMerchantCapacity);
 
         if (totalAmounts(send) <= 0) return;
 
+        const merchantCost = getMerchantCapacityCost(send);
+        if (merchantCost > usableMerchantCapacity) return;
+
         subtractAmounts(need, send);
-        subtractAmounts(origin, send);
-        origin.merchantCapacityLeft -= totalAmounts(send);
+        reserveOriginForSend(origin, send);
 
         requests.push({
           originCoord: origin.coord,
@@ -882,7 +908,9 @@
           wood: send.wood,
           clay: send.clay,
           iron: send.iron,
-          total: totalAmounts(send)
+          total: totalAmounts(send),
+          merchantCost: merchantCost,
+          merchantSlots: Math.ceil(merchantCost / getMerchantCapacity())
         });
       });
 
