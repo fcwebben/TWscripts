@@ -12,8 +12,11 @@
  * - Reads building overview data
  * - Reads Account Manager construction template data when AM construction mode is selected
  * - Reads incoming transport data
+ * - Counts incoming resources for target need calculations
+ * - Uses current origin resources only when planning requestable origin availability
  * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
  * - Allows one grouped manual request action per target row
+ * - Tries to balance wood, clay and iron arrival timing within configurable time windows
  *
  * This script does NOT:
  * - Send attacks, support, or troops
@@ -46,7 +49,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.4";
+  const SCRIPT_VERSION = "1.7.5";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
 
@@ -72,7 +75,9 @@
     idleDonorBonus: 35,
     deadVillageDonorBonus: 150,
     scoreDistanceTieThreshold: 18,
-    donorAuditLimit: 20
+    donorAuditLimit: 20,
+    arrivalBalanceWindowMinutes: 30,
+    baseMerchantMinutesPerField: 18
   };
 
   const BUILDING_NAMES = {
@@ -1023,6 +1028,7 @@
     const reserveMerchants = Math.max(0, parseInt(ui.reserveMerchants.value, 10) || DEFAULTS.reserveMerchants);
     const maxDistance = Math.max(0, parseFloatSafe(ui.maxDistance.value, DEFAULTS.maxDistance));
     const reserveWarehousePercent = Math.max(0, Math.min(80, parseFloatSafe(ui.reserveWarehousePercent.value, DEFAULTS.reserveWarehousePercent)));
+    const arrivalBalanceWindowMinutes = Math.max(1, Math.min(180, parseFloatSafe(ui.arrivalBalanceWindowMinutes.value, DEFAULTS.arrivalBalanceWindowMinutes)));
     const prioritizeLowPoints = ui.prioritizeLowPoints.checked;
 
     return {
@@ -1036,6 +1042,8 @@
       merchantCapacity: DEFAULTS.merchantCapacity,
       minShipment: DEFAULTS.minShipment,
       maxDistance: maxDistance,
+      arrivalBalanceWindowMinutes: arrivalBalanceWindowMinutes,
+      merchantMinutesPerField: getMerchantMinutesPerField(),
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
@@ -1113,7 +1121,7 @@
     const targets = buildTargets(villages, stats, settings);
     const donors = buildDonors(villages, stats, settings);
     const launches = matchDonorsToTargets(targets, donors, settings);
-    const targetPlans = groupLaunchesByTarget(launches);
+    const targetPlans = groupLaunchesByTarget(launches, settings);
     const donorAudit = buildDonorAudit(donors, targets, launches, settings);
 
     return {
@@ -1237,6 +1245,8 @@
       return {
         village: village,
         need: need,
+        initialNeed: cloneResources(need),
+        arrivalBuckets: new Map(),
         constructionNeed: constructionNeed,
         warehouseTarget: warehouseTarget,
         totalNeed: totalNeed,
@@ -1284,14 +1294,140 @@
     return reasons.join(", ");
   }
 
+  function getCurrentResourcesOnly(village) {
+    return {
+      wood: village.wood || 0,
+      stone: village.stone || 0,
+      iron: village.iron || 0
+    };
+  }
+
   function getCurrentResourcesWithIncoming(village) {
     const incoming = village.incoming || emptyResources();
 
     return {
-      wood: village.wood + incoming.wood,
-      stone: village.stone + incoming.stone,
-      iron: village.iron + incoming.iron
+      wood: (village.wood || 0) + incoming.wood,
+      stone: (village.stone || 0) + incoming.stone,
+      iron: (village.iron || 0) + incoming.iron
     };
+  }
+
+  function getDetectedWorldSpeedFactor() {
+    const candidates = [];
+
+    if (typeof game_data !== "undefined") {
+      if (game_data.speed) candidates.push(game_data.speed);
+      if (game_data.unit_speed) candidates.push(game_data.unit_speed);
+      if (game_data.world_config && game_data.world_config.speed) candidates.push(game_data.world_config.speed);
+      if (game_data.world_config && game_data.world_config.unit_speed) candidates.push(game_data.world_config.unit_speed);
+      if (game_data.config && game_data.config.speed) candidates.push(game_data.config.speed);
+      if (game_data.config && game_data.config.unit_speed) candidates.push(game_data.config.unit_speed);
+    }
+
+    for (let i = 0; i < candidates.length; i++) {
+      const value = parseFloatSafe(candidates[i], 0);
+      if (value > 0) return value;
+    }
+
+    return 1;
+  }
+
+  function getMerchantMinutesPerField() {
+    const speed = getDetectedWorldSpeedFactor();
+    return Math.max(0.1, DEFAULTS.baseMerchantMinutesPerField / Math.max(0.1, speed));
+  }
+
+  function getTravelMinutes(distance, settings) {
+    return Math.max(0, (distance || 0) * (settings.merchantMinutesPerField || getMerchantMinutesPerField()));
+  }
+
+  function getArrivalBucketIndex(travelMinutes, settings) {
+    const windowMinutes = Math.max(1, settings.arrivalBalanceWindowMinutes || DEFAULTS.arrivalBalanceWindowMinutes);
+    return Math.floor(Math.max(0, travelMinutes || 0) / windowMinutes);
+  }
+
+  function getTargetArrivalBucket(target, bucketIndex) {
+    if (!target.arrivalBuckets) target.arrivalBuckets = new Map();
+    const key = String(bucketIndex || 0);
+
+    if (!target.arrivalBuckets.has(key)) {
+      target.arrivalBuckets.set(key, emptyResources());
+    }
+
+    return target.arrivalBuckets.get(key);
+  }
+
+  function addResourcesToArrivalBucket(target, bucketIndex, resources) {
+    const bucket = getTargetArrivalBucket(target, bucketIndex);
+    addResources(bucket, resources || emptyResources());
+  }
+
+  function getActiveResourceKeys(resources) {
+    return ["wood", "stone", "iron"].filter(key => (resources && resources[key] || 0) > 0);
+  }
+
+  function getArrivalBalancePriority(target, bucketIndex, planned, remainingNeed, resourceKey) {
+    const activeKeys = getActiveResourceKeys(remainingNeed);
+    if (activeKeys.length <= 1) return 1;
+
+    const initialNeed = target.initialNeed || remainingNeed || emptyResources();
+    const initialTotal = Math.max(1, totalResources(initialNeed));
+    const expectedRatio = Math.max(0.05, (initialNeed[resourceKey] || 0) / initialTotal);
+    const bucket = getTargetArrivalBucket(target, bucketIndex);
+    const currentBucketTotal = totalResources(bucket) + totalResources(planned || emptyResources());
+    const currentResourceAmount = (bucket[resourceKey] || 0) + ((planned && planned[resourceKey]) || 0);
+    const currentRatio = currentBucketTotal > 0 ? currentResourceAmount / currentBucketTotal : 0;
+    const remainingTotal = Math.max(1, totalResources(remainingNeed || emptyResources()));
+    const remainingRatio = (remainingNeed[resourceKey] || 0) / remainingTotal;
+
+    return (expectedRatio - currentRatio) * 3 + remainingRatio;
+  }
+
+  function getArrivalBalanceCandidateScore(donor, target, bucketIndex, remainingNeed, settings) {
+    if (!settings.arrivalBalanceWindowMinutes || settings.arrivalBalanceWindowMinutes <= 0) return 0;
+
+    const activeKeys = getActiveResourceKeys(remainingNeed);
+    if (activeKeys.length <= 1) return 0;
+
+    let score = 0;
+    activeKeys.forEach(key => {
+      const possible = Math.max(0, Math.min(donor.available[key] || 0, remainingNeed[key] || 0));
+      if (possible <= 0) return;
+      score += Math.min(possible, settings.merchantCapacity * 8) / 1000 * getArrivalBalancePriority(target, bucketIndex, emptyResources(), remainingNeed, key);
+    });
+
+    return score;
+  }
+
+  function createArrivalBalanceSummary(targetPlan, settings) {
+    const activeKeys = getActiveResourceKeys(targetPlan.resources);
+    if (activeKeys.length <= 1 || !targetPlan.launches || targetPlan.launches.length <= 1) {
+      return "Single-resource/simple arrival";
+    }
+
+    const buckets = new Map();
+    targetPlan.launches.forEach(launch => {
+      const key = String(launch.arrivalBucket || 0);
+      if (!buckets.has(key)) buckets.set(key, emptyResources());
+      addResources(buckets.get(key), launch.resources || emptyResources());
+    });
+
+    let unevenBuckets = 0;
+    buckets.forEach(bucket => {
+      const bucketTotal = totalResources(bucket);
+      if (bucketTotal < settings.minShipment * 2) return;
+
+      const shares = activeKeys.map(key => (bucket[key] || 0) / bucketTotal);
+      const maxShare = Math.max.apply(null, shares);
+      const missingCount = activeKeys.filter(key => (bucket[key] || 0) <= 0).length;
+
+      if (maxShare >= 0.82 || missingCount >= Math.max(1, activeKeys.length - 1)) {
+        unevenBuckets++;
+      }
+    });
+
+    const windowMinutes = settings.arrivalBalanceWindowMinutes || DEFAULTS.arrivalBalanceWindowMinutes;
+    return buckets.size + " arrival window(s), " + (unevenBuckets ? unevenBuckets + " uneven" : "balanced") + " (~" + windowMinutes + "m)";
   }
 
   function getWarehouseBalanceTarget(village, stats) {
@@ -1329,7 +1465,9 @@
 
   function buildDonors(villages, stats, settings) {
     return villages.map(village => {
-      const current = getCurrentResourcesWithIncoming(village);
+      // Only resources currently present in the origin can be requested right now.
+      // Incoming resources are counted for target need, but not as requestable donor stock.
+      const current = getCurrentResourcesOnly(village);
       const warehouseProtect = Math.round((village.capacity || 0) * getWarehouseReserveRatio(village, settings));
 
       let ownNeed = emptyResources();
@@ -1454,10 +1592,14 @@
           })
           .map(donor => {
             const distance = getDistance(donor.village.coord, target.village.coord);
+            const travelMinutes = getTravelMinutes(distance, settings);
+            const arrivalBucket = getArrivalBucketIndex(travelMinutes, settings);
             return {
               donor: donor,
               distance: distance,
-              score: getDonorMatchScore(donor, target, distance, settings)
+              travelMinutes: travelMinutes,
+              arrivalBucket: arrivalBucket,
+              score: getDonorMatchScore(donor, target, distance, settings, need) + getArrivalBalanceCandidateScore(donor, target, arrivalBucket, need, settings)
             };
           })
           .sort((a, b) => sortDonorMatches(a, b, settings));
@@ -1466,7 +1608,7 @@
 
         const match = usableDonors[0];
         const donor = match.donor;
-        const shipment = createShipment(donor, target, need, settings);
+        const shipment = createShipment(donor, target, need, settings, match);
 
         if (totalResources(shipment.resources) < settings.minShipment) {
           donor.merchantsAvailable = 0;
@@ -1475,6 +1617,7 @@
 
         subtractResources(donor.available, shipment.resources);
         subtractResources(need, shipment.resources);
+        addResourcesToArrivalBucket(target, match.arrivalBucket, shipment.resources);
         donor.merchantsAvailable = Math.max(0, donor.merchantsAvailable - shipment.merchantsUsed);
         donor.totalAvailable = Math.min(
           totalResources(donor.available),
@@ -1491,6 +1634,8 @@
           total: totalResources(shipment.resources),
           merchantsUsed: shipment.merchantsUsed,
           distance: match.distance,
+          travelMinutes: match.travelMinutes,
+          arrivalBucket: match.arrivalBucket,
           targetScore: target.score,
           donorScore: match.score,
           targetReason: target.reason,
@@ -1502,7 +1647,7 @@
     return launches;
   }
 
-  function groupLaunchesByTarget(launches) {
+  function groupLaunchesByTarget(launches, settings) {
     const map = new Map();
 
     launches.forEach(launch => {
@@ -1531,7 +1676,12 @@
       plan.maxDistance = Math.max(plan.maxDistance, launch.distance);
     });
 
-    return Array.from(map.values()).sort((a, b) => b.total - a.total);
+    const plans = Array.from(map.values());
+    plans.forEach(plan => {
+      plan.arrivalBalance = createArrivalBalanceSummary(plan, settings || DEFAULTS);
+    });
+
+    return plans.sort((a, b) => b.total - a.total);
   }
 
   function buildDonorAudit(donors, targets, launches, settings) {
@@ -1630,7 +1780,7 @@
     return b.score - a.score;
   }
 
-  function getDonorMatchScore(donor, target, distance, settings) {
+  function getDonorMatchScore(donor, target, distance, settings, remainingNeed) {
     let score = donor.baseScore;
 
     score -= distance * settings.donorDistancePenalty;
@@ -1654,24 +1804,39 @@
     return score;
   }
 
-  function createShipment(donor, target, need, settings) {
-    const capacity = donor.merchantsAvailable * settings.merchantCapacity;
-    const desired = {
-      wood: Math.max(0, Math.min(donor.available.wood, need.wood)),
-      stone: Math.max(0, Math.min(donor.available.stone, need.stone)),
-      iron: Math.max(0, Math.min(donor.available.iron, need.iron))
-    };
+  function createShipment(donor, target, need, settings, match) {
+    const capacity = Math.max(0, donor.merchantsAvailable * settings.merchantCapacity);
+    const desired = emptyResources();
+    let capacityLeft = capacity;
+    let safety = 0;
+    const bucketIndex = match && match.arrivalBucket !== undefined ? match.arrivalBucket : 0;
+    const chunkSize = Math.max(1, settings.merchantCapacity || DEFAULTS.merchantCapacity);
 
-    let totalDesired = totalResources(desired);
+    while (capacityLeft > 0 && totalResources(need) > 0 && safety < 1000) {
+      safety++;
 
-    if (totalDesired > capacity && totalDesired > 0) {
-      const factor = capacity / totalDesired;
-      desired.wood = Math.floor(desired.wood * factor);
-      desired.stone = Math.floor(desired.stone * factor);
-      desired.iron = Math.floor(desired.iron * factor);
-      totalDesired = totalResources(desired);
+      const candidates = getActiveResourceKeys(need)
+        .filter(key => Math.max(0, (donor.available[key] || 0) - (desired[key] || 0)) > 0)
+        .map(key => ({
+          key: key,
+          priority: getArrivalBalancePriority(target, bucketIndex, desired, need, key)
+        }))
+        .sort((a, b) => b.priority - a.priority);
+
+      if (!candidates.length) break;
+
+      const resourceKey = candidates[0].key;
+      const availableLeft = Math.max(0, (donor.available[resourceKey] || 0) - (desired[resourceKey] || 0));
+      const neededLeft = Math.max(0, need[resourceKey] || 0);
+      const amount = Math.min(chunkSize, capacityLeft, availableLeft, neededLeft);
+
+      if (amount <= 0) break;
+
+      desired[resourceKey] += Math.floor(amount);
+      capacityLeft -= amount;
     }
 
+    const totalDesired = totalResources(desired);
     const merchantsUsed = Math.ceil(totalDesired / settings.merchantCapacity);
 
     return {
@@ -1827,10 +1992,13 @@
         coord: launch.origin.coord,
         id: launch.origin.id,
         resources: Object.assign({}, launch.resources),
-        merchantsUsed: launch.merchantsUsed
+        merchantsUsed: launch.merchantsUsed,
+        travelMinutes: launch.travelMinutes,
+        arrivalBucket: launch.arrivalBucket
       })),
       total: targetPlan.total,
       merchantsUsed: targetPlan.merchantsUsed,
+      arrivalBalance: targetPlan.arrivalBalance,
       payload: debugPayload,
       payloadOriginCount: targetPlan.launches.length,
       payloadResourceKeys: Object.keys(debugPayload).length
@@ -1885,7 +2053,8 @@
       createSummaryCard("Origin transfers", planResult.launches.length) +
       createSummaryCard("Donors checked", planResult.donors.length) +
       createSummaryCard("Mode", settings.useAmTemplates ? "AM" : "WH %") +
-      createSummaryCard("Reserve", escapeHtml(settings.reserveWarehousePercent) + "%");
+      createSummaryCard("Reserve", escapeHtml(settings.reserveWarehousePercent) + "%") +
+      createSummaryCard("Arrival", escapeHtml(settings.arrivalBalanceWindowMinutes) + "m");
 
     ui.results.appendChild(summary);
 
@@ -1935,7 +2104,7 @@
 
       appendCell(row, String(targetPlan.id));
       appendCell(row, targetPlan.target.name, "twrp-left twrp-target-name");
-      appendCell(row, formatResources(targetPlan.resources), "twrp-left twrp-resource-cell");
+      appendCell(row, formatResources(targetPlan.resources) + "\n" + (targetPlan.arrivalBalance || ""), "twrp-left twrp-resource-cell");
 
       const originsCell = document.createElement("td");
       originsCell.className = "twrp-left";
@@ -1954,7 +2123,9 @@
         line.innerHTML =
           "<strong>" + escapeHtml(launch.origin.name) + "</strong><br>" +
           "<span>" + escapeHtml(formatResources(launch.resources)) + " | " +
-          escapeHtml(launch.distance.toFixed(1)) + " fields</span>";
+          escapeHtml(launch.distance.toFixed(1)) + " fields" +
+          (launch.travelMinutes !== undefined ? " | ~" + formatTravelMinutes(launch.travelMinutes) : "") +
+          "</span>";
         originList.appendChild(line);
       });
 
@@ -2095,6 +2266,15 @@
     return new Intl.NumberFormat().format(Math.round(value || 0));
   }
 
+  function formatTravelMinutes(value) {
+    const minutes = Math.max(0, Math.round(value || 0));
+    if (minutes < 60) return minutes + "m";
+
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return hours + "h" + (rest ? " " + rest + "m" : "");
+  }
+
   function copyPlan() {
     if (!state.plan.length) {
       setStatus("No plan to copy.", "warn");
@@ -2107,6 +2287,7 @@
     lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
     lines.push("Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance"));
     lines.push("Origin reserve: " + settings.reserveWarehousePercent + "% of warehouse");
+    lines.push("Arrival balance window: " + settings.arrivalBalanceWindowMinutes + " minutes");
     lines.push("");
 
     state.plan.forEach(targetPlan => {
@@ -2116,7 +2297,8 @@
         " | " + formatResources(targetPlan.resources) +
         " | origins: " + targetPlan.launches.length +
         " | merchants: " + targetPlan.merchantsUsed +
-        " | max distance: " + targetPlan.maxDistance.toFixed(1)
+        " | max distance: " + targetPlan.maxDistance.toFixed(1) +
+        " | arrival: " + (targetPlan.arrivalBalance || "n/a")
       );
       lines.push("   Reason: " + targetPlan.targetReason);
 
@@ -2124,7 +2306,8 @@
         lines.push(
           "   - " + launch.origin.name +
           " -> " + formatResources(launch.resources) +
-          " | distance: " + launch.distance.toFixed(1)
+          " | distance: " + launch.distance.toFixed(1) +
+          (launch.travelMinutes !== undefined ? " | approx arrival: " + formatTravelMinutes(launch.travelMinutes) : "")
         );
       });
 
@@ -2720,7 +2903,8 @@
       "AM construction or WH balance",
       "Origin reserve protection",
       "Farm-30 donor boost",
-      "Enter-to-send with delay"
+      "Arrival balance",
+      "Enter-to-request with 50ms cooldown"
     ].forEach(text => {
       const pill = document.createElement("span");
       pill.className = "twrp-pill";
@@ -2742,6 +2926,7 @@
     const reserveMerchants = createInput("Reserve merchants", DEFAULTS.reserveMerchants);
     const reserveWarehousePercent = createInput("Origin reserve", DEFAULTS.reserveWarehousePercent);
     const maxDistance = createInput("Max distance", DEFAULTS.maxDistance);
+    const arrivalBalanceWindowMinutes = createInput("Arrival window", DEFAULTS.arrivalBalanceWindowMinutes);
     const prioritizeLowPoints = createCheckbox("Low-point priority", DEFAULTS.prioritizeLowPoints);
 
     addHint(planMode.wrap, "AM template or WH %");
@@ -2749,6 +2934,7 @@
     addHint(reserveMerchants.wrap, "kept home");
     addHint(reserveWarehousePercent.wrap, "% warehouse");
     addHint(maxDistance.wrap, "0 = any");
+    addHint(arrivalBalanceWindowMinutes.wrap, "minutes");
     addHint(prioritizeLowPoints.wrap, "boost smaller villages");
 
     [
@@ -2757,6 +2943,7 @@
       reserveMerchants.wrap,
       reserveWarehousePercent.wrap,
       maxDistance.wrap,
+      arrivalBalanceWindowMinutes.wrap,
       prioritizeLowPoints.wrap
     ].forEach(node => grid.appendChild(node));
 
@@ -2816,6 +3003,7 @@
     ui.reserveMerchants = reserveMerchants.input;
     ui.reserveWarehousePercent = reserveWarehousePercent.input;
     ui.maxDistance = maxDistance.input;
+    ui.arrivalBalanceWindowMinutes = arrivalBalanceWindowMinutes.input;
     ui.prioritizeLowPoints = prioritizeLowPoints.input;
     ui.planButton = planButton;
     ui.copyButton = copyButton;
