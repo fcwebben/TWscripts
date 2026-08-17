@@ -13,7 +13,7 @@
  * - Reads Account Manager construction template data when AM construction mode is selected
  * - Reads incoming transport data
  * - Counts incoming resources for target need calculations
- * - Caps planned target requests so current + incoming + planned resources do not exceed target warehouse capacity
+ * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
  * - Uses current origin resources only when planning requestable origin availability
  * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
  * - Allows one grouped manual request action per target row
@@ -63,7 +63,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.9";
+  const SCRIPT_VERSION = "1.7.10";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -94,7 +94,7 @@
     donorAuditLimit: 20,
     arrivalBalanceWindowMinutes: 30,
     baseMerchantMinutesPerField: 18,
-    targetWarehouseLimitPercent: 100
+    targetWarehouseLimitPercent: 90
   };
 
   const BUILDING_NAMES = {
@@ -1319,7 +1319,7 @@
       return null;
     }
 
-    const limitPercent = Math.max(0, Math.min(100, settings.targetWarehouseLimitPercent || DEFAULTS.targetWarehouseLimitPercent || 100));
+    const limitPercent = Math.max(0, Math.min(100, settings.targetWarehouseLimitPercent !== undefined ? settings.targetWarehouseLimitPercent : DEFAULTS.targetWarehouseLimitPercent));
     return Math.floor(capacity * (limitPercent / 100));
   }
 
@@ -1483,7 +1483,7 @@
     }
 
     if (warehouseCap && warehouseCap.limited) {
-      reasons.push("warehouse capacity limited by " + formatNumber(totalResources(warehouseCap.reduced)));
+      reasons.push("90% target warehouse safety limit reduced by " + formatNumber(totalResources(warehouseCap.reduced)));
     }
 
     if (totalNeed > 0) {
