@@ -63,7 +63,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.8";
+  const SCRIPT_VERSION = "1.7.9";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -2020,6 +2020,7 @@
 
       const candidates = getActiveResourceKeys(need)
         .filter(key => Math.max(0, (donor.available[key] || 0) - (desired[key] || 0)) > 0)
+        .filter(key => Math.max(0, (need[key] || 0) - (desired[key] || 0)) > 0)
         .map(key => ({
           key: key,
           priority: getArrivalBalancePriority(target, bucketIndex, desired, need, key)
@@ -2030,7 +2031,7 @@
 
       const resourceKey = candidates[0].key;
       const availableLeft = Math.max(0, (donor.available[resourceKey] || 0) - (desired[resourceKey] || 0));
-      const neededLeft = Math.max(0, need[resourceKey] || 0);
+      const neededLeft = Math.max(0, (need[resourceKey] || 0) - (desired[resourceKey] || 0));
       const amount = Math.min(chunkSize, capacityLeft, availableLeft, neededLeft);
 
       if (amount <= 0) break;
