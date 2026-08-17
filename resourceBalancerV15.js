@@ -14,6 +14,8 @@
  * - Reads incoming transport data
  * - Counts incoming resources for target need calculations
  * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
+ * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
+ * - Adds grouped plan diagnostics in the console for debugging and optimization
  * - Uses current origin resources only when planning requestable origin availability
  * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
  * - Allows one grouped manual request action per target row
@@ -63,7 +65,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.10";
+  const SCRIPT_VERSION = "1.7.11";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -94,7 +96,8 @@
     donorAuditLimit: 20,
     arrivalBalanceWindowMinutes: 30,
     baseMerchantMinutesPerField: 18,
-    targetWarehouseLimitPercent: 90
+    targetWarehouseLimitPercent: 90,
+    minResourcePerOrigin: 500
   };
 
   const BUILDING_NAMES = {
@@ -128,6 +131,7 @@
     stats: null,
     lastSettings: null,
     sendLocked: false,
+    debug: null,
     logs: [],
     savedSettings: normalizeSettings(getInitialUserData().settings)
   };
@@ -1179,6 +1183,7 @@
       arrivalBalanceWindowMinutes: arrivalBalanceWindowMinutes,
       merchantMinutesPerField: getMerchantMinutesPerField(),
       targetWarehouseLimitPercent: DEFAULTS.targetWarehouseLimitPercent,
+      minResourcePerOrigin: DEFAULTS.minResourcePerOrigin,
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
@@ -1234,6 +1239,7 @@
       state.plan = planResult.targetPlans;
       state.stats = planResult.stats;
 
+      logPlanDiagnostics(planResult, settings);
       renderResults(planResult);
       ui.copyButton.disabled = !state.plan.length;
 
@@ -1252,6 +1258,12 @@
   }
 
   function createTransferPlan(settings) {
+    state.debug = {
+      cappedTargets: [],
+      skippedSmallShipments: [],
+      rejectedTinyResourceFragments: []
+    };
+
     const villages = state.villages.slice();
     const stats = calculateGlobalStats(villages);
     const targets = buildTargets(villages, stats, settings);
@@ -1406,6 +1418,20 @@
 
       const warehouseCap = capNeedToTargetWarehouse(village, need, settings);
       need = warehouseCap.need;
+
+      if (warehouseCap && warehouseCap.limited && state.debug && state.debug.cappedTargets) {
+        state.debug.cappedTargets.push({
+          coord: village.coord,
+          id: village.id,
+          name: village.name,
+          capacity: village.capacity || 0,
+          safeLimit: getTargetWarehouseLimit(village, settings),
+          currentWithIncoming: getCurrentResourcesWithIncoming(village),
+          remainingSafeSpace: cloneResources(warehouseCap.space || emptyResources()),
+          reduced: cloneResources(warehouseCap.reduced || emptyResources()),
+          cappedNeed: cloneResources(need)
+        });
+      }
 
       if (settings.useAmTemplates) {
         score = totalResources(need) / 1000;
@@ -1567,6 +1593,42 @@
 
   function getActiveResourceKeys(resources) {
     return ["wood", "stone", "iron"].filter(key => (resources && resources[key] || 0) > 0);
+  }
+
+  function cleanSmallResourceAmounts(resources, minAmount) {
+    const cleaned = cloneResources(resources || emptyResources());
+    const removed = emptyResources();
+    const threshold = Math.max(0, minAmount || 0);
+
+    if (threshold <= 0) {
+      return {
+        resources: cleaned,
+        removed: removed,
+        changed: false
+      };
+    }
+
+    ["wood", "stone", "iron"].forEach(key => {
+      const value = Math.max(0, Math.floor(cleaned[key] || 0));
+      if (value > 0 && value < threshold) {
+        removed[key] = value;
+        cleaned[key] = 0;
+      } else {
+        cleaned[key] = value;
+      }
+    });
+
+    return {
+      resources: cleaned,
+      removed: removed,
+      changed: totalResources(removed) > 0
+    };
+  }
+
+  function hasResourceAtLeast(resources, minAmount) {
+    const threshold = Math.max(0, minAmount || 0);
+    if (threshold <= 0) return totalResources(resources || emptyResources()) > 0;
+    return ["wood", "stone", "iron"].some(key => (resources && resources[key] || 0) >= threshold);
   }
 
   function getArrivalBalancePriority(target, bucketIndex, planned, remainingNeed, resourceKey) {
@@ -1785,8 +1847,10 @@
         const usableDonors = donors
           .filter(donor => {
             if (donor.village.coord === target.village.coord) return false;
+            if (donor.blockedTargetIds && donor.blockedTargetIds.has(String(target.village.id))) return false;
             if (donor.merchantsAvailable <= 0) return false;
             if (totalResources(donor.available) < settings.minShipment) return false;
+            if (!hasResourceAtLeast(donor.available, settings.minResourcePerOrigin)) return false;
 
             const distance = getDistance(donor.village.coord, target.village.coord);
             if (settings.maxDistance > 0 && distance > settings.maxDistance) return false;
@@ -1813,8 +1877,24 @@
         const donor = match.donor;
         const shipment = createShipment(donor, target, need, settings, match);
 
-        if (totalResources(shipment.resources) < settings.minShipment) {
-          donor.merchantsAvailable = 0;
+        if (totalResources(shipment.resources) < settings.minShipment || !hasResourceAtLeast(shipment.resources, settings.minResourcePerOrigin)) {
+          if (!donor.blockedTargetIds) donor.blockedTargetIds = new Set();
+          donor.blockedTargetIds.add(String(target.village.id));
+
+          if (state.debug && state.debug.skippedSmallShipments) {
+            state.debug.skippedSmallShipments.push({
+              target: target.village.coord,
+              targetId: target.village.id,
+              origin: donor.village.coord,
+              originId: donor.village.id,
+              attempted: cloneResources(shipment.attemptedResources || shipment.resources || emptyResources()),
+              keptAfterSmallFragmentFilter: cloneResources(shipment.resources || emptyResources()),
+              removedSmallFragments: cloneResources(shipment.removedSmallFragments || emptyResources()),
+              minShipment: settings.minShipment,
+              minResourcePerOrigin: settings.minResourcePerOrigin
+            });
+          }
+
           continue;
         }
 
@@ -2040,13 +2120,162 @@
       capacityLeft -= amount;
     }
 
-    const totalDesired = totalResources(desired);
+    const attempted = cloneResources(desired);
+    const cleaned = cleanSmallResourceAmounts(desired, settings.minResourcePerOrigin);
+    const totalDesired = totalResources(cleaned.resources);
     const merchantsUsed = Math.ceil(totalDesired / settings.merchantCapacity);
 
+    if (cleaned.changed && state.debug && state.debug.rejectedTinyResourceFragments) {
+      state.debug.rejectedTinyResourceFragments.push({
+        target: target.village.coord,
+        targetId: target.village.id,
+        origin: donor.village.coord,
+        originId: donor.village.id,
+        attempted: attempted,
+        removed: cloneResources(cleaned.removed),
+        kept: cloneResources(cleaned.resources),
+        minResourcePerOrigin: settings.minResourcePerOrigin
+      });
+    }
+
     return {
-      resources: desired,
+      resources: cleaned.resources,
+      attemptedResources: attempted,
+      removedSmallFragments: cleaned.removed,
       merchantsUsed: merchantsUsed
     };
+  }
+
+  function buildTargetWarehouseAudit(targetPlans, settings) {
+    return (targetPlans || []).map(plan => {
+      const target = plan.target;
+      const currentWithIncoming = getCurrentResourcesWithIncoming(target);
+      const safeLimit = getTargetWarehouseLimit(target, settings);
+      const afterPlanned = {
+        wood: currentWithIncoming.wood + (plan.resources.wood || 0),
+        stone: currentWithIncoming.stone + (plan.resources.stone || 0),
+        iron: currentWithIncoming.iron + (plan.resources.iron || 0)
+      };
+
+      return {
+        target: target.coord,
+        targetId: target.id,
+        warehouseCapacity: target.capacity || 0,
+        targetSafeLimitPercent: settings.targetWarehouseLimitPercent,
+        safeLimit: safeLimit,
+        currentPlusIncoming: currentWithIncoming,
+        planned: cloneResources(plan.resources || emptyResources()),
+        afterPlanned: afterPlanned,
+        overSafeLimit: safeLimit !== null ? {
+          wood: afterPlanned.wood > safeLimit,
+          stone: afterPlanned.stone > safeLimit,
+          iron: afterPlanned.iron > safeLimit
+        } : null,
+        total: plan.total,
+        origins: plan.launches ? plan.launches.length : 0,
+        arrivalBalance: plan.arrivalBalance
+      };
+    });
+  }
+
+  function buildOriginUsagePlanAudit(launches, settings) {
+    const map = new Map();
+
+    (launches || []).forEach(launch => {
+      const coord = launch.origin.coord;
+      const current = map.get(coord) || {
+        origin: coord,
+        originId: launch.origin.id,
+        name: launch.origin.name,
+        planned: emptyResources(),
+        plannedTotal: 0,
+        plannedMerchants: 0,
+        transfers: 0,
+        originCurrent: getCurrentResourcesOnly(launch.origin),
+        originMerchants: launch.origin.merchants || 0
+      };
+
+      addResources(current.planned, launch.resources || emptyResources());
+      current.plannedTotal += launch.total || totalResources(launch.resources || emptyResources());
+      current.plannedMerchants += launch.merchantsUsed || Math.ceil((launch.total || 0) / settings.merchantCapacity);
+      current.transfers += 1;
+      map.set(coord, current);
+    });
+
+    return Array.from(map.values()).map(origin => ({
+      origin: origin.origin,
+      originId: origin.originId,
+      name: origin.name,
+      planned: origin.planned,
+      plannedTotal: origin.plannedTotal,
+      plannedMerchants: origin.plannedMerchants,
+      transfers: origin.transfers,
+      originCurrent: origin.originCurrent,
+      originMerchants: origin.originMerchants,
+      overOriginWood: origin.planned.wood > origin.originCurrent.wood,
+      overOriginStone: origin.planned.stone > origin.originCurrent.stone,
+      overOriginIron: origin.planned.iron > origin.originCurrent.iron,
+      overOriginMerchants: origin.plannedMerchants > origin.originMerchants
+    }));
+  }
+
+  function logPlanDiagnostics(planResult, settings) {
+    const targetWarehouseAudit = buildTargetWarehouseAudit(planResult.targetPlans, settings);
+    const originUsageAudit = buildOriginUsagePlanAudit(planResult.launches, settings);
+    const overWarehouse = targetWarehouseAudit.filter(row => row.overSafeLimit && (row.overSafeLimit.wood || row.overSafeLimit.stone || row.overSafeLimit.iron));
+    const overOrigins = originUsageAudit.filter(row => row.overOriginWood || row.overOriginStone || row.overOriginIron || row.overOriginMerchants);
+    const debug = state.debug || {};
+
+    const diagnostics = {
+      version: SCRIPT_VERSION,
+      settings: {
+        mode: settings.useAmTemplates ? "AM construction" : "Warehouse balance",
+        targetWarehouseLimitPercent: settings.targetWarehouseLimitPercent,
+        minResourcePerOrigin: settings.minResourcePerOrigin,
+        minShipment: settings.minShipment,
+        maxDistance: settings.maxDistance,
+        reserveWarehousePercent: settings.reserveWarehousePercent,
+        reserveMerchants: settings.reserveMerchants,
+        arrivalBalanceWindowMinutes: settings.arrivalBalanceWindowMinutes,
+        merchantMinutesPerField: settings.merchantMinutesPerField,
+        prioritizeLowPoints: settings.prioritizeLowPoints
+      },
+      counts: {
+        villages: state.villages.length,
+        targetsBuilt: planResult.targets ? planResult.targets.length : 0,
+        targetPlans: planResult.targetPlans.length,
+        launches: planResult.launches.length,
+        donors: planResult.donors.length,
+        cappedTargets: debug.cappedTargets ? debug.cappedTargets.length : 0,
+        skippedSmallShipments: debug.skippedSmallShipments ? debug.skippedSmallShipments.length : 0,
+        rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments ? debug.rejectedTinyResourceFragments.length : 0,
+        targetsOverSafeWarehouseLimit: overWarehouse.length,
+        originsOverAvailableResourcesOrMerchants: overOrigins.length
+      },
+      stats: planResult.stats,
+      overWarehouse: overWarehouse,
+      overOrigins: overOrigins,
+      targetWarehouseAudit: targetWarehouseAudit,
+      originUsageAudit: originUsageAudit,
+      cappedTargets: debug.cappedTargets || [],
+      skippedSmallShipments: debug.skippedSmallShipments || [],
+      rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments || []
+    };
+
+    console.groupCollapsed(SCRIPT_NAME + " plan diagnostics " + SCRIPT_VERSION);
+    console.log("Summary", diagnostics.counts);
+    console.log("Settings", diagnostics.settings);
+    console.log("Targets over 90% warehouse safety limit", overWarehouse);
+    console.log("Origins over available resources/merchants", overOrigins);
+    console.log("Target warehouse audit", targetWarehouseAudit);
+    console.log("Origin usage audit", originUsageAudit);
+    console.log("Capped targets", diagnostics.cappedTargets);
+    console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
+    console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
+    console.log("Full diagnostics", diagnostics);
+    console.groupEnd();
+
+    state.lastDiagnostics = diagnostics;
   }
 
   function getFirstEnabledSendButton() {
