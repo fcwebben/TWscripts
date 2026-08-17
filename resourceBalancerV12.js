@@ -13,6 +13,7 @@
  * - Reads Account Manager construction template data when AM construction mode is selected
  * - Reads incoming transport data
  * - Counts incoming resources for target need calculations
+ * - Caps planned target requests so current + incoming + planned resources do not exceed target warehouse capacity
  * - Uses current origin resources only when planning requestable origin availability
  * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
  * - Allows one grouped manual request action per target row
@@ -62,7 +63,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.7";
+  const SCRIPT_VERSION = "1.7.8";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -92,7 +93,8 @@
     scoreDistanceTieThreshold: 18,
     donorAuditLimit: 20,
     arrivalBalanceWindowMinutes: 30,
-    baseMerchantMinutesPerField: 18
+    baseMerchantMinutesPerField: 18,
+    targetWarehouseLimitPercent: 100
   };
 
   const BUILDING_NAMES = {
@@ -1176,6 +1178,7 @@
       maxDistance: maxDistance,
       arrivalBalanceWindowMinutes: arrivalBalanceWindowMinutes,
       merchantMinutesPerField: getMerchantMinutesPerField(),
+      targetWarehouseLimitPercent: DEFAULTS.targetWarehouseLimitPercent,
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
@@ -1309,6 +1312,61 @@
     };
   }
 
+  function getTargetWarehouseLimit(village, settings) {
+    const capacity = Math.max(0, village && village.capacity || 0);
+
+    if (capacity <= 0) {
+      return null;
+    }
+
+    const limitPercent = Math.max(0, Math.min(100, settings.targetWarehouseLimitPercent || DEFAULTS.targetWarehouseLimitPercent || 100));
+    return Math.floor(capacity * (limitPercent / 100));
+  }
+
+  function getTargetWarehouseSpace(village, settings) {
+    const limit = getTargetWarehouseLimit(village, settings);
+
+    if (limit === null) {
+      return null;
+    }
+
+    const current = getCurrentResourcesWithIncoming(village);
+
+    return {
+      wood: Math.max(0, limit - current.wood),
+      stone: Math.max(0, limit - current.stone),
+      iron: Math.max(0, limit - current.iron)
+    };
+  }
+
+  function capNeedToTargetWarehouse(village, need, settings) {
+    const space = getTargetWarehouseSpace(village, settings);
+    const capped = cloneResources(need || emptyResources());
+    const reduced = emptyResources();
+
+    if (!space) {
+      return {
+        need: capped,
+        reduced: reduced,
+        limited: false,
+        space: null
+      };
+    }
+
+    ["wood", "stone", "iron"].forEach(key => {
+      const before = capped[key] || 0;
+      capped[key] = Math.max(0, Math.min(before, space[key] || 0));
+      reduced[key] = Math.max(0, before - capped[key]);
+    });
+
+    return {
+      need: capped,
+      reduced: reduced,
+      limited: totalResources(reduced) > 0,
+      space: space
+    };
+  }
+
   function buildTargets(villages, stats, settings) {
     return villages.map(village => {
       const current = getCurrentResourcesWithIncoming(village);
@@ -1337,7 +1395,19 @@
           stone: Math.max(0, constructionNeed.stone - current.stone),
           iron: Math.max(0, constructionNeed.iron - current.iron)
         };
+      } else {
+        warehouseTarget = getWarehouseBalanceTarget(village, stats);
+        need = {
+          wood: Math.max(0, warehouseTarget.wood - current.wood),
+          stone: Math.max(0, warehouseTarget.stone - current.stone),
+          iron: Math.max(0, warehouseTarget.iron - current.iron)
+        };
+      }
 
+      const warehouseCap = capNeedToTargetWarehouse(village, need, settings);
+      need = warehouseCap.need;
+
+      if (settings.useAmTemplates) {
         score = totalResources(need) / 1000;
 
         if (hasTemplate) {
@@ -1359,16 +1429,9 @@
         }
 
         if (settings.priorityMode === "construction_first") {
-          score += totalResources(constructionNeed) / 700;
+          score += totalResources(need) / 700;
         }
       } else {
-        warehouseTarget = getWarehouseBalanceTarget(village, stats);
-        need = {
-          wood: Math.max(0, warehouseTarget.wood - current.wood),
-          stone: Math.max(0, warehouseTarget.stone - current.stone),
-          iron: Math.max(0, warehouseTarget.iron - current.iron)
-        };
-
         score = totalResources(need) / 1000;
         score += lowPointRatio * settings.lowPointsBoost * 0.35;
       }
@@ -1382,6 +1445,9 @@
         arrivalBuckets: new Map(),
         constructionNeed: constructionNeed,
         warehouseTarget: warehouseTarget,
+        warehouseSpace: warehouseCap.space,
+        warehouseLimited: warehouseCap.limited,
+        warehouseReduced: warehouseCap.reduced,
         totalNeed: totalNeed,
         score: score,
         hasTemplate: hasTemplate,
@@ -1389,14 +1455,14 @@
         queueEmpty: queueEmpty,
         queueHours: queueHours,
         lowPointRatio: lowPointRatio,
-        reason: buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget)
+        reason: buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap)
       };
     })
-      .filter(target => target.totalNeed >= settings.minShipment || (settings.useAmTemplates && target.score > settings.emptyQueueBoost))
+      .filter(target => target.totalNeed >= settings.minShipment || (settings.useAmTemplates && target.totalNeed > 0 && target.score > settings.emptyQueueBoost))
       .sort((a, b) => b.score - a.score);
   }
 
-  function buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget) {
+  function buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap) {
     const reasons = [];
 
     if (!settings.useAmTemplates) {
@@ -1414,6 +1480,10 @@
 
     if (lowPointRatio > 0.5 && settings.prioritizeLowPoints) {
       reasons.push("lower points");
+    }
+
+    if (warehouseCap && warehouseCap.limited) {
+      reasons.push("warehouse capacity limited by " + formatNumber(totalResources(warehouseCap.reduced)));
     }
 
     if (totalNeed > 0) {
