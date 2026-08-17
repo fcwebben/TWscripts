@@ -13,12 +13,12 @@
  * - Reads Account Manager construction template data when AM construction mode is selected
  * - Reads incoming transport data
  * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
- * - Allows one grouped manual send action per target row
+ * - Allows one grouped manual request action per target row
  *
  * This script does NOT:
  * - Send attacks, support, or troops
  * - Auto-click game actions
- * - Auto-send all resources
+ * - Auto-request all resources
  * - Use external servers or external files
  */
 
@@ -46,7 +46,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.1";
+  const SCRIPT_VERSION = "1.7.3";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
 
@@ -64,7 +64,7 @@
     emptyQueueBoost: 80,
     lowPointsBoost: 35,
     prioritizeLowPoints: true,
-    sendDelayMs: 900,
+    sendDelayMs: 50,
     donorPreference: "smart_balanced",
     donorDistancePenalty: 2.25,
     noTemplateDonorBonus: 75,
@@ -1095,8 +1095,8 @@
 
       setStatus(
         "Loaded " + state.villages.length + " village(s). Planned " +
-          planResult.targetPlans.length + " target send(s) from " +
-          planResult.launches.length + " origin transfer(s).",
+          planResult.targetPlans.length + " target request(s) from " +
+          planResult.launches.length + " origin request source(s).",
         "success"
       );
     } catch (err) {
@@ -1706,14 +1706,14 @@
     }
 
     if (!focusFirstSendButton()) {
-      setStatus("All visible target sends are completed.", "success");
+      setStatus("All visible target requests are completed.", "success");
     }
   }
 
   function releaseSendLockAfterDelay(button) {
     const delayMs = DEFAULTS.sendDelayMs;
 
-    setStatus("Resources sent. Waiting " + (delayMs / 1000).toFixed(1) + "s before next send is available...", "success");
+    setStatus("Resources requested. Next request is available in " + delayMs + "ms.", "success");
 
     window.setTimeout(function () {
       removeSentTargetRow(button);
@@ -1745,12 +1745,47 @@
     });
   }
 
-  function sendTargetPlan(targetPlan, button) {
-    if (!targetPlan || !targetPlan.target || !targetPlan.launches || !targetPlan.launches.length) return;
-    if (!button || button.disabled || state.sendLocked) return;
+  function getCsrfToken() {
+    if (typeof window.csrf_token !== "undefined" && window.csrf_token) return window.csrf_token;
+    if (typeof game_data !== "undefined" && game_data.csrf) return game_data.csrf;
 
-    state.sendLocked = true;
+    const input = document.querySelector('input[name="h"]');
+    return input ? input.value : "";
+  }
 
+  function responseHasError(response) {
+    if (!response) return false;
+    return Boolean(response.error || response.errors || response.warning || response.warnings);
+  }
+
+  function getResponseMessage(response, fallback) {
+    if (!response) return fallback;
+    return response.success || response.message || response.error || response.warning || fallback;
+  }
+
+  function postMarketAction(options, data) {
+    return new Promise((resolve, reject) => {
+      try {
+        TribalWars.post(
+          "market",
+          options,
+          data,
+          response => {
+            if (responseHasError(response)) {
+              reject(response);
+              return;
+            }
+            resolve(response);
+          },
+          error => reject(error)
+        );
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  function buildCallDataForTargetPlan(targetPlan) {
     const data = {};
 
     targetPlan.launches.forEach(launch => {
@@ -1758,46 +1793,64 @@
       const stoneKey = "resource[" + launch.origin.id + "][stone]";
       const ironKey = "resource[" + launch.origin.id + "][iron]";
 
-      data[woodKey] = (data[woodKey] || 0) + launch.resources.wood;
-      data[stoneKey] = (data[stoneKey] || 0) + launch.resources.stone;
-      data[ironKey] = (data[ironKey] || 0) + launch.resources.iron;
+      data[woodKey] = (data[woodKey] || 0) + Math.max(0, Math.round(launch.resources.wood || 0));
+      data[stoneKey] = (data[stoneKey] || 0) + Math.max(0, Math.round(launch.resources.stone || 0));
+      data[ironKey] = (data[ironKey] || 0) + Math.max(0, Math.round(launch.resources.iron || 0));
     });
 
+    return data;
+  }
+
+  async function requestTargetPlan(targetPlan, button) {
+    if (!targetPlan || !targetPlan.target || !targetPlan.launches || !targetPlan.launches.length) return;
+    if (!button || button.disabled || state.sendLocked) return;
+
+    state.sendLocked = true;
+    button.disabled = true;
+    button.textContent = "Requesting...";
+
+    const data = buildCallDataForTargetPlan(targetPlan);
     const options = {
       village: targetPlan.target.id,
-      ajaxaction: "call",
-      h: window.csrf_token
+      ajaxaction: "call"
     };
 
-    button.disabled = true;
-    button.textContent = "Sending...";
+    const csrf = getCsrfToken();
+    if (csrf) options.h = csrf;
+
+    console.log(SCRIPT_NAME + " grouped request", {
+      target: targetPlan.target.coord,
+      targetId: targetPlan.target.id,
+      origins: targetPlan.launches.map(launch => ({
+        coord: launch.origin.coord,
+        id: launch.origin.id,
+        resources: launch.resources,
+        merchantsUsed: launch.merchantsUsed
+      })),
+      total: targetPlan.total,
+      merchantsUsed: targetPlan.merchantsUsed,
+      data: data
+    });
 
     try {
-      TribalWars.post(
-        "market",
-        options,
-        data,
-        response => {
-          console.log(SCRIPT_NAME + " grouped send response:", response);
-          UI.SuccessMessage(response.success || "Resources sent.", 1500);
-          button.textContent = "Sent";
-          releaseSendLockAfterDelay(button);
-        },
-        error => {
-          console.error(SCRIPT_NAME + " grouped send failed:", error);
-          UI.ErrorMessage("Could not send resources.", 2500);
-          state.sendLocked = false;
-          button.disabled = false;
-          button.textContent = "Send";
-          focusFirstSendButton();
-        }
-      );
-    } catch (err) {
-      console.error(SCRIPT_NAME + " grouped send failed:", err);
-      UI.ErrorMessage("Could not send resources.", 2500);
+      const response = await postMarketAction(options, data);
+
+      if (typeof UI !== "undefined" && UI.SuccessMessage) {
+        UI.SuccessMessage(getResponseMessage(response, "Resources requested."), 1500);
+      }
+
+      button.textContent = "Requested";
+      releaseSendLockAfterDelay(button);
+    } catch (error) {
+      console.error(SCRIPT_NAME + " request failed:", error);
+
+      if (typeof UI !== "undefined" && UI.ErrorMessage) {
+        UI.ErrorMessage(getResponseMessage(error, "Could not request resources."), 2500);
+      }
+
       state.sendLocked = false;
       button.disabled = false;
-      button.textContent = "Send";
+      button.textContent = "Request";
       focusFirstSendButton();
     }
   }
@@ -1816,7 +1869,7 @@
     summary.className = "twrp-card-row";
     summary.innerHTML =
       createSummaryCard("Villages", state.villages.length) +
-      createSummaryCard("Target sends", planResult.targetPlans.length) +
+      createSummaryCard("Target requests", planResult.targetPlans.length) +
       createSummaryCard("Origin transfers", planResult.launches.length) +
       createSummaryCard("Donors checked", planResult.donors.length) +
       createSummaryCard("Mode", settings.useAmTemplates ? "AM" : "WH %") +
@@ -1842,7 +1895,7 @@
   function renderTargetTable(targetPlans) {
     const title = document.createElement("div");
     title.className = "twrp-section-title";
-    title.textContent = "Recommended sends";
+    title.textContent = "Recommended requests";
     ui.results.appendChild(title);
 
     const tableWrap = document.createElement("div");
@@ -1904,10 +1957,10 @@
       const button = document.createElement("button");
       button.type = "button";
       button.className = "btn twrp-send-button";
-      button.textContent = "Send";
+      button.textContent = "Request";
       button.title = targetPlan.targetReason;
       button.addEventListener("click", function () {
-        sendTargetPlan(targetPlan, button);
+        requestTargetPlan(targetPlan, button);
       });
       actionCell.appendChild(button);
       row.appendChild(actionCell);
@@ -1924,7 +1977,7 @@
 
     const note = document.createElement("div");
     note.className = "twrp-send-note";
-    note.textContent = "One Send button per target. Hold Enter to continue through the list; there is a short delay after each successful send.";
+    note.textContent = "One Request button per target. Each click sends one grouped market request from all planned origins for that target. Hold Enter to continue through the list; the cooldown is 50ms after each successful request.";
     ui.results.appendChild(note);
   }
 
@@ -2634,7 +2687,7 @@
     title.className = "twrp-title";
     title.innerHTML =
       "<span>" + escapeHtml(SCRIPT_NAME + " " + SCRIPT_VERSION) + "</span>" +
-      "<span class=\"twrp-subtitle\">Resource planning with grouped target sends</span>";
+      "<span class=\"twrp-subtitle\">Resource planning with grouped target requests</span>";
 
     const closeButton = document.createElement("button");
     closeButton.type = "button";
@@ -2651,7 +2704,7 @@
     const quickHelp = document.createElement("div");
     quickHelp.className = "twrp-quick-help";
     [
-      "One Send per target",
+      "One Request per target",
       "AM construction or WH balance",
       "Origin reserve protection",
       "Farm-30 donor boost",
