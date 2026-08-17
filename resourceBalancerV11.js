@@ -16,13 +16,26 @@
  * - Uses current origin resources only when planning requestable origin availability
  * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
  * - Allows one grouped manual request action per target row
- * - Tries to balance wood, clay and iron arrival timing within configurable time windows
+ * - Tries to balance wood, clay and iron arrival timing within fixed 30-minute windows
+ * - Supports TribalWars.scriptData settings input when enabled in the Script Library
  *
  * This script does NOT:
  * - Send attacks, support, or troops
  * - Auto-click game actions
  * - Auto-request all resources
  * - Use external servers or external files
+ *
+ * Expected TribalWars.scriptData format:
+ * {
+ *   "settings": {
+ *     "useAmTemplates": true,
+ *     "constructionHours": 8,
+ *     "reserveMerchants": 0,
+ *     "reserveWarehousePercent": 8,
+ *     "maxDistance": 0,
+ *     "prioritizeLowPoints": true
+ *   }
+ * }
  */
 
 /*
@@ -49,9 +62,11 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.5";
+  const SCRIPT_VERSION = "1.7.7";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
+  const DATA_VERSION = 1;
+  const SETTINGS_STORAGE_KEY = "twacticsResourcePlannerSettings";
 
   const DEFAULTS = {
     useAmTemplates: true,
@@ -111,14 +126,17 @@
     stats: null,
     lastSettings: null,
     sendLocked: false,
-    logs: []
+    logs: [],
+    savedSettings: normalizeSettings(getInitialUserData().settings)
   };
 
   const ui = {};
 
   window.twacticsResourcePlanner = {
     close: closeDialog,
-    state: state
+    state: state,
+    exportSettings: exportUserData,
+    saveSettings: persistSettings
   };
 
   function cleanText(value) {
@@ -127,6 +145,120 @@
       .replace(/\r/g, "")
       .replace(/\s+/g, " ")
       .trim();
+  }
+
+
+  function getWorldKeyForSettings(name) {
+    const world = typeof game_data !== "undefined" && game_data.world ? game_data.world : "world";
+    return world + ":" + name;
+  }
+
+  function getScriptDataObject() {
+    if (typeof TribalWars === "undefined" || TribalWars.scriptData === undefined || TribalWars.scriptData === null) {
+      return null;
+    }
+
+    if (typeof TribalWars.scriptData === "string") {
+      try {
+        return JSON.parse(TribalWars.scriptData);
+      } catch (err) {
+        console.warn(SCRIPT_NAME + " could not parse TribalWars.scriptData:", err);
+        return null;
+      }
+    }
+
+    if (typeof TribalWars.scriptData === "object") {
+      return TribalWars.scriptData;
+    }
+
+    return null;
+  }
+
+  function getLocalSavedUserData() {
+    try {
+      const raw = localStorage.getItem(getWorldKeyForSettings(SETTINGS_STORAGE_KEY));
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not read local settings:", err);
+      return null;
+    }
+  }
+
+  function normalizeSettings(input) {
+    const source = Object.assign({}, DEFAULTS, input || {});
+
+    return {
+      useAmTemplates: source.useAmTemplates !== false,
+      constructionHours: Math.max(0, Math.min(72, parseFloatSafe(source.constructionHours, DEFAULTS.constructionHours))),
+      reserveMerchants: Math.max(0, parseInt(source.reserveMerchants, 10) || DEFAULTS.reserveMerchants),
+      reserveWarehousePercent: Math.max(0, Math.min(80, parseFloatSafe(source.reserveWarehousePercent, DEFAULTS.reserveWarehousePercent))),
+      maxDistance: Math.max(0, parseFloatSafe(source.maxDistance, DEFAULTS.maxDistance)),
+      prioritizeLowPoints: source.prioritizeLowPoints !== false
+    };
+  }
+
+  function getInitialUserData() {
+    const defaults = {
+      version: DATA_VERSION,
+      settings: normalizeSettings(DEFAULTS)
+    };
+
+    const localData = getLocalSavedUserData();
+    const scriptData = getScriptDataObject();
+
+    return normalizeUserData(Object.assign({}, defaults, localData || {}, scriptData || {}));
+  }
+
+  function normalizeUserData(input) {
+    return {
+      version: DATA_VERSION,
+      settings: normalizeSettings(input && input.settings ? input.settings : input)
+    };
+  }
+
+  function getCurrentUserData() {
+    return normalizeUserData({
+      settings: getSettings()
+    });
+  }
+
+  function persistSettings() {
+    const data = getCurrentUserData();
+    state.savedSettings = data.settings;
+
+    try {
+      localStorage.setItem(getWorldKeyForSettings(SETTINGS_STORAGE_KEY), JSON.stringify(data));
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not save local settings:", err);
+    }
+
+    if (typeof TribalWars !== "undefined") {
+      const existing = getScriptDataObject() || {};
+      TribalWars.scriptData = Object.assign({}, existing, data);
+    }
+
+    return data;
+  }
+
+  function exportUserData() {
+    return JSON.stringify(getCurrentUserData(), null, 2);
+  }
+
+  function installSettingsAutoSave() {
+    [
+      ui.planMode,
+      ui.constructionHours,
+      ui.reserveMerchants,
+      ui.reserveWarehousePercent,
+      ui.maxDistance,
+      ui.prioritizeLowPoints
+    ].forEach(input => {
+      if (!input || input.__twacticsSettingsAutoSave) return;
+      input.__twacticsSettingsAutoSave = true;
+      input.addEventListener("change", persistSettings);
+      input.addEventListener("input", persistSettings);
+    });
   }
 
   function escapeHtml(value) {
@@ -1028,7 +1160,7 @@
     const reserveMerchants = Math.max(0, parseInt(ui.reserveMerchants.value, 10) || DEFAULTS.reserveMerchants);
     const maxDistance = Math.max(0, parseFloatSafe(ui.maxDistance.value, DEFAULTS.maxDistance));
     const reserveWarehousePercent = Math.max(0, Math.min(80, parseFloatSafe(ui.reserveWarehousePercent.value, DEFAULTS.reserveWarehousePercent)));
-    const arrivalBalanceWindowMinutes = Math.max(1, Math.min(180, parseFloatSafe(ui.arrivalBalanceWindowMinutes.value, DEFAULTS.arrivalBalanceWindowMinutes)));
+    const arrivalBalanceWindowMinutes = DEFAULTS.arrivalBalanceWindowMinutes;
     const prioritizeLowPoints = ui.prioritizeLowPoints.checked;
 
     return {
@@ -1069,6 +1201,7 @@
       if (ui.results) ui.results.innerHTML = "";
 
       const settings = getSettings();
+      persistSettings();
       state.lastSettings = settings;
       state.sendLocked = false;
 
@@ -2035,28 +2168,9 @@
     }
   }
 
-  function createSummaryCard(label, value) {
-    return "<div class=\"twrp-card\"><span>" + escapeHtml(label) + "</span><strong>" + escapeHtml(value) + "</strong></div>";
-  }
-
   function renderResults(planResult) {
     ui.results.innerHTML = "";
     state.sendLocked = false;
-
-    const settings = state.lastSettings || getSettings();
-
-    const summary = document.createElement("div");
-    summary.className = "twrp-card-row";
-    summary.innerHTML =
-      createSummaryCard("Villages", state.villages.length) +
-      createSummaryCard("Target requests", planResult.targetPlans.length) +
-      createSummaryCard("Origin transfers", planResult.launches.length) +
-      createSummaryCard("Donors checked", planResult.donors.length) +
-      createSummaryCard("Mode", settings.useAmTemplates ? "AM" : "WH %") +
-      createSummaryCard("Reserve", escapeHtml(settings.reserveWarehousePercent) + "%") +
-      createSummaryCard("Arrival", escapeHtml(settings.arrivalBalanceWindowMinutes) + "m");
-
-    ui.results.appendChild(summary);
 
     if (!planResult.targetPlans.length) {
       const empty = document.createElement("div");
@@ -2158,10 +2272,6 @@
     installHoldEnterSendHandler();
     focusFirstSendButton();
 
-    const note = document.createElement("div");
-    note.className = "twrp-send-note";
-    note.textContent = "One Request button per target. Each click sends one grouped market request from all planned origins for that target. Hold Enter to continue through the list; the cooldown is 50ms after each successful request.";
-    ui.results.appendChild(note);
   }
 
   function renderDiagnostics(planResult) {
@@ -2287,7 +2397,6 @@
     lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
     lines.push("Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance"));
     lines.push("Origin reserve: " + settings.reserveWarehousePercent + "% of warehouse");
-    lines.push("Arrival balance window: " + settings.arrivalBalanceWindowMinutes + " minutes");
     lines.push("");
 
     state.plan.forEach(targetPlan => {
@@ -2536,35 +2645,6 @@
         border-color: #c99a9a;
       }
 
-      .twrp-card-row {
-        display: grid;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
-        gap: 8px;
-        margin: 10px 0;
-      }
-
-      .twrp-card {
-        background: #fff7e5;
-        border: 1px solid #d0ad6a;
-        border-radius: 8px;
-        padding: 9px;
-        min-height: 55px;
-      }
-
-      .twrp-card span {
-        display: block;
-        font-size: 10px;
-        text-transform: uppercase;
-        letter-spacing: 0.03em;
-        opacity: 0.7;
-        margin-bottom: 5px;
-      }
-
-      .twrp-card strong {
-        display: block;
-        font-size: 16px;
-        line-height: 1.2;
-      }
 
       .twrp-empty {
         padding: 12px;
@@ -2686,15 +2766,6 @@
         font-weight: bold;
       }
 
-      .twrp-send-note {
-        margin-top: 8px;
-        padding: 7px;
-        background: #fff7e5;
-        border: 1px dashed #d0ad6a;
-        border-radius: 7px;
-        font-size: 11px;
-        line-height: 1.35;
-      }
 
       .twrp-footer {
         display: flex;
@@ -2715,15 +2786,13 @@
           width: auto;
         }
 
-        .twrp-grid,
-        .twrp-card-row {
+        .twrp-grid {
           grid-template-columns: 1fr 1fr;
         }
       }
 
       @media (max-width: 560px) {
-        .twrp-grid,
-        .twrp-card-row {
+        .twrp-grid {
           grid-template-columns: 1fr;
         }
       }
@@ -2896,45 +2965,29 @@
     const body = document.createElement("div");
     body.className = "twrp-body";
 
-    const quickHelp = document.createElement("div");
-    quickHelp.className = "twrp-quick-help";
-    [
-      "One Request per target",
-      "AM construction or WH balance",
-      "Origin reserve protection",
-      "Farm-30 donor boost",
-      "Arrival balance",
-      "Enter-to-request with 50ms cooldown"
-    ].forEach(text => {
-      const pill = document.createElement("span");
-      pill.className = "twrp-pill";
-      pill.textContent = text;
-      quickHelp.appendChild(pill);
-    });
-
     const panel = document.createElement("div");
     panel.className = "twrp-panel";
 
     const grid = document.createElement("div");
     grid.className = "twrp-grid";
 
+    const initialSettings = state.savedSettings || normalizeSettings(DEFAULTS);
+
     const planMode = createSelect("Plan mode", [
       { value: "am", text: "AM construction" },
       { value: "warehouse", text: "Warehouse balance" }
-    ], DEFAULTS.useAmTemplates ? "am" : "warehouse");
-    const constructionHours = createInput("Build coverage", DEFAULTS.constructionHours);
-    const reserveMerchants = createInput("Reserve merchants", DEFAULTS.reserveMerchants);
-    const reserveWarehousePercent = createInput("Origin reserve", DEFAULTS.reserveWarehousePercent);
-    const maxDistance = createInput("Max distance", DEFAULTS.maxDistance);
-    const arrivalBalanceWindowMinutes = createInput("Arrival window", DEFAULTS.arrivalBalanceWindowMinutes);
-    const prioritizeLowPoints = createCheckbox("Low-point priority", DEFAULTS.prioritizeLowPoints);
+    ], initialSettings.useAmTemplates ? "am" : "warehouse");
+    const constructionHours = createInput("Build coverage", initialSettings.constructionHours);
+    const reserveMerchants = createInput("Reserve merchants", initialSettings.reserveMerchants);
+    const reserveWarehousePercent = createInput("Origin reserve", initialSettings.reserveWarehousePercent);
+    const maxDistance = createInput("Max distance", initialSettings.maxDistance);
+    const prioritizeLowPoints = createCheckbox("Low-point priority", initialSettings.prioritizeLowPoints);
 
     addHint(planMode.wrap, "AM template or WH %");
     addHint(constructionHours.wrap, "hours");
     addHint(reserveMerchants.wrap, "kept home");
     addHint(reserveWarehousePercent.wrap, "% warehouse");
     addHint(maxDistance.wrap, "0 = any");
-    addHint(arrivalBalanceWindowMinutes.wrap, "minutes");
     addHint(prioritizeLowPoints.wrap, "boost smaller villages");
 
     [
@@ -2943,7 +2996,6 @@
       reserveMerchants.wrap,
       reserveWarehousePercent.wrap,
       maxDistance.wrap,
-      arrivalBalanceWindowMinutes.wrap,
       prioritizeLowPoints.wrap
     ].forEach(node => grid.appendChild(node));
 
@@ -2988,7 +3040,6 @@
     footer.className = "twrp-footer";
     footer.textContent = "Created by Twactics";
 
-    body.appendChild(quickHelp);
     body.appendChild(panel);
     body.appendChild(status);
     body.appendChild(results);
@@ -3003,12 +3054,14 @@
     ui.reserveMerchants = reserveMerchants.input;
     ui.reserveWarehousePercent = reserveWarehousePercent.input;
     ui.maxDistance = maxDistance.input;
-    ui.arrivalBalanceWindowMinutes = arrivalBalanceWindowMinutes.input;
     ui.prioritizeLowPoints = prioritizeLowPoints.input;
     ui.planButton = planButton;
     ui.copyButton = copyButton;
     ui.status = status;
     ui.results = results;
+
+    installSettingsAutoSave();
+    persistSettings();
 
     makeDraggable(box, header);
   }
