@@ -12,10 +12,14 @@
  * - Reads building overview data
  * - Reads Account Manager construction template data when AM construction mode is selected
  * - Reads incoming transport data
- * - Counts incoming resources for target need calculations
+ * - Counts incoming resources for target need and 90% target warehouse safety calculations
  * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
+ * - Treats Build coverage as target queue time coverage, not only number of queued buildings
+ * - Caps warehouse safety per resource so one overflowing resource does not block other resources
+ * - Creates conservative relay replenishment requests after direct target requests
  * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
  * - Adds grouped plan diagnostics in the console for debugging and optimization
+ * - Shows visible incoming and warehouse audit data in copied plans and the Audit section
  * - Uses current origin resources only when planning requestable origin availability
  * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
  * - Allows one grouped manual request action per target row
@@ -36,7 +40,9 @@
  *     "reserveMerchants": 0,
  *     "reserveWarehousePercent": 8,
  *     "maxDistance": 0,
- *     "prioritizeLowPoints": true
+ *     "prioritizeLowPoints": true,
+ *     "enableRelayReplenishment": true,
+ *     "relaySafetyBufferMinutes": 30
  *   }
  * }
  */
@@ -65,7 +71,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.11";
+  const SCRIPT_VERSION = "1.7.21";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -80,7 +86,7 @@
     lowFarmBlockedReservePercent: 1,
     lowFarmFreePercent: 4,
     merchantCapacity: 1000,
-    minShipment: 700,
+    minShipment: 500,
     maxDistance: 0,
     emptyQueueBoost: 80,
     lowPointsBoost: 35,
@@ -97,7 +103,15 @@
     arrivalBalanceWindowMinutes: 30,
     baseMerchantMinutesPerField: 18,
     targetWarehouseLimitPercent: 90,
-    minResourcePerOrigin: 500
+    minResourcePerOrigin: 500,
+    dataRequestDelayMs: 350,
+    templateRequestDelayMs: 650,
+    fetchRetryDelayMs: 1200,
+    fetchMaxRetries: 2,
+    targetQueueCoverageBuildings: 4,
+    queueSoonRefillBuildingCount: 1,
+    enableRelayReplenishment: true,
+    relaySafetyBufferMinutes: 30
   };
 
   const BUILDING_NAMES = {
@@ -200,7 +214,9 @@
       reserveMerchants: Math.max(0, parseInt(source.reserveMerchants, 10) || DEFAULTS.reserveMerchants),
       reserveWarehousePercent: Math.max(0, Math.min(80, parseFloatSafe(source.reserveWarehousePercent, DEFAULTS.reserveWarehousePercent))),
       maxDistance: Math.max(0, parseFloatSafe(source.maxDistance, DEFAULTS.maxDistance)),
-      prioritizeLowPoints: source.prioritizeLowPoints !== false
+      prioritizeLowPoints: source.prioritizeLowPoints !== false,
+      enableRelayReplenishment: source.enableRelayReplenishment !== false,
+      relaySafetyBufferMinutes: Math.max(0, Math.min(360, parseFloatSafe(source.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes)))
     };
   }
 
@@ -340,6 +356,7 @@
     }
 
     Object.keys(params || {}).forEach(key => {
+      if (key.indexOf("__") === 0) return;
       if (params[key] !== undefined && params[key] !== null && params[key] !== "") {
         url.searchParams.set(key, String(params[key]));
       }
@@ -348,6 +365,8 @@
     if (
       currentGroup &&
       params &&
+      !params.__skipGroup &&
+      params.group === undefined &&
       (params.screen === "overview_villages" || params.screen === "am_village")
     ) {
       url.searchParams.set("group", currentGroup);
@@ -356,20 +375,81 @@
     return url.pathname + url.search;
   }
 
-  async function fetchText(url) {
-    const response = await fetch(url, {
-      method: "GET",
-      credentials: "same-origin",
-      headers: {
-        Accept: "text/html, */*; q=0.01"
-      }
-    });
+  function wait(ms) {
+    return new Promise(resolve => window.setTimeout(resolve, Math.max(0, ms || 0)));
+  }
 
-    if (!response.ok) {
-      throw new Error("HTTP " + response.status + " while loading " + url);
+  function getHttpStatusFromError(err) {
+    const message = err && err.message ? err.message : String(err || "");
+    const match = message.match(/HTTP\s+(\d+)/i);
+    return match ? parseInt(match[1], 10) : 0;
+  }
+
+  async function fetchText(url, options) {
+    const opts = Object.assign({
+      retries: DEFAULTS.fetchMaxRetries,
+      retryDelayMs: DEFAULTS.fetchRetryDelayMs,
+      label: ""
+    }, options || {});
+
+    let attempt = 0;
+    let lastError = null;
+
+    while (attempt <= opts.retries) {
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          credentials: "same-origin",
+          headers: {
+            Accept: "text/html, */*; q=0.01"
+          }
+        });
+
+        if (!response.ok) {
+          const error = new Error("HTTP " + response.status + " while loading " + url);
+          error.status = response.status;
+          throw error;
+        }
+
+        return response.text();
+      } catch (err) {
+        lastError = err;
+        const status = err && err.status ? err.status : getHttpStatusFromError(err);
+        const retryable = status === 429 || status === 502 || status === 503 || status === 504;
+
+        if (!retryable || attempt >= opts.retries) {
+          throw err;
+        }
+
+        const delay = Math.round((opts.retryDelayMs || DEFAULTS.fetchRetryDelayMs) * Math.pow(1.7, attempt));
+        console.warn(SCRIPT_NAME + " fetch retry " + (attempt + 1) + "/" + opts.retries, {
+          label: opts.label || "",
+          status: status,
+          delayMs: delay,
+          url: url
+        });
+        await wait(delay);
+        attempt++;
+      }
     }
 
-    return response.text();
+    throw lastError || new Error("Could not load " + url);
+  }
+
+  async function throttleDataRequest(label, delayMs) {
+    const delay = Math.max(0, delayMs === undefined ? DEFAULTS.dataRequestDelayMs : delayMs);
+    if (!state.debug) state.debug = {};
+    if (!state.debug.dataLoad) state.debug.dataLoad = [];
+
+    state.debug.dataLoad.push({
+      label: label || "data request",
+      delayMs: delay,
+      timestamp: new Date().toISOString()
+    });
+
+    if (delay > 0) {
+      await wait(delay);
+    }
   }
 
   function parseHtml(html) {
@@ -621,37 +701,374 @@
     return villages;
   }
 
-  async function loadIncomingData() {
-    const url = buildGameUrl({
-      screen: "overview_villages",
-      mode: "trader",
-      type: "inc",
-      page: "-1"
-    });
+  function buildVillageLookupContext(villages) {
+    const byId = new Map();
+    const coords = new Set();
 
-    const html = await fetchText(url);
-    const doc = parseHtml(html);
-    const rows = Array.from(doc.querySelectorAll("#trades_table tbody tr, #content_value .row_a, #content_value .row_b"));
-    const incoming = new Map();
-
-    rows.forEach(row => {
-      const resources = extractResourcesFromRow(row);
-      const coordMatches = cleanText(row.textContent).match(/\d{1,3}\|\d{1,3}/g) || [];
-      const coord = coordMatches[coordMatches.length - 1];
-
-      if (!coord) return;
-
-      if (!incoming.has(coord)) {
-        incoming.set(coord, emptyResources());
+    (villages || []).forEach(village => {
+      if (village && village.id !== undefined && village.id !== null) {
+        byId.set(String(village.id), village.coord);
       }
 
-      const current = incoming.get(coord);
-      current.wood += resources.wood;
-      current.stone += resources.stone;
-      current.iron += resources.iron;
+      if (village && village.coord) {
+        coords.add(village.coord);
+      }
     });
 
-    return incoming;
+    return {
+      byId: byId,
+      coords: coords
+    };
+  }
+
+  function getIncomingTargetHeaderIndex(doc) {
+    const table = doc.querySelector("#trades_table") || doc.querySelector("table.vis") || doc.querySelector("table");
+
+    if (!table) return -1;
+
+    const headerRows = Array.from(table.querySelectorAll("thead tr, tr")).slice(0, 4);
+    const targetPatterns = [
+      /target/i,
+      /destination/i,
+      /recipient/i,
+      /to village/i,
+      /target village/i,
+      /mottag/i,
+      /mål/i,
+      /ziel/i,
+      /destin/i,
+      /cible/i,
+      /destino/i
+    ];
+    const originPatterns = [/origin/i, /source/i, /from/i, /ursprung/i, /från/i, /von/i, /origen/i];
+
+    for (let r = 0; r < headerRows.length; r++) {
+      const cells = Array.from(headerRows[r].querySelectorAll("th, td"));
+
+      for (let i = 0; i < cells.length; i++) {
+        const text = cleanText(cells[i].textContent);
+        const links = Array.from(cells[i].querySelectorAll("a[href]")).map(link => link.getAttribute("href") || "").join(" ");
+
+        if (/order=target_village_name/i.test(links)) {
+          return i;
+        }
+
+        if (!text) continue;
+
+        const isOrigin = originPatterns.some(pattern => pattern.test(text)) || /order=start_village_name/i.test(links);
+        const isTarget = targetPatterns.some(pattern => pattern.test(text));
+
+        if (isTarget && !isOrigin) {
+          return i;
+        }
+
+        // English Tribal Wars trader overview labels the target column simply as "Village".
+        // The origin column is labeled "Origin", so a plain Village header is safe here.
+        if (/^village$/i.test(text) && !isOrigin) {
+          return i;
+        }
+      }
+    }
+
+    return -1;
+  }
+
+  function getCoordFromText(text) {
+    const matches = cleanText(text).match(/\d{1,3}\|\d{1,3}/g) || [];
+    return matches.length ? matches[matches.length - 1] : "";
+  }
+
+  function getKnownVillageCoordFromLink(link, lookup) {
+    if (!link || !lookup) return "";
+
+    const href = link.getAttribute("href") || "";
+
+    // In overview pages, links often include village=<current village id> even when the
+    // link points to a player or another screen. Do not use that value for transport rows.
+    if (/screen=info_village/i.test(href)) {
+      const id = getParam("id", href) || "";
+      if (id && lookup.byId.has(String(id))) {
+        return lookup.byId.get(String(id));
+      }
+
+      const coord = getCoordFromText(link.textContent || "");
+      if (coord) return coord;
+    }
+
+    if (/screen=overview/i.test(href)) {
+      const id = getParam("village", href) || "";
+      if (id && lookup.byId.has(String(id))) {
+        return lookup.byId.get(String(id));
+      }
+    }
+
+    return "";
+  }
+
+  function detectIncomingTargetCoord(row, headerIndex, lookup) {
+    const cells = Array.from(row.children || []);
+
+    if (headerIndex >= 0 && cells[headerIndex]) {
+      const headerCellCoord = getCoordFromText(cells[headerIndex].textContent);
+      if (headerCellCoord) {
+        return {
+          coord: headerCellCoord,
+          method: "target-header-cell"
+        };
+      }
+
+      const headerCellKnownLink = Array.from(cells[headerIndex].querySelectorAll("a[href]")).map(link => getKnownVillageCoordFromLink(link, lookup)).find(Boolean);
+      if (headerCellKnownLink) {
+        return {
+          coord: headerCellKnownLink,
+          method: "target-header-link"
+        };
+      }
+    }
+
+    // Fallback for the standard incoming trader table:
+    // checkbox, icon, sender, origin, target/village, arrival, arrives in, merchants, resources.
+    if (cells.length >= 9) {
+      const standardTargetCellCoord = getCoordFromText(cells[4].textContent);
+      if (standardTargetCellCoord) {
+        return {
+          coord: standardTargetCellCoord,
+          method: "standard-trader-target-cell"
+        };
+      }
+    }
+
+    const knownLinkCoords = Array.from(row.querySelectorAll("a[href]")).map(link => getKnownVillageCoordFromLink(link, lookup)).filter(Boolean);
+    const uniqueKnownLinkCoords = Array.from(new Set(knownLinkCoords));
+
+    if (uniqueKnownLinkCoords.length === 1) {
+      return {
+        coord: uniqueKnownLinkCoords[0],
+        method: "single-known-village-link"
+      };
+    }
+
+    const coordMatches = cleanText(row.textContent).match(/\d{1,3}\|\d{1,3}/g) || [];
+
+    if (coordMatches.length >= 2) {
+      return {
+        coord: coordMatches[coordMatches.length - 1],
+        method: uniqueKnownLinkCoords.length > 1 ? "last-coordinate-fallback-ambiguous-links" : "last-coordinate-fallback"
+      };
+    }
+
+    if (uniqueKnownLinkCoords.length) {
+      return {
+        coord: uniqueKnownLinkCoords[uniqueKnownLinkCoords.length - 1],
+        method: "last-known-village-link-fallback"
+      };
+    }
+
+    return {
+      coord: "",
+      method: "not-found"
+    };
+  }
+
+  function addIncomingToMap(incoming, coord, resources) {
+    if (!incoming.has(coord)) {
+      incoming.set(coord, emptyResources());
+    }
+
+    const current = incoming.get(coord);
+    current.wood += resources.wood || 0;
+    current.stone += resources.stone || 0;
+    current.iron += resources.iron || 0;
+  }
+
+  function summarizeIncomingMap(incoming) {
+    return Array.from(incoming.entries())
+      .map(([coord, resources]) => ({
+        coord: coord,
+        resources: cloneResources(resources),
+        total: totalResources(resources)
+      }))
+      .sort((a, b) => b.total - a.total);
+  }
+
+  function parseIncomingRows(doc, rows, lookup, url) {
+    const incoming = new Map();
+    const headerIndex = getIncomingTargetHeaderIndex(doc);
+    const diagnostics = {
+      url: url,
+      headerTargetIndex: headerIndex,
+      rowsSeen: rows.length,
+      rowsParsed: 0,
+      rowsSkippedNoResources: 0,
+      rowsSkippedNoTargetCoord: 0,
+      detectionMethods: {},
+      totals: emptyResources(),
+      ambiguousRows: [],
+      parsedSamples: [],
+      skippedSamples: [],
+      byCoord: []
+    };
+
+    rows.forEach((row, rowIndex) => {
+      const resources = extractResourcesFromRow(row);
+      const total = totalResources(resources);
+      const rowText = cleanText(row.textContent).slice(0, 240);
+
+      if (total <= 0) {
+        diagnostics.rowsSkippedNoResources += 1;
+        if (diagnostics.skippedSamples.length < 8) {
+          diagnostics.skippedSamples.push({ rowIndex: rowIndex, reason: "no resources", text: rowText });
+        }
+        return;
+      }
+
+      const detected = detectIncomingTargetCoord(row, headerIndex, lookup);
+      const coord = detected.coord;
+
+      diagnostics.detectionMethods[detected.method] = (diagnostics.detectionMethods[detected.method] || 0) + 1;
+
+      if (!coord) {
+        diagnostics.rowsSkippedNoTargetCoord += 1;
+        if (diagnostics.skippedSamples.length < 8) {
+          diagnostics.skippedSamples.push({ rowIndex: rowIndex, reason: "no target coord", resources: cloneResources(resources), text: rowText });
+        }
+        return;
+      }
+
+      if (diagnostics.parsedSamples.length < 12) {
+        diagnostics.parsedSamples.push({
+          rowIndex: rowIndex,
+          method: detected.method,
+          selectedCoord: coord,
+          resources: cloneResources(resources),
+          text: rowText
+        });
+      }
+
+      if (/ambiguous|fallback/.test(detected.method) && diagnostics.ambiguousRows.length < 20) {
+        diagnostics.ambiguousRows.push({
+          rowIndex: rowIndex,
+          method: detected.method,
+          selectedCoord: coord,
+          resources: cloneResources(resources),
+          text: rowText
+        });
+      }
+
+      addIncomingToMap(incoming, coord, resources);
+      addResources(diagnostics.totals, resources);
+      diagnostics.rowsParsed += 1;
+    });
+
+    diagnostics.byCoord = summarizeIncomingMap(incoming);
+
+    return {
+      incoming: incoming,
+      diagnostics: diagnostics
+    };
+  }
+
+  async function loadIncomingData(villages) {
+    const lookup = buildVillageLookupContext(villages);
+    const incomingUrlSpecs = [
+      {
+        label: "incoming-group-0-all-pages",
+        screen: "overview_villages",
+        mode: "trader",
+        type: "inc",
+        group: "0",
+        page: "-1",
+        __skipGroup: true
+      },
+      {
+        label: "incoming-group-0-page-0-debug",
+        screen: "overview_villages",
+        mode: "trader",
+        type: "inc",
+        group: "0",
+        page: "0",
+        __skipGroup: true,
+        __debugOnly: true
+      },
+      {
+        label: "incoming-without-group-debug",
+        screen: "overview_villages",
+        mode: "trader",
+        type: "inc",
+        page: "-1",
+        __skipGroup: true,
+        __debugOnly: true
+      },
+      {
+        label: "all-transports-group-0-debug-only",
+        screen: "overview_villages",
+        mode: "trader",
+        type: "all",
+        group: "0",
+        page: "-1",
+        __skipGroup: true,
+        __debugOnly: true
+      }
+    ];
+
+    const attempts = [];
+    let selected = null;
+
+    for (let i = 0; i < incomingUrlSpecs.length; i++) {
+      const spec = incomingUrlSpecs[i];
+      const url = buildGameUrl(spec);
+
+      try {
+        const html = await fetchText(url);
+        const doc = parseHtml(html);
+        const rows = Array.from(doc.querySelectorAll("#trades_table tbody tr.row_a, #trades_table tbody tr.row_b, #trades_table tbody tr"));
+        const parsed = parseIncomingRows(doc, rows, lookup, url);
+        parsed.diagnostics.label = spec.label || "incoming";
+        parsed.diagnostics.debugOnly = Boolean(spec.__debugOnly);
+        attempts.push(parsed.diagnostics);
+
+        if (!spec.__debugOnly && (!selected || parsed.diagnostics.rowsParsed > selected.diagnostics.rowsParsed)) {
+          selected = parsed;
+        }
+      } catch (err) {
+        attempts.push({
+          label: spec.label || "incoming",
+          url: url,
+          debugOnly: Boolean(spec.__debugOnly),
+          error: err && err.message ? err.message : String(err),
+          rowsSeen: 0,
+          rowsParsed: 0
+        });
+      }
+    }
+
+    if (!selected) {
+      selected = {
+        incoming: new Map(),
+        diagnostics: {
+          rowsSeen: 0,
+          rowsParsed: 0,
+          totals: emptyResources(),
+          byCoord: []
+        }
+      };
+    }
+
+    if (!state.debug) state.debug = {};
+    state.debug.incomingTransportLoad = {
+      selectedUrl: selected.diagnostics.url || "",
+      selectedLabel: selected.diagnostics.label || "",
+      attempts: attempts,
+      selected: selected.diagnostics
+    };
+
+    console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION);
+    console.log("Selected incoming parser result", selected.diagnostics);
+    console.log("Incoming parser attempts", attempts);
+    console.log("Incoming by target coord", selected.diagnostics.byCoord || []);
+    console.groupEnd();
+
+    return selected.incoming;
   }
 
   async function loadBuildingsData() {
@@ -748,7 +1165,7 @@
     let html;
 
     try {
-      html = await fetchText(mainUrl);
+      html = await fetchText(mainUrl, { label: "Account Manager village overview" });
     } catch (err) {
       console.warn(SCRIPT_NAME + " could not load Account Manager data:", err);
       return result;
@@ -778,13 +1195,14 @@
     });
 
     const options = Array.from(doc.querySelectorAll('select[name="template"] option'));
-    const templateFetches = [];
+    const templateQueue = [];
+    const seenTemplateIds = new Set();
 
     options.forEach(option => {
       const optionName = normalizeTemplateName(option.textContent);
       const templateId = option.value;
 
-      if (!optionName || !templateId) return;
+      if (!optionName || !templateId || seenTemplateIds.has(String(templateId))) return;
 
       const matchesAssigned = Array.from(assignedTemplateNames).some(name => {
         return name === optionName || optionName.includes(name) || name.includes(optionName);
@@ -792,13 +1210,41 @@
 
       if (!matchesAssigned) return;
 
-      templateFetches.push(loadTemplateDefinition(templateId, optionName));
+      seenTemplateIds.add(String(templateId));
+      templateQueue.push({
+        id: templateId,
+        name: optionName
+      });
     });
 
-    const templateDefs = await Promise.all(templateFetches);
+    if (!state.debug) state.debug = {};
+    state.debug.amTemplateLoad = {
+      assignedTemplates: Array.from(assignedTemplateNames),
+      queuedTemplates: templateQueue.map(item => ({ id: item.id, name: item.name })),
+      loadedTemplates: [],
+      failedTemplates: [],
+      delayMs: DEFAULTS.templateRequestDelayMs
+    };
 
-    templateDefs.forEach(def => {
-      if (!def || !def.name) return;
+    for (let i = 0; i < templateQueue.length; i++) {
+      const item = templateQueue[i];
+      setStatus("Loading AM template " + (i + 1) + "/" + templateQueue.length + ": " + item.name + "...", "warn");
+
+      await throttleDataRequest("AM template delay before " + item.name, DEFAULTS.templateRequestDelayMs);
+
+      const def = await loadTemplateDefinition(item.id, item.name);
+
+      if (!def || !def.name) {
+        state.debug.amTemplateLoad.failedTemplates.push({ id: item.id, name: item.name });
+        continue;
+      }
+
+      state.debug.amTemplateLoad.loadedTemplates.push({
+        id: item.id,
+        name: def.name,
+        buildings: def.buildings ? def.buildings.length : 0
+      });
+
       result.templateDefsByName.set(def.name, def);
 
       Array.from(assignedTemplateNames).forEach(assignedName => {
@@ -806,7 +1252,7 @@
           result.templateDefsByName.set(assignedName, def);
         }
       });
-    });
+    }
 
     return result;
   }
@@ -819,7 +1265,7 @@
     });
 
     try {
-      const html = await fetchText(url);
+      const html = await fetchText(url, { label: "AM template " + templateName, retries: DEFAULTS.fetchMaxRetries, retryDelayMs: DEFAULTS.fetchRetryDelayMs });
       const doc = parseHtml(html);
       const buildings = [];
 
@@ -1168,6 +1614,9 @@
     const reserveWarehousePercent = Math.max(0, Math.min(80, parseFloatSafe(ui.reserveWarehousePercent.value, DEFAULTS.reserveWarehousePercent)));
     const arrivalBalanceWindowMinutes = DEFAULTS.arrivalBalanceWindowMinutes;
     const prioritizeLowPoints = ui.prioritizeLowPoints.checked;
+    const savedSettings = state.savedSettings || {};
+    const enableRelayReplenishment = savedSettings.enableRelayReplenishment !== undefined ? savedSettings.enableRelayReplenishment !== false : DEFAULTS.enableRelayReplenishment;
+    const relaySafetyBufferMinutes = savedSettings.relaySafetyBufferMinutes !== undefined ? Math.max(0, Math.min(360, parseFloatSafe(savedSettings.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes))) : DEFAULTS.relaySafetyBufferMinutes;
 
     return {
       useAmTemplates: useAmTemplates,
@@ -1184,6 +1633,8 @@
       merchantMinutesPerField: getMerchantMinutesPerField(),
       targetWarehouseLimitPercent: DEFAULTS.targetWarehouseLimitPercent,
       minResourcePerOrigin: DEFAULTS.minResourcePerOrigin,
+      targetQueueCoverageBuildings: DEFAULTS.targetQueueCoverageBuildings,
+      queueSoonRefillBuildingCount: DEFAULTS.queueSoonRefillBuildingCount,
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
@@ -1198,7 +1649,9 @@
       protectDonorConstruction: useAmTemplates,
       includeAverageBalance: false,
       prioritizeNoTemplateDonors: useAmTemplates,
-      prioritizeLowPoints: prioritizeLowPoints
+      prioritizeLowPoints: prioritizeLowPoints,
+      enableRelayReplenishment: enableRelayReplenishment,
+      relaySafetyBufferMinutes: relaySafetyBufferMinutes
     };
   }
 
@@ -1225,15 +1678,35 @@
         templateDefsByName: new Map()
       };
 
-      const results = await Promise.all([
-        loadProductionData(),
-        loadBuildingsData(),
-        loadIncomingData(),
-        settings.useAmTemplates ? loadAccountManagerData() : Promise.resolve(emptyAmData),
-        settings.useAmTemplates ? loadBuildingConstants() : Promise.resolve(new Map())
-      ]);
+      state.debug = {
+        dataLoad: []
+      };
 
-      mergeLoadedData(results[0], results[1], results[2], results[3], results[4], settings);
+      setStatus("Loading production data: resources, warehouse capacity and merchants...", "warn");
+      const productionData = await loadProductionData();
+      await throttleDataRequest("after production data");
+
+      setStatus("Loading building queues...", "warn");
+      const buildingsData = await loadBuildingsData();
+      await throttleDataRequest("after building queues");
+
+      setStatus("Loading incoming transports from group 0...", "warn");
+      const incomingData = await loadIncomingData(productionData);
+
+      let buildingConstants = new Map();
+      let amData = emptyAmData;
+
+      if (settings.useAmTemplates) {
+        await throttleDataRequest("before building constants");
+        setStatus("Loading building cost data...", "warn");
+        buildingConstants = await loadBuildingConstants();
+
+        await throttleDataRequest("before Account Manager templates");
+        setStatus("Loading Account Manager templates sequentially...", "warn");
+        amData = await loadAccountManagerData();
+      }
+
+      mergeLoadedData(productionData, buildingsData, incomingData, amData, buildingConstants, settings);
 
       const planResult = createTransferPlan(settings);
       state.plan = planResult.targetPlans;
@@ -1258,17 +1731,31 @@
   }
 
   function createTransferPlan(settings) {
+    const previousDebug = state.debug || {};
     state.debug = {
+      incomingTransportLoad: previousDebug.incomingTransportLoad || null,
+      dataLoad: previousDebug.dataLoad || [],
+      amTemplateLoad: previousDebug.amTemplateLoad || null,
       cappedTargets: [],
       skippedSmallShipments: [],
-      rejectedTinyResourceFragments: []
+      rejectedTinyResourceFragments: [],
+      relayCandidates: [],
+      relayAccepted: [],
+      relayRejected: []
     };
 
     const villages = state.villages.slice();
     const stats = calculateGlobalStats(villages);
     const targets = buildTargets(villages, stats, settings);
+    targets.forEach((target, index) => {
+      target.planningOrder = index + 1;
+    });
     const donors = buildDonors(villages, stats, settings);
-    const launches = matchDonorsToTargets(targets, donors, settings);
+    const directLaunches = matchDonorsToTargets(targets, donors, settings);
+    const relayLaunches = settings.enableRelayReplenishment
+      ? buildRelayReplenishmentLaunches(directLaunches, targets, donors, settings, directLaunches.length + 1)
+      : [];
+    const launches = directLaunches.concat(relayLaunches);
     const targetPlans = groupLaunchesByTarget(launches, settings);
     const donorAudit = buildDonorAudit(donors, targets, launches, settings);
 
@@ -1351,17 +1838,40 @@
     };
   }
 
+  function getTargetCurrentOverWarehouseLimit(village, settings) {
+    const limit = getTargetWarehouseLimit(village, settings);
+
+    if (limit === null) {
+      return null;
+    }
+
+    const current = getCurrentResourcesWithIncoming(village);
+
+    return {
+      wood: current.wood > limit,
+      stone: current.stone > limit,
+      iron: current.iron > limit
+    };
+  }
+
+  function hasAnyWarehouseLimitOverflow(over) {
+    return Boolean(over && (over.wood || over.stone || over.iron));
+  }
+
   function capNeedToTargetWarehouse(village, need, settings) {
     const space = getTargetWarehouseSpace(village, settings);
     const capped = cloneResources(need || emptyResources());
     const reduced = emptyResources();
+    const currentOverLimit = getTargetCurrentOverWarehouseLimit(village, settings);
 
     if (!space) {
       return {
         need: capped,
         reduced: reduced,
         limited: false,
-        space: null
+        space: null,
+        currentOverLimit: currentOverLimit,
+        blockedByCurrentOverLimit: false
       };
     }
 
@@ -1375,8 +1885,123 @@
       need: capped,
       reduced: reduced,
       limited: totalResources(reduced) > 0,
-      space: space
+      space: space,
+      currentOverLimit: currentOverLimit,
+      blockedByCurrentOverLimit: false
     };
+  }
+
+  function sumNeedDetails(details, limit) {
+    const need = emptyResources();
+    const selected = [];
+    const maxItems = Math.max(0, limit || 0);
+
+    (details || []).forEach(detail => {
+      if (selected.length >= maxItems) return;
+      const resources = detail && detail.resources ? detail.resources : emptyResources();
+      if (totalResources(resources) <= 0) return;
+      addResources(need, resources);
+      selected.push(detail);
+    });
+
+    return {
+      resources: need,
+      details: selected,
+      count: selected.length
+    };
+  }
+
+  function getTargetQueueCoverage(village, settings) {
+    const currentQueueCount = Math.max(0, village.queueCount || 0);
+    const currentQueueHours = (village.queueEndSeconds || 0) / 3600;
+    const targetQueueHours = Math.max(0, settings.constructionHours || DEFAULTS.constructionHours);
+    const horizonSeconds = targetQueueHours * 3600;
+    const details = village.ownNeedDetails || [];
+    const resources = emptyResources();
+    const selected = [];
+    let simulatedSeconds = Math.max(0, village.queueEndSeconds || 0);
+
+    details.forEach(detail => {
+      if (horizonSeconds <= 0 || simulatedSeconds >= horizonSeconds) return;
+      const detailResources = detail && detail.resources ? detail.resources : emptyResources();
+      if (totalResources(detailResources) <= 0) return;
+
+      addResources(resources, detailResources);
+      selected.push(detail);
+      simulatedSeconds += Math.max(0, detail.seconds || 0);
+    });
+
+    const simulatedQueueHours = simulatedSeconds / 3600;
+
+    return {
+      currentQueueCount: currentQueueCount,
+      targetQueueCount: targetQueueHours,
+      targetQueueHours: targetQueueHours,
+      currentQueueHours: currentQueueHours,
+      queueHours: currentQueueHours,
+      missingQueueHours: Math.max(0, targetQueueHours - currentQueueHours),
+      wantedBuilds: selected.length,
+      plannedBuilds: selected.length,
+      details: selected,
+      resources: resources,
+      simulatedQueueHours: simulatedQueueHours,
+      mode: selected.length > 0 ? "time coverage" : "already covered"
+    };
+  }
+
+  function formatQueueCoverage(queueCoverage) {
+    if (!queueCoverage) return "";
+
+    const current = Number.isFinite(queueCoverage.currentQueueHours) ? queueCoverage.currentQueueHours : 0;
+    const target = Number.isFinite(queueCoverage.targetQueueHours) ? queueCoverage.targetQueueHours : DEFAULTS.constructionHours;
+    const simulated = Number.isFinite(queueCoverage.simulatedQueueHours) ? queueCoverage.simulatedQueueHours : current;
+    const builds = queueCoverage.plannedBuilds || 0;
+
+    if (builds > 0) {
+      return current.toFixed(1) + "h -> " + Math.min(simulated, Math.max(target, current)).toFixed(1) + "h, +" + builds + " build(s)";
+    }
+
+    return current.toFixed(1) + "h / " + target.toFixed(1) + "h";
+  }
+
+  function getTargetPriorityTier(target, settings) {
+    if (!settings.useAmTemplates) return 50;
+
+    const queueHours = Math.max(0, target.queueHours || 0);
+    const horizonHours = Math.max(1, settings.constructionHours || DEFAULTS.constructionHours);
+
+    if (target.queueEmpty) return 0;
+    if (queueHours <= 1) return 1;
+    if (queueHours <= Math.min(3, horizonHours)) return 2;
+    if (queueHours < horizonHours) return 3;
+    return 4;
+  }
+
+  function sortTargetsForPlanning(a, b, settings) {
+    if (!settings.useAmTemplates) {
+      const scoreDiff = b.score - a.score;
+      if (scoreDiff) return scoreDiff;
+      return b.totalNeed - a.totalNeed;
+    }
+
+    const tierDiff = (a.priorityTier || 0) - (b.priorityTier || 0);
+    if (tierDiff) return tierDiff;
+
+    const queueDiff = (a.queueHours || 0) - (b.queueHours || 0);
+    if (Math.abs(queueDiff) > 0.05) return queueDiff;
+
+    if (settings.prioritizeLowPoints) {
+      const pointDiff = (a.village.points || 0) - (b.village.points || 0);
+      if (pointDiff) return pointDiff;
+    }
+
+    const missingHourDiff = (b.queueCoverage && b.queueCoverage.missingQueueHours || 0) - (a.queueCoverage && a.queueCoverage.missingQueueHours || 0);
+    if (Math.abs(missingHourDiff) > 0.05) return missingHourDiff;
+
+    const plannedBuildDiff = (b.queueCoverage && b.queueCoverage.plannedBuilds || 0) - (a.queueCoverage && a.queueCoverage.plannedBuilds || 0);
+    if (plannedBuildDiff) return plannedBuildDiff;
+
+    return b.totalNeed - a.totalNeed;
   }
 
   function buildTargets(villages, stats, settings) {
@@ -1400,8 +2025,11 @@
       let need = emptyResources();
       let score = 0;
 
+      let queueCoverage = null;
+
       if (settings.useAmTemplates) {
-        constructionNeed = cloneResources(village.ownNeed || emptyResources());
+        queueCoverage = getTargetQueueCoverage(village, settings);
+        constructionNeed = cloneResources(queueCoverage.resources || emptyResources());
         need = {
           wood: Math.max(0, constructionNeed.wood - current.wood),
           stone: Math.max(0, constructionNeed.stone - current.stone),
@@ -1429,12 +2057,17 @@
           currentWithIncoming: getCurrentResourcesWithIncoming(village),
           remainingSafeSpace: cloneResources(warehouseCap.space || emptyResources()),
           reduced: cloneResources(warehouseCap.reduced || emptyResources()),
-          cappedNeed: cloneResources(need)
+          cappedNeed: cloneResources(need),
+          currentOverLimit: warehouseCap.currentOverLimit || null
         });
       }
 
       if (settings.useAmTemplates) {
+        const queueCoverageMissingHours = queueCoverage ? Math.max(0, queueCoverage.missingQueueHours || 0) : 0;
+        const queueCoverageBuilds = queueCoverage ? Math.max(0, queueCoverage.plannedBuilds || 0) : 0;
         score = totalResources(need) / 1000;
+        score += queueCoverageMissingHours * 35;
+        score += queueCoverageBuilds * 12;
 
         if (hasTemplate) {
           score += 10;
@@ -1445,17 +2078,11 @@
         }
 
         if (hasTemplate) {
-          score += queueSoon * 30;
+          score += queueSoon * 20;
         }
-
-        score += lowPointRatio * settings.lowPointsBoost;
 
         if (!hasTemplateData && hasTemplate) {
           score *= 0.35;
-        }
-
-        if (settings.priorityMode === "construction_first") {
-          score += totalResources(need) / 700;
         }
       } else {
         score = totalResources(need) / 1000;
@@ -1463,8 +2090,7 @@
       }
 
       const totalNeed = totalResources(need);
-
-      return {
+      const targetDraft = {
         village: village,
         need: need,
         initialNeed: cloneResources(need),
@@ -1480,15 +2106,19 @@
         hasTemplateData: hasTemplateData,
         queueEmpty: queueEmpty,
         queueHours: queueHours,
+        queueCoverage: queueCoverage,
         lowPointRatio: lowPointRatio,
-        reason: buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap)
+        reason: buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap, queueCoverage)
       };
+
+      targetDraft.priorityTier = getTargetPriorityTier(targetDraft, settings);
+      return targetDraft;
     })
-      .filter(target => target.totalNeed >= settings.minShipment || (settings.useAmTemplates && target.totalNeed > 0 && target.score > settings.emptyQueueBoost))
-      .sort((a, b) => b.score - a.score);
+      .filter(target => target.totalNeed >= settings.minShipment || (settings.useAmTemplates && target.totalNeed > 0))
+      .sort((a, b) => sortTargetsForPlanning(a, b, settings));
   }
 
-  function buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap) {
+  function buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap, queueCoverage) {
     const reasons = [];
 
     if (!settings.useAmTemplates) {
@@ -1504,12 +2134,19 @@
       reasons.push("AM template active");
     }
 
+    if (settings.useAmTemplates && queueCoverage && queueCoverage.wantedBuilds > 0) {
+      reasons.push("build coverage " + formatQueueCoverage(queueCoverage));
+    }
+
     if (lowPointRatio > 0.5 && settings.prioritizeLowPoints) {
       reasons.push("lower points");
     }
 
     if (warehouseCap && warehouseCap.limited) {
-      reasons.push("90% target warehouse safety limit reduced by " + formatNumber(totalResources(warehouseCap.reduced)));
+      const overLimitText = warehouseCap.currentOverLimit && hasAnyWarehouseLimitOverflow(warehouseCap.currentOverLimit)
+        ? " (resource-specific cap; already over: " + formatWarehouseOverResources(warehouseCap.currentOverLimit) + ")"
+        : "";
+      reasons.push("90% target warehouse safety limit reduced by " + formatNumber(totalResources(warehouseCap.reduced)) + overLimitText);
     }
 
     if (totalNeed > 0) {
@@ -1920,6 +2557,9 @@
           travelMinutes: match.travelMinutes,
           arrivalBucket: match.arrivalBucket,
           targetScore: target.score,
+          targetOrder: target.planningOrder || 999999,
+          targetPriorityTier: target.priorityTier,
+          targetQueueCoverage: target.queueCoverage || null,
           donorScore: match.score,
           targetReason: target.reason,
           donorReason: donor.reason
@@ -1930,11 +2570,256 @@
     return launches;
   }
 
+
+  function buildRelayReplenishmentLaunches(directLaunches, targets, donors, settings, startId) {
+    const relayLaunches = [];
+    let launchId = Math.max(1, startId || 1);
+
+    const activeTargetIds = new Set((targets || [])
+      .filter(target => totalResources(target.need || emptyResources()) > 0)
+      .map(target => String(target.village.id)));
+
+    const outgoingByOrigin = new Map();
+    (directLaunches || []).forEach(launch => {
+      if (!launch || launch.isRelay || !launch.origin || !launch.resources) return;
+      const key = String(launch.origin.id);
+      const current = outgoingByOrigin.get(key) || {
+        village: launch.origin,
+        resources: emptyResources(),
+        total: 0,
+        launches: 0,
+        targetNames: [],
+        minDirectTravelMinutes: Infinity,
+        maxDirectTravelMinutes: 0
+      };
+
+      addResources(current.resources, launch.resources);
+      current.total += totalResources(launch.resources || emptyResources());
+      current.launches += 1;
+      if (launch.target && launch.target.name) current.targetNames.push(launch.target.name);
+      if (launch.travelMinutes !== undefined) {
+        current.minDirectTravelMinutes = Math.min(current.minDirectTravelMinutes, launch.travelMinutes || 0);
+        current.maxDirectTravelMinutes = Math.max(current.maxDirectTravelMinutes, launch.travelMinutes || 0);
+      }
+      outgoingByOrigin.set(key, current);
+    });
+
+    const middlemanIds = new Set(Array.from(outgoingByOrigin.keys()));
+    const directOriginIds = new Set(Array.from(outgoingByOrigin.keys()));
+    const donorById = new Map((donors || []).map(donor => [String(donor.village.id), donor]));
+    const relaySafetyBufferMinutes = Math.max(0, settings.relaySafetyBufferMinutes !== undefined ? settings.relaySafetyBufferMinutes : DEFAULTS.relaySafetyBufferMinutes);
+
+    outgoingByOrigin.forEach(outgoing => {
+      const middleman = outgoing.village;
+      const middlemanId = String(middleman.id);
+      const queueSeconds = Math.max(0, middleman.queueEndSeconds || 0);
+      const queueHours = queueSeconds / 3600;
+      const candidateBase = {
+        middleman: middleman.coord,
+        middlemanId: middleman.id,
+        name: middleman.name,
+        outgoing: cloneResources(outgoing.resources),
+        outgoingTotal: outgoing.total,
+        queueHours: queueHours,
+        targets: outgoing.targetNames.slice(0, 5)
+      };
+
+      if (state.debug && state.debug.relayCandidates) {
+        state.debug.relayCandidates.push(Object.assign({}, candidateBase));
+      }
+
+      if (outgoing.total < settings.minShipment || !hasResourceAtLeast(outgoing.resources, settings.minResourcePerOrigin)) {
+        pushRelayRejected(candidateBase, "outgoing below relay minimum");
+        return;
+      }
+
+      if (activeTargetIds.has(middlemanId)) {
+        pushRelayRejected(candidateBase, "middleman is an active resource target");
+        return;
+      }
+
+      if (queueSeconds <= 0) {
+        pushRelayRejected(candidateBase, "middleman has no active construction queue");
+        return;
+      }
+
+      const relaySpace = getRelayWarehouseSpaceAfterOutgoing(middleman, outgoing.resources, settings);
+      let relayNeed = capResourcesToSpace(outgoing.resources, relaySpace);
+      relayNeed = cleanSmallResourceAmounts(relayNeed, settings.minResourcePerOrigin).resources;
+
+      if (totalResources(relayNeed) < settings.minShipment || !hasResourceAtLeast(relayNeed, settings.minResourcePerOrigin)) {
+        pushRelayRejected(Object.assign({}, candidateBase, { relaySpace: cloneResources(relaySpace), relayNeed: cloneResources(relayNeed) }), "no safe relay space after outgoing resources");
+        return;
+      }
+
+      const relayTarget = {
+        village: middleman,
+        initialNeed: cloneResources(relayNeed),
+        arrivalBuckets: new Map()
+      };
+
+      let safety = 0;
+      while (totalResources(relayNeed) >= settings.minShipment && safety < 80) {
+        safety += 1;
+
+        const matches = (donors || [])
+          .filter(donor => {
+            if (!donor || !donor.village) return false;
+            const donorId = String(donor.village.id);
+            if (donorId === middlemanId) return false;
+            if (middlemanIds.has(donorId)) return false;
+            if (activeTargetIds.has(donorId)) return false;
+            if (donor.merchantsAvailable <= 0) return false;
+            if (totalResources(donor.available || emptyResources()) < settings.minShipment) return false;
+
+            const matching = getMatchingResources(donor.available || emptyResources(), relayNeed);
+            if (!hasResourceAtLeast(matching, settings.minResourcePerOrigin)) return false;
+
+            const distance = getDistance(donor.village.coord, middleman.coord);
+            if (settings.maxDistance > 0 && distance > settings.maxDistance) return false;
+
+            const travelMinutes = getTravelMinutes(distance, settings);
+            if (queueSeconds < ((travelMinutes + relaySafetyBufferMinutes) * 60)) return false;
+
+            return true;
+          })
+          .map(donor => {
+            const distance = getDistance(donor.village.coord, middleman.coord);
+            const travelMinutes = getTravelMinutes(distance, settings);
+            const arrivalBucket = getArrivalBucketIndex(travelMinutes, settings);
+            const matching = getMatchingResources(donor.available || emptyResources(), relayNeed);
+            const directOriginPenalty = directOriginIds.has(String(donor.village.id)) ? 500 : 0;
+            return {
+              donor: donor,
+              distance: distance,
+              travelMinutes: travelMinutes,
+              arrivalBucket: arrivalBucket,
+              matching: matching,
+              score: donor.baseScore - distance * settings.donorDistancePenalty - directOriginPenalty + Math.min(totalResources(matching), settings.merchantCapacity * 10) / 1000
+            };
+          })
+          .sort((a, b) => sortDonorMatches(a, b, settings));
+
+        if (!matches.length) {
+          pushRelayRejected(Object.assign({}, candidateBase, { relayNeedRemaining: cloneResources(relayNeed), relaySpace: cloneResources(relaySpace) }), "no eligible relay refill donor with enough queue buffer");
+          break;
+        }
+
+        const match = matches[0];
+        const donor = match.donor;
+        const shipment = createShipment(donor, relayTarget, relayNeed, settings, match);
+
+        if (totalResources(shipment.resources) < settings.minShipment || !hasResourceAtLeast(shipment.resources, settings.minResourcePerOrigin)) {
+          if (!donor.blockedTargetIds) donor.blockedTargetIds = new Set();
+          donor.blockedTargetIds.add("relay:" + middlemanId);
+          pushRelayRejected(Object.assign({}, candidateBase, {
+            donor: donor.village.coord,
+            attempted: cloneResources(shipment.attemptedResources || emptyResources()),
+            kept: cloneResources(shipment.resources || emptyResources())
+          }), "relay shipment below minimum after small-fragment filter");
+          continue;
+        }
+
+        subtractResources(donor.available, shipment.resources);
+        subtractResources(relayNeed, shipment.resources);
+        addResourcesToArrivalBucket(relayTarget, match.arrivalBucket, shipment.resources);
+        donor.merchantsAvailable = Math.max(0, donor.merchantsAvailable - shipment.merchantsUsed);
+        donor.totalAvailable = Math.min(totalResources(donor.available), donor.merchantsAvailable * settings.merchantCapacity);
+        donor.usedTotal += totalResources(shipment.resources);
+        donor.usedTransfers += 1;
+
+        const relayLaunch = {
+          id: launchId++,
+          origin: donor.village,
+          target: middleman,
+          resources: shipment.resources,
+          total: totalResources(shipment.resources),
+          merchantsUsed: shipment.merchantsUsed,
+          distance: match.distance,
+          travelMinutes: match.travelMinutes,
+          arrivalBucket: match.arrivalBucket,
+          targetScore: 0,
+          targetOrder: 100000 + relayLaunches.length,
+          targetPriorityTier: 90,
+          targetQueueCoverage: null,
+          donorScore: match.score,
+          targetReason: "Relay refill after this village sent resources onward; queue buffer " + formatTravelMinutes(queueSeconds / 60) + ", refill arrives in ~" + formatTravelMinutes(match.travelMinutes) + " + " + relaySafetyBufferMinutes + "m safety",
+          donorReason: donor.reason,
+          isRelay: true,
+          relayMiddleman: middleman.coord,
+          relayOutgoingOffset: cloneResources(outgoing.resources),
+          relayOriginalTargets: outgoing.targetNames.slice(0, 8)
+        };
+
+        relayLaunches.push(relayLaunch);
+
+        if (state.debug && state.debug.relayAccepted) {
+          state.debug.relayAccepted.push({
+            middleman: middleman.coord,
+            middlemanId: middleman.id,
+            origin: donor.village.coord,
+            originId: donor.village.id,
+            resources: cloneResources(shipment.resources),
+            total: relayLaunch.total,
+            travelMinutes: Math.round(match.travelMinutes),
+            queueHours: Math.round(queueHours * 10) / 10,
+            safetyBufferMinutes: relaySafetyBufferMinutes,
+            remainingRelayNeed: cloneResources(relayNeed)
+          });
+        }
+      }
+    });
+
+    return relayLaunches;
+  }
+
+  function pushRelayRejected(candidate, reason) {
+    if (!state.debug || !state.debug.relayRejected) return;
+    state.debug.relayRejected.push(Object.assign({}, candidate || {}, { reason: reason }));
+  }
+
+  function getMatchingResources(available, need) {
+    return {
+      wood: Math.min(Math.max(0, available && available.wood || 0), Math.max(0, need && need.wood || 0)),
+      stone: Math.min(Math.max(0, available && available.stone || 0), Math.max(0, need && need.stone || 0)),
+      iron: Math.min(Math.max(0, available && available.iron || 0), Math.max(0, need && need.iron || 0))
+    };
+  }
+
+  function capResourcesToSpace(resources, space) {
+    const src = resources || emptyResources();
+    const targetSpace = space || emptyResources();
+    return {
+      wood: Math.max(0, Math.min(src.wood || 0, targetSpace.wood || 0)),
+      stone: Math.max(0, Math.min(src.stone || 0, targetSpace.stone || 0)),
+      iron: Math.max(0, Math.min(src.iron || 0, targetSpace.iron || 0))
+    };
+  }
+
+  function getRelayWarehouseSpaceAfterOutgoing(village, outgoingResources, settings) {
+    const limit = getTargetWarehouseLimit(village, settings);
+    if (limit === null) {
+      return {
+        wood: Number.MAX_SAFE_INTEGER,
+        stone: Number.MAX_SAFE_INTEGER,
+        iron: Number.MAX_SAFE_INTEGER
+      };
+    }
+
+    const current = getCurrentResourcesWithIncoming(village);
+    const outgoing = outgoingResources || emptyResources();
+    return {
+      wood: Math.max(0, limit - Math.max(0, current.wood - (outgoing.wood || 0))),
+      stone: Math.max(0, limit - Math.max(0, current.stone - (outgoing.stone || 0))),
+      iron: Math.max(0, limit - Math.max(0, current.iron - (outgoing.iron || 0)))
+    };
+  }
+
   function groupLaunchesByTarget(launches, settings) {
     const map = new Map();
 
     launches.forEach(launch => {
-      const key = String(launch.target.id);
+      const key = (launch.isRelay ? "relay:" : "direct:") + String(launch.target.id);
 
       if (!map.has(key)) {
         map.set(key, {
@@ -1945,11 +2830,28 @@
           total: 0,
           merchantsUsed: 0,
           maxDistance: 0,
-          targetReason: launch.targetReason
+          targetReason: launch.targetReason,
+          targetOrder: launch.targetOrder || 999999,
+          targetPriorityTier: launch.targetPriorityTier,
+          targetQueueCoverage: launch.targetQueueCoverage || null,
+          isRelay: Boolean(launch.isRelay),
+          planType: launch.isRelay ? "relay" : "direct",
+          relayOutgoingOffset: launch.relayOutgoingOffset ? cloneResources(launch.relayOutgoingOffset) : emptyResources(),
+          relayOriginalTargets: launch.relayOriginalTargets ? launch.relayOriginalTargets.slice() : []
         });
       }
 
       const plan = map.get(key);
+      if (launch.isRelay) {
+        plan.isRelay = true;
+        plan.planType = "relay";
+        if (launch.relayOutgoingOffset && totalResources(plan.relayOutgoingOffset || emptyResources()) <= 0) {
+          plan.relayOutgoingOffset = cloneResources(launch.relayOutgoingOffset);
+        }
+        if (launch.relayOriginalTargets && launch.relayOriginalTargets.length && (!plan.relayOriginalTargets || !plan.relayOriginalTargets.length)) {
+          plan.relayOriginalTargets = launch.relayOriginalTargets.slice();
+        }
+      }
       plan.launches.push(launch);
       plan.resources.wood += launch.resources.wood;
       plan.resources.stone += launch.resources.stone;
@@ -1964,7 +2866,10 @@
       plan.arrivalBalance = createArrivalBalanceSummary(plan, settings || DEFAULTS);
     });
 
-    return plans.sort((a, b) => b.total - a.total);
+    return plans.sort((a, b) => {
+      if (Boolean(a.isRelay) !== Boolean(b.isRelay)) return a.isRelay ? 1 : -1;
+      return (a.targetOrder || 999999) - (b.targetOrder || 999999);
+    });
   }
 
   function buildDonorAudit(donors, targets, launches, settings) {
@@ -2150,12 +3055,35 @@
     return (targetPlans || []).map(plan => {
       const target = plan.target;
       const currentWithIncoming = getCurrentResourcesWithIncoming(target);
+      const relayOutgoingOffset = plan && plan.isRelay ? cloneResources(plan.relayOutgoingOffset || emptyResources()) : emptyResources();
+      const projectedBase = {
+        wood: Math.max(0, currentWithIncoming.wood - relayOutgoingOffset.wood),
+        stone: Math.max(0, currentWithIncoming.stone - relayOutgoingOffset.stone),
+        iron: Math.max(0, currentWithIncoming.iron - relayOutgoingOffset.iron)
+      };
       const safeLimit = getTargetWarehouseLimit(target, settings);
       const afterPlanned = {
-        wood: currentWithIncoming.wood + (plan.resources.wood || 0),
-        stone: currentWithIncoming.stone + (plan.resources.stone || 0),
-        iron: currentWithIncoming.iron + (plan.resources.iron || 0)
+        wood: projectedBase.wood + (plan.resources.wood || 0),
+        stone: projectedBase.stone + (plan.resources.stone || 0),
+        iron: projectedBase.iron + (plan.resources.iron || 0)
       };
+
+      const planned = cloneResources(plan.resources || emptyResources());
+      const overSafeLimit = safeLimit !== null ? {
+        wood: afterPlanned.wood > safeLimit,
+        stone: afterPlanned.stone > safeLimit,
+        iron: afterPlanned.iron > safeLimit
+      } : null;
+      const plannedOverSafeLimit = safeLimit !== null ? {
+        wood: planned.wood > 0 && afterPlanned.wood > safeLimit,
+        stone: planned.stone > 0 && afterPlanned.stone > safeLimit,
+        iron: planned.iron > 0 && afterPlanned.iron > safeLimit
+      } : null;
+      const preExistingOverSafeLimit = safeLimit !== null ? {
+        wood: projectedBase.wood > safeLimit,
+        stone: projectedBase.stone > safeLimit,
+        iron: projectedBase.iron > safeLimit
+      } : null;
 
       return {
         target: target.coord,
@@ -2164,13 +3092,13 @@
         targetSafeLimitPercent: settings.targetWarehouseLimitPercent,
         safeLimit: safeLimit,
         currentPlusIncoming: currentWithIncoming,
-        planned: cloneResources(plan.resources || emptyResources()),
+        relayOutgoingOffset: relayOutgoingOffset,
+        projectedBaseAfterOutgoing: projectedBase,
+        planned: planned,
         afterPlanned: afterPlanned,
-        overSafeLimit: safeLimit !== null ? {
-          wood: afterPlanned.wood > safeLimit,
-          stone: afterPlanned.stone > safeLimit,
-          iron: afterPlanned.iron > safeLimit
-        } : null,
+        overSafeLimit: overSafeLimit,
+        plannedOverSafeLimit: plannedOverSafeLimit,
+        preExistingOverSafeLimit: preExistingOverSafeLimit,
         total: plan.total,
         origins: plan.launches ? plan.launches.length : 0,
         arrivalBalance: plan.arrivalBalance
@@ -2219,10 +3147,123 @@
     }));
   }
 
+
+  function getTargetUsableDonorDiagnostics(target, donors, settings) {
+    const counts = {
+      checked: 0,
+      sameVillage: 0,
+      blockedForTarget: 0,
+      noMerchants: 0,
+      noAvailableResources: 0,
+      noResourceFragmentAtLeastMinimum: 0,
+      outsideMaxDistance: 0,
+      noMatchingNeededResource: 0,
+      usable: 0
+    };
+    const samples = [];
+    const need = target && target.need ? target.need : emptyResources();
+
+    (donors || []).forEach(donor => {
+      counts.checked += 1;
+      let status = "usable";
+      const distance = getDistance(donor.village.coord, target.village.coord);
+      const matchingResources = {
+        wood: Math.min(Math.max(0, donor.available.wood || 0), Math.max(0, need.wood || 0)),
+        stone: Math.min(Math.max(0, donor.available.stone || 0), Math.max(0, need.stone || 0)),
+        iron: Math.min(Math.max(0, donor.available.iron || 0), Math.max(0, need.iron || 0))
+      };
+
+      if (donor.village.coord === target.village.coord) {
+        counts.sameVillage += 1;
+        status = "same village";
+      } else if (donor.blockedTargetIds && donor.blockedTargetIds.has(String(target.village.id))) {
+        counts.blockedForTarget += 1;
+        status = "blocked after tiny/failed shipment attempt";
+      } else if (donor.merchantsAvailable <= 0) {
+        counts.noMerchants += 1;
+        status = "no merchants";
+      } else if (totalResources(donor.available) < settings.minShipment) {
+        counts.noAvailableResources += 1;
+        status = "available below minimum shipment";
+      } else if (!hasResourceAtLeast(donor.available, settings.minResourcePerOrigin)) {
+        counts.noResourceFragmentAtLeastMinimum += 1;
+        status = "no resource fragment >= minimum";
+      } else if (settings.maxDistance > 0 && distance > settings.maxDistance) {
+        counts.outsideMaxDistance += 1;
+        status = "outside max distance";
+      } else if (!hasResourceAtLeast(matchingResources, settings.minResourcePerOrigin)) {
+        counts.noMatchingNeededResource += 1;
+        status = "no matching needed resource >= minimum";
+      } else {
+        counts.usable += 1;
+      }
+
+      if ((status === "usable" || samples.length < 12) && samples.length < 20) {
+        samples.push({
+          origin: donor.village.coord,
+          originId: donor.village.id,
+          name: donor.village.name,
+          distance: Math.round(distance * 10) / 10,
+          merchantsAvailable: donor.merchantsAvailable,
+          available: cloneResources(donor.available),
+          matchingResources: matchingResources,
+          status: status
+        });
+      }
+    });
+
+    return {
+      counts: counts,
+      samples: samples
+    };
+  }
+
+  function buildUnplannedTargetDiagnostics(planResult, settings) {
+    const plannedTargetIds = new Set((planResult.launches || []).map(launch => String(launch.target.id)));
+    return (planResult.targets || [])
+      .filter(target => totalResources(target.need || emptyResources()) > 0)
+      .filter(target => !plannedTargetIds.has(String(target.village.id)))
+      .slice(0, 40)
+      .map(target => {
+        let reason = "not planned";
+        const totalNeed = totalResources(target.need || emptyResources());
+        const donorDiagnostics = getTargetUsableDonorDiagnostics(target, planResult.donors || [], settings);
+
+        if (totalNeed < settings.minShipment) {
+          reason = "target need below minimum shipment";
+        } else if (!donorDiagnostics.counts.usable) {
+          if (donorDiagnostics.counts.outsideMaxDistance > 0) {
+            reason = "no usable donor inside max distance";
+          } else if (donorDiagnostics.counts.noMatchingNeededResource > 0) {
+            reason = "no donor with matching needed resource above minimum";
+          } else if (donorDiagnostics.counts.noMerchants > 0) {
+            reason = "donors had no merchants left";
+          } else {
+            reason = "no usable donor found";
+          }
+        }
+
+        return {
+          coord: target.village.coord,
+          targetId: target.village.id,
+          name: target.village.name,
+          points: target.village.points || 0,
+          priorityTier: target.priorityTier,
+          queueCount: target.queueCoverage ? target.queueCoverage.currentQueueCount : target.village.queueCount || 0,
+          queueHours: target.queueHours,
+          totalNeed: totalNeed,
+          need: cloneResources(target.need || emptyResources()),
+          reason: reason,
+          targetReason: target.reason,
+          donorDiagnostics: donorDiagnostics
+        };
+      });
+  }
+
   function logPlanDiagnostics(planResult, settings) {
     const targetWarehouseAudit = buildTargetWarehouseAudit(planResult.targetPlans, settings);
     const originUsageAudit = buildOriginUsagePlanAudit(planResult.launches, settings);
-    const overWarehouse = targetWarehouseAudit.filter(row => row.overSafeLimit && (row.overSafeLimit.wood || row.overSafeLimit.stone || row.overSafeLimit.iron));
+    const overWarehouse = targetWarehouseAudit.filter(row => row.plannedOverSafeLimit && (row.plannedOverSafeLimit.wood || row.plannedOverSafeLimit.stone || row.plannedOverSafeLimit.iron));
     const overOrigins = originUsageAudit.filter(row => row.overOriginWood || row.overOriginStone || row.overOriginIron || row.overOriginMerchants);
     const debug = state.debug || {};
 
@@ -2232,13 +3273,21 @@
         mode: settings.useAmTemplates ? "AM construction" : "Warehouse balance",
         targetWarehouseLimitPercent: settings.targetWarehouseLimitPercent,
         minResourcePerOrigin: settings.minResourcePerOrigin,
+        targetQueueCoverageHours: settings.constructionHours,
+        targetQueueCoverageBuildings: settings.targetQueueCoverageBuildings,
         minShipment: settings.minShipment,
         maxDistance: settings.maxDistance,
         reserveWarehousePercent: settings.reserveWarehousePercent,
         reserveMerchants: settings.reserveMerchants,
         arrivalBalanceWindowMinutes: settings.arrivalBalanceWindowMinutes,
         merchantMinutesPerField: settings.merchantMinutesPerField,
-        prioritizeLowPoints: settings.prioritizeLowPoints
+        prioritizeLowPoints: settings.prioritizeLowPoints,
+        enableRelayReplenishment: settings.enableRelayReplenishment !== false,
+        relaySafetyBufferMinutes: settings.relaySafetyBufferMinutes,
+        dataRequestDelayMs: DEFAULTS.dataRequestDelayMs,
+        templateRequestDelayMs: DEFAULTS.templateRequestDelayMs,
+        fetchRetryDelayMs: DEFAULTS.fetchRetryDelayMs,
+        fetchMaxRetries: DEFAULTS.fetchMaxRetries
       },
       counts: {
         villages: state.villages.length,
@@ -2249,14 +3298,47 @@
         cappedTargets: debug.cappedTargets ? debug.cappedTargets.length : 0,
         skippedSmallShipments: debug.skippedSmallShipments ? debug.skippedSmallShipments.length : 0,
         rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments ? debug.rejectedTinyResourceFragments.length : 0,
+        relayCandidates: debug.relayCandidates ? debug.relayCandidates.length : 0,
+        relayAccepted: debug.relayAccepted ? debug.relayAccepted.length : 0,
+        relayRejected: debug.relayRejected ? debug.relayRejected.length : 0,
+        incomingRowsParsed: debug.incomingTransportLoad && debug.incomingTransportLoad.selected ? debug.incomingTransportLoad.selected.rowsParsed : 0,
+        queueCoverageTargetHours: settings.constructionHours,
+        queueCoverageTargetBuildings: settings.targetQueueCoverageBuildings,
+        targetsWithIncoming: debug.incomingTransportLoad && debug.incomingTransportLoad.selected && debug.incomingTransportLoad.selected.byCoord ? debug.incomingTransportLoad.selected.byCoord.length : 0,
         targetsOverSafeWarehouseLimit: overWarehouse.length,
-        originsOverAvailableResourcesOrMerchants: overOrigins.length
+        originsOverAvailableResourcesOrMerchants: overOrigins.length,
+        dataLoadSteps: debug.dataLoad ? debug.dataLoad.length : 0,
+        amTemplatesLoaded: debug.amTemplateLoad && debug.amTemplateLoad.loadedTemplates ? debug.amTemplateLoad.loadedTemplates.length : 0,
+        amTemplatesFailed: debug.amTemplateLoad && debug.amTemplateLoad.failedTemplates ? debug.amTemplateLoad.failedTemplates.length : 0
       },
       stats: planResult.stats,
       overWarehouse: overWarehouse,
       overOrigins: overOrigins,
       targetWarehouseAudit: targetWarehouseAudit,
       originUsageAudit: originUsageAudit,
+      incomingTransportLoad: debug.incomingTransportLoad || null,
+      dataLoad: debug.dataLoad || [],
+      amTemplateLoad: debug.amTemplateLoad || null,
+      targetPlanningOrder: (planResult.targets || []).slice(0, 40).map(target => ({
+        order: target.planningOrder,
+        coord: target.village.coord,
+        name: target.village.name,
+        points: target.village.points || 0,
+        priorityTier: target.priorityTier,
+        queueCount: target.queueCoverage ? target.queueCoverage.currentQueueCount : target.village.queueCount || 0,
+        queueHours: target.queueHours,
+        queueCoverage: formatQueueCoverage(target.queueCoverage),
+        plannedBuilds: target.queueCoverage ? target.queueCoverage.plannedBuilds : 0,
+        totalNeed: target.totalNeed,
+        need: cloneResources(target.need || emptyResources()),
+        reason: target.reason
+      })),
+      unplannedTargets: buildUnplannedTargetDiagnostics(planResult, settings),
+      relayReplenishment: {
+        candidates: debug.relayCandidates || [],
+        accepted: debug.relayAccepted || [],
+        rejected: debug.relayRejected || []
+      },
       cappedTargets: debug.cappedTargets || [],
       skippedSmallShipments: debug.skippedSmallShipments || [],
       rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments || []
@@ -2269,6 +3351,12 @@
     console.log("Origins over available resources/merchants", overOrigins);
     console.log("Target warehouse audit", targetWarehouseAudit);
     console.log("Origin usage audit", originUsageAudit);
+    console.log("Incoming transport load", diagnostics.incomingTransportLoad);
+    console.log("Data load steps", diagnostics.dataLoad);
+    console.log("AM template load", diagnostics.amTemplateLoad);
+    console.log("Target planning order", diagnostics.targetPlanningOrder);
+    console.log("Unplanned targets", diagnostics.unplannedTargets);
+    console.log("Relay replenishment", diagnostics.relayReplenishment);
     console.log("Capped targets", diagnostics.cappedTargets);
     console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
     console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
@@ -2432,6 +3520,7 @@
       total: targetPlan.total,
       merchantsUsed: targetPlan.merchantsUsed,
       arrivalBalance: targetPlan.arrivalBalance,
+      targetStorageAudit: createTargetPlanStorageAudit(targetPlan, state.lastSettings || getSettings()),
       payload: debugPayload,
       payloadOriginCount: targetPlan.launches.length,
       payloadResourceKeys: Object.keys(debugPayload).length
@@ -2517,8 +3606,11 @@
       const row = document.createElement("tr");
 
       appendCell(row, String(targetPlan.id));
-      appendCell(row, targetPlan.target.name, "twrp-left twrp-target-name");
-      appendCell(row, formatResources(targetPlan.resources) + "\n" + (targetPlan.arrivalBalance || ""), "twrp-left twrp-resource-cell");
+      appendCell(row, (targetPlan.isRelay ? "Relay refill: " : "") + targetPlan.target.name, "twrp-left twrp-target-name");
+      const targetAudit = createTargetPlanStorageAudit(targetPlan, state.lastSettings || getSettings());
+      const incomingLine = totalResources(targetAudit.incoming) > 0 ? "\nIncoming: " + formatResources(targetAudit.incoming) : "\nIncoming: -";
+      const safeLine = targetAudit.safeLimit === null ? "" : "\nAfter: " + formatResources(targetAudit.afterPlanned) + " / safe " + formatNumber(targetAudit.safeLimit);
+      appendCell(row, formatResources(targetPlan.resources) + "\n" + (targetPlan.arrivalBalance || "") + incomingLine + safeLine, "twrp-left twrp-resource-cell");
 
       const originsCell = document.createElement("td");
       originsCell.className = "twrp-left";
@@ -2536,7 +3628,7 @@
         line.className = "twrp-origin-line";
         line.innerHTML =
           "<strong>" + escapeHtml(launch.origin.name) + "</strong><br>" +
-          "<span>" + escapeHtml(formatResources(launch.resources)) + " | " +
+          "<span>" + escapeHtml((launch.isRelay ? "Relay refill: " : "") + formatResources(launch.resources)) + " | " +
           escapeHtml(launch.distance.toFixed(1)) + " fields" +
           (launch.travelMinutes !== undefined ? " | ~" + formatTravelMinutes(launch.travelMinutes) : "") +
           "</span>";
@@ -2582,20 +3674,61 @@
     summary.textContent = "Audit";
     details.appendChild(summary);
 
+    const incomingTitle = document.createElement("div");
+    incomingTitle.className = "twrp-section-title";
+    incomingTitle.textContent = "Incoming / target warehouse audit";
+    details.appendChild(incomingTitle);
+
+    const settings = state.lastSettings || getSettings();
+    details.appendChild(createMiniTable(
+      ["Village", "Current", "Incoming", "Planned", "After", "Safe", "Over"],
+      (planResult.targetPlans || []).map(plan => {
+        const audit = createTargetPlanStorageAudit(plan, settings);
+        return [
+          plan.target.name,
+          formatResources(audit.current),
+          formatResources(audit.incoming),
+          formatResources(audit.planned),
+          formatResources(audit.afterPlanned),
+          audit.safeLimit === null ? "unknown" : formatNumber(audit.safeLimit),
+          formatAuditOverLabel(audit)
+        ];
+      })
+    ));
+
     const targetTitle = document.createElement("div");
     targetTitle.className = "twrp-section-title";
     targetTitle.textContent = "Top targets";
     details.appendChild(targetTitle);
 
     details.appendChild(createMiniTable(
-      ["Village", "Need", "Queue", "Reason"],
+      ["Village", "Need", "Queue", "Points", "Reason"],
       planResult.targets.slice(0, 12).map(target => [
         target.village.name,
         formatResources(target.need),
-        target.queueHours.toFixed(1) + "h",
+        target.queueCoverage ? formatQueueCoverage(target.queueCoverage) : target.queueHours.toFixed(1) + "h",
+        String(target.village.points || 0),
         target.reason
       ])
     ));
+
+    const relayAccepted = state.lastDiagnostics && state.lastDiagnostics.relayReplenishment ? state.lastDiagnostics.relayReplenishment.accepted : [];
+    if (relayAccepted && relayAccepted.length) {
+      const relayTitle = document.createElement("div");
+      relayTitle.className = "twrp-section-title";
+      relayTitle.textContent = "Relay replenishment";
+      details.appendChild(relayTitle);
+      details.appendChild(createMiniTable(
+        ["Middleman", "Refill origin", "Resources", "Arrival", "Queue"],
+        relayAccepted.slice(0, 12).map(row => [
+          row.middleman,
+          row.origin,
+          formatResources(row.resources || emptyResources()),
+          formatTravelMinutes(row.travelMinutes || 0),
+          (row.queueHours || 0).toFixed ? row.queueHours.toFixed(1) + "h" : String(row.queueHours || "")
+        ])
+      ));
+    }
 
     const donorTitle = document.createElement("div");
     donorTitle.className = "twrp-section-title";
@@ -2672,6 +3805,28 @@
     return parts.length ? parts.join(" / ") : "-";
   }
 
+  function formatWarehouseOverResources(over) {
+    const parts = [];
+
+    if (over && over.wood) parts.push("wood");
+    if (over && over.stone) parts.push("clay");
+    if (over && over.iron) parts.push("iron");
+
+    return parts.length ? parts.join(" / ") : "none";
+  }
+
+  function formatAuditOverLabel(audit) {
+    if (audit.plannedOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.plannedOverSafeLimit)) {
+      return "YES";
+    }
+
+    if (audit.preExistingOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.preExistingOverSafeLimit)) {
+      return "existing: " + formatWarehouseOverResources(audit.preExistingOverSafeLimit);
+    }
+
+    return "no";
+  }
+
   function formatNumber(value) {
     return new Intl.NumberFormat().format(Math.round(value || 0));
   }
@@ -2685,6 +3840,100 @@
     return hours + "h" + (rest ? " " + rest + "m" : "");
   }
 
+  function createTargetPlanStorageAudit(targetPlan, settings) {
+    const target = targetPlan && targetPlan.target ? targetPlan.target : {};
+    const current = getCurrentResourcesOnly(target);
+    const incoming = cloneResources(target.incoming || emptyResources());
+    const currentPlusIncoming = getCurrentResourcesWithIncoming(target);
+    const relayOutgoingOffset = targetPlan && targetPlan.isRelay ? cloneResources(targetPlan.relayOutgoingOffset || emptyResources()) : emptyResources();
+    const projectedBaseAfterOutgoing = {
+      wood: Math.max(0, currentPlusIncoming.wood - relayOutgoingOffset.wood),
+      stone: Math.max(0, currentPlusIncoming.stone - relayOutgoingOffset.stone),
+      iron: Math.max(0, currentPlusIncoming.iron - relayOutgoingOffset.iron)
+    };
+    const planned = cloneResources(targetPlan && targetPlan.resources ? targetPlan.resources : emptyResources());
+    const safeLimit = getTargetWarehouseLimit(target, settings || DEFAULTS);
+    const afterPlanned = {
+      wood: projectedBaseAfterOutgoing.wood + (planned.wood || 0),
+      stone: projectedBaseAfterOutgoing.stone + (planned.stone || 0),
+      iron: projectedBaseAfterOutgoing.iron + (planned.iron || 0)
+    };
+
+    const overSafeLimit = safeLimit !== null ? {
+      wood: afterPlanned.wood > safeLimit,
+      stone: afterPlanned.stone > safeLimit,
+      iron: afterPlanned.iron > safeLimit
+    } : null;
+    const plannedOverSafeLimit = safeLimit !== null ? {
+      wood: planned.wood > 0 && afterPlanned.wood > safeLimit,
+      stone: planned.stone > 0 && afterPlanned.stone > safeLimit,
+      iron: planned.iron > 0 && afterPlanned.iron > safeLimit
+    } : null;
+    const preExistingOverSafeLimit = safeLimit !== null ? {
+      wood: projectedBaseAfterOutgoing.wood > safeLimit,
+      stone: projectedBaseAfterOutgoing.stone > safeLimit,
+      iron: projectedBaseAfterOutgoing.iron > safeLimit
+    } : null;
+
+    return {
+      target: target.coord || "",
+      targetId: target.id || "",
+      capacity: target.capacity || 0,
+      safeLimitPercent: settings && settings.targetWarehouseLimitPercent !== undefined ? settings.targetWarehouseLimitPercent : DEFAULTS.targetWarehouseLimitPercent,
+      safeLimit: safeLimit,
+      current: current,
+      incoming: incoming,
+      currentPlusIncoming: currentPlusIncoming,
+      relayOutgoingOffset: relayOutgoingOffset,
+      projectedBaseAfterOutgoing: projectedBaseAfterOutgoing,
+      planned: planned,
+      afterPlanned: afterPlanned,
+      overSafeLimit: overSafeLimit,
+      plannedOverSafeLimit: plannedOverSafeLimit,
+      preExistingOverSafeLimit: preExistingOverSafeLimit
+    };
+  }
+
+  function getIncomingLoadSummaryText() {
+    const load = state.lastDiagnostics && state.lastDiagnostics.incomingTransportLoad;
+    const selected = load && load.selected ? load.selected : null;
+
+    if (!selected) {
+      return "Incoming parsed: not available";
+    }
+
+    return "Incoming parsed: " +
+      (selected.rowsParsed || 0) + " row(s), " +
+      ((selected.byCoord && selected.byCoord.length) || 0) + " target(s), total " +
+      formatResources(selected.totals || emptyResources()) +
+      (load.selectedLabel ? " | source: " + load.selectedLabel : "");
+  }
+
+  function formatStorageAuditLine(targetPlan, settings) {
+    const audit = createTargetPlanStorageAudit(targetPlan, settings);
+    const safeText = audit.safeLimit === null ? "unknown" : formatNumber(audit.safeLimit);
+    const capacityText = audit.capacity ? formatNumber(audit.capacity) : "unknown";
+    let overText = "";
+    if (audit.plannedOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.plannedOverSafeLimit)) {
+      overText = " | OVER SAFE LIMIT";
+    } else if (audit.preExistingOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.preExistingOverSafeLimit)) {
+      overText = " | existing over safe: " + formatWarehouseOverResources(audit.preExistingOverSafeLimit);
+    }
+
+    const relayText = targetPlan && targetPlan.isRelay
+      ? " | outgoing before relay " + formatResources(audit.relayOutgoingOffset || emptyResources()) + " | projected after outgoing " + formatResources(audit.projectedBaseAfterOutgoing || emptyResources())
+      : "";
+
+    return "   Target storage audit: capacity " + capacityText +
+      " | 90% safe " + safeText +
+      " | current " + formatResources(audit.current) +
+      " | incoming " + formatResources(audit.incoming) +
+      " | current+incoming " + formatResources(audit.currentPlusIncoming) +
+      relayText +
+      " | after planned " + formatResources(audit.afterPlanned) +
+      overText;
+  }
+
   function copyPlan() {
     if (!state.plan.length) {
       setStatus("No plan to copy.", "warn");
@@ -2696,13 +3945,18 @@
 
     lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
     lines.push("Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance"));
+    if (settings.useAmTemplates) {
+      lines.push("Build coverage target: " + settings.constructionHours + "h queue time");
+    }
     lines.push("Origin reserve: " + settings.reserveWarehousePercent + "% of warehouse");
+    lines.push("Relay replenishment: " + (settings.enableRelayReplenishment !== false ? "enabled" : "disabled") + " (safety buffer " + (settings.relaySafetyBufferMinutes || DEFAULTS.relaySafetyBufferMinutes) + "m)");
+    lines.push(getIncomingLoadSummaryText());
     lines.push("");
 
     state.plan.forEach(targetPlan => {
       lines.push(
         targetPlan.id + ". " +
-        "Target: " + targetPlan.target.name +
+        (targetPlan.isRelay ? "Relay refill target: " : "Target: ") + targetPlan.target.name +
         " | " + formatResources(targetPlan.resources) +
         " | origins: " + targetPlan.launches.length +
         " | merchants: " + targetPlan.merchantsUsed +
@@ -2710,11 +3964,12 @@
         " | arrival: " + (targetPlan.arrivalBalance || "n/a")
       );
       lines.push("   Reason: " + targetPlan.targetReason);
+      lines.push(formatStorageAuditLine(targetPlan, settings));
 
       targetPlan.launches.forEach(launch => {
         lines.push(
           "   - " + launch.origin.name +
-          " -> " + formatResources(launch.resources) +
+          " -> " + (launch.isRelay ? "relay refill " : "") + formatResources(launch.resources) +
           " | distance: " + launch.distance.toFixed(1) +
           (launch.travelMinutes !== undefined ? " | approx arrival: " + formatTravelMinutes(launch.travelMinutes) : "")
         );
