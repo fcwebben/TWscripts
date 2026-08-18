@@ -13,6 +13,7 @@
  * - Checks every queued building order, not only the first order in the queue
  * - Estimates each queue item's own build duration from the finish-time gap inside the village queue
  * - Can also sort villages by total queue duration
+ * - Can filter the result list by one or more building types
  * - Sorts results by longest duration first
  *
  * This script does NOT:
@@ -20,12 +21,23 @@
  * - Send attacks, support, or troops
  * - Auto-click game actions
  * - Use external servers or external files
+ *
+ * Disclaimer:
+ * By uploading a user-generated mod for use with Tribal Wars, the creator grants
+ * InnoGames a perpetual, irrevocable, worldwide, royalty-free, non-exclusive
+ * license to use, reproduce, distribute, publicly display, modify, and create
+ * derivative works of the mod. This license permits InnoGames to incorporate the
+ * mod into any aspect of the game and its related services, including promotional
+ * and commercial endeavors, without any requirement for compensation or
+ * attribution to the uploader. The uploader represents and warrants that they
+ * have the legal right to grant this license and that the mod does not infringe
+ * upon any third-party rights. German law applies.
  */
 (function () {
   "use strict";
 
   const SCRIPT_NAME = "Twactics Long Construction Queue";
-  const SCRIPT_VERSION = "v1.0.0";
+  const SCRIPT_VERSION = "v1.0.1";
   const BOX_ID = "twactics-long-construction-queue";
   const STYLE_ID = "twactics-long-construction-queue-style";
   const DEFAULT_MAX_ROWS = 15;
@@ -33,17 +45,38 @@
   const SORT_BY_SINGLE = "single";
   const SORT_BY_TOTAL = "total";
 
+  const DEFAULT_BUILDING_NAMES = [
+    "Headquarters",
+    "Barracks",
+    "Stable",
+    "Workshop",
+    "Watchtower",
+    "Academy",
+    "Smithy",
+    "Rally point",
+    "Market",
+    "Timber camp",
+    "Clay pit",
+    "Iron mine",
+    "Farm",
+    "Warehouse",
+    "Hiding place",
+    "Wall"
+  ];
+
   const DEFAULT_SETTINGS = {
     sortBy: SORT_BY_SINGLE,
     redWarningHours: 12,
     orangeWarningHours: 8,
-    yellowWarningHours: 5
+    yellowWarningHours: 5,
+    enabledBuildings: DEFAULT_BUILDING_NAMES.slice()
   };
 
   const state = {
     rows: [],
     maxRows: DEFAULT_MAX_ROWS,
     sourceUrl: "",
+    availableBuildings: DEFAULT_BUILDING_NAMES.slice(),
     settings: loadSavedSettings()
   };
 
@@ -496,14 +529,127 @@
     return parsed;
   }
 
+  function normalizeBuildingFilterValue(value) {
+    return cleanText(value);
+  }
+
+  function getBuildingFilterKey(value) {
+    return normalizeSearchText(normalizeBuildingFilterValue(value));
+  }
+
+  function uniqueBuildingNames(values) {
+    const result = [];
+    const seen = new Set();
+
+    (values || []).forEach(value => {
+      const name = normalizeBuildingFilterValue(value);
+      const key = getBuildingFilterKey(name);
+
+      if (!name || seen.has(key)) return;
+      seen.add(key);
+      result.push(name);
+    });
+
+    return result;
+  }
+
+  function getDefaultEnabledBuildings() {
+    return DEFAULT_BUILDING_NAMES.slice();
+  }
+
+  function getAvailableBuildingNames(rows) {
+    return uniqueBuildingNames(
+      DEFAULT_BUILDING_NAMES.concat(
+        (rows || [])
+          .map(item => item && item.building)
+          .filter(Boolean)
+      )
+    );
+  }
+
+  function getTribalWarsScriptData() {
+    try {
+      if (!window.TribalWars) return null;
+      if (!window.TribalWars.scriptData) window.TribalWars.scriptData = {};
+      return window.TribalWars.scriptData;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function parseSettingsObject(value) {
+    if (!value) return null;
+
+    if (typeof value === "string") {
+      try {
+        return JSON.parse(value);
+      } catch (err) {
+        return null;
+      }
+    }
+
+    if (typeof value === "object") return value;
+    return null;
+  }
+
+  function readSettingsFromScriptData() {
+    const scriptData = getTribalWarsScriptData();
+    if (!scriptData) return null;
+
+    const nested = parseSettingsObject(scriptData[SETTINGS_KEY] || scriptData.longConstructionQueueSettings);
+    if (nested) return nested;
+
+    const hasDirectSettings = [
+      "sortBy",
+      "redWarningHours",
+      "orangeWarningHours",
+      "yellowWarningHours",
+      "enabledBuildings"
+    ].some(key => scriptData[key] !== undefined);
+
+    return hasDirectSettings ? scriptData : null;
+  }
+
+  function writeSettingsToScriptData(settings) {
+    const scriptData = getTribalWarsScriptData();
+    if (!scriptData) return;
+
+    scriptData[SETTINGS_KEY] = Object.assign({}, settings, {
+      enabledBuildings: (settings.enabledBuildings || []).slice()
+    });
+    scriptData.longConstructionQueueSettings = scriptData[SETTINGS_KEY];
+  }
+
+  function readSettingsFromLocalStorage() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not load local settings:", err);
+      return null;
+    }
+  }
+
+  function writeSettingsToLocalStorage(settings) {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not save local settings:", err);
+    }
+  }
+
   function normalizeSettings(settings) {
     const merged = Object.assign({}, DEFAULT_SETTINGS, settings || {});
+    const enabledBuildings = Array.isArray(merged.enabledBuildings)
+      ? uniqueBuildingNames(merged.enabledBuildings)
+      : getDefaultEnabledBuildings();
 
     return {
       sortBy: merged.sortBy === SORT_BY_TOTAL ? SORT_BY_TOTAL : SORT_BY_SINGLE,
       redWarningHours: parsePositiveNumber(merged.redWarningHours, DEFAULT_SETTINGS.redWarningHours),
       orangeWarningHours: parsePositiveNumber(merged.orangeWarningHours, DEFAULT_SETTINGS.orangeWarningHours),
-      yellowWarningHours: parsePositiveNumber(merged.yellowWarningHours, DEFAULT_SETTINGS.yellowWarningHours)
+      yellowWarningHours: parsePositiveNumber(merged.yellowWarningHours, DEFAULT_SETTINGS.yellowWarningHours),
+      enabledBuildings: enabledBuildings
     };
   }
 
@@ -518,15 +664,18 @@
     if (settings.yellowWarningHours < 0) {
       return "Yellow warning cannot be below 0.";
     }
+    if (!settings.enabledBuildings || !settings.enabledBuildings.length) {
+      return "Select at least one building to show.";
+    }
     return "";
   }
 
   function loadSavedSettings() {
     try {
-      const raw = localStorage.getItem(SETTINGS_KEY);
-      if (!raw) return normalizeSettings(DEFAULT_SETTINGS);
+      const savedFromScriptData = readSettingsFromScriptData();
+      const savedFromLocalStorage = readSettingsFromLocalStorage();
+      const saved = normalizeSettings(savedFromScriptData || savedFromLocalStorage || DEFAULT_SETTINGS);
 
-      const saved = normalizeSettings(JSON.parse(raw));
       if (validateSettings(saved)) return normalizeSettings(DEFAULT_SETTINGS);
 
       return saved;
@@ -538,10 +687,19 @@
 
   function saveSettings(settings) {
     const normalized = normalizeSettings(settings);
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(normalized));
+    writeSettingsToScriptData(normalized);
+    writeSettingsToLocalStorage(normalized);
     state.settings = normalized;
     syncSettingsPanel();
     return normalized;
+  }
+
+  function getCheckedBuildingFiltersFromUi() {
+    if (!ui.buildingFilterList) return state.settings.enabledBuildings || getDefaultEnabledBuildings();
+
+    return Array.from(ui.buildingFilterList.querySelectorAll('input[type="checkbox"]'))
+      .filter(input => input.checked)
+      .map(input => input.value);
   }
 
   function getSettingsFromUi() {
@@ -549,7 +707,43 @@
       sortBy: ui.sortBySelect ? ui.sortBySelect.value : state.settings.sortBy,
       redWarningHours: ui.redWarningInput ? ui.redWarningInput.value : state.settings.redWarningHours,
       orangeWarningHours: ui.orangeWarningInput ? ui.orangeWarningInput.value : state.settings.orangeWarningHours,
-      yellowWarningHours: ui.yellowWarningInput ? ui.yellowWarningInput.value : state.settings.yellowWarningHours
+      yellowWarningHours: ui.yellowWarningInput ? ui.yellowWarningInput.value : state.settings.yellowWarningHours,
+      enabledBuildings: getCheckedBuildingFiltersFromUi()
+    });
+  }
+
+  function renderBuildingFilterCheckboxes() {
+    if (!ui.buildingFilterList) return;
+
+    const selected = new Set((state.settings.enabledBuildings || getDefaultEnabledBuildings()).map(getBuildingFilterKey));
+    const available = state.availableBuildings && state.availableBuildings.length
+      ? state.availableBuildings
+      : getDefaultEnabledBuildings();
+
+    ui.buildingFilterList.innerHTML = "";
+
+    available.forEach(building => {
+      const label = document.createElement("label");
+      label.className = "twlcq-checkbox-label";
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = building;
+      checkbox.checked = selected.has(getBuildingFilterKey(building));
+
+      const span = document.createElement("span");
+      span.textContent = building;
+
+      label.appendChild(checkbox);
+      label.appendChild(span);
+      ui.buildingFilterList.appendChild(label);
+    });
+  }
+
+  function setAllBuildingFilterCheckboxes(checked) {
+    if (!ui.buildingFilterList) return;
+    Array.from(ui.buildingFilterList.querySelectorAll('input[type="checkbox"]')).forEach(input => {
+      input.checked = checked;
     });
   }
 
@@ -559,6 +753,7 @@
     ui.redWarningInput.value = state.settings.redWarningHours;
     ui.orangeWarningInput.value = state.settings.orangeWarningHours;
     ui.yellowWarningInput.value = state.settings.yellowWarningHours;
+    renderBuildingFilterCheckboxes();
   }
 
   function saveCurrentSettingsFromUi() {
@@ -634,6 +829,24 @@
     return Array.from(grouped.values());
   }
 
+  function getFilteredRows(rows) {
+    const selected = new Set((state.settings.enabledBuildings || getDefaultEnabledBuildings()).map(getBuildingFilterKey));
+
+    return (rows || []).filter(item => {
+      const key = getBuildingFilterKey(item && item.building);
+      return key && selected.has(key);
+    });
+  }
+
+  function getBuildingFilterSummary() {
+    const selected = state.settings.enabledBuildings || getDefaultEnabledBuildings();
+    const available = state.availableBuildings || getDefaultEnabledBuildings();
+
+    if (selected.length >= available.length) return "all buildings";
+    if (selected.length <= 3) return selected.join(", ");
+    return selected.length + " selected building types";
+  }
+
   function getSortableRows(rows) {
     if (state.settings.sortBy === SORT_BY_TOTAL) {
       return buildTotalQueueRows(rows);
@@ -666,11 +879,13 @@
   }
 
   function renderRows(rows) {
-    const sortableRows = getSortableRows(rows);
+    const filteredRows = getFilteredRows(rows);
+    const sortableRows = getSortableRows(filteredRows);
     const sorted = sortRows(sortableRows);
     const displayRows = sorted.slice(0, state.maxRows || DEFAULT_MAX_ROWS);
-    const villageCount = new Set((rows || []).map(item => item.villageId || item.villageName)).size;
+    const villageCount = new Set((filteredRows || []).map(item => item.villageId || item.villageName)).size;
     const totalQueuedOrders = (rows || []).length;
+    const filteredQueuedOrders = filteredRows.length;
     const sortLabel = getSortDurationLabel();
 
     ui.results.innerHTML = "";
@@ -679,15 +894,15 @@
     summary.className = "twlcq-summary";
     summary.innerHTML =
       "Showing the <strong>top " + displayRows.length + "</strong> result(s) by <strong>" + escapeHtml(sortLabel) + "</strong>" +
-      " from <strong>" + totalQueuedOrders + "</strong> total queued order(s)" +
+      " from <strong>" + filteredQueuedOrders + "</strong> matching queued order(s)" +
       " in <strong>" + villageCount + "</strong> village(s). " +
-      "<span class='twlcq-muted'>Red: " + state.settings.redWarningHours + "h+, Orange: " + state.settings.orangeWarningHours + "h+, Yellow: " + state.settings.yellowWarningHours + "h+.</span>";
+      "<span class='twlcq-muted'>Building filter: " + escapeHtml(getBuildingFilterSummary()) + ". Total before filter: " + totalQueuedOrders + ". Red: " + state.settings.redWarningHours + "h+, Orange: " + state.settings.orangeWarningHours + "h+, Yellow: " + state.settings.yellowWarningHours + "h+.</span>";
     ui.results.appendChild(summary);
 
     if (!displayRows.length) {
       const empty = document.createElement("div");
       empty.className = "twlcq-status twlcq-status-warn";
-      empty.textContent = "No queued building orders found.";
+      empty.textContent = totalQueuedOrders ? "No queued building orders match the selected building filter." : "No queued building orders found.";
       ui.results.appendChild(empty);
       return;
     }
@@ -768,11 +983,13 @@
 
       const rows = await loadConstructionRows();
       state.rows = rows;
+      state.availableBuildings = getAvailableBuildingNames(rows);
+      renderBuildingFilterCheckboxes();
 
       renderRows(rows);
 
       setStatus(
-        "Loaded " + rows.length + " queued building order(s). Showing top " + (state.maxRows || DEFAULT_MAX_ROWS) + " by " + getSortDurationLabel() + ".",
+        "Loaded " + rows.length + " queued building order(s). Showing top " + (state.maxRows || DEFAULT_MAX_ROWS) + " by " + getSortDurationLabel() + ". Building filter: " + getBuildingFilterSummary() + ".",
         "success"
       );
     } catch (err) {
@@ -876,6 +1093,56 @@
       .twlcq-field input[type="number"] { width: 90px; }
 
       .twlcq-field select.twlcq-sort-by { width: 230px; }
+
+      .twlcq-building-filter-panel {
+        margin-top: 8px;
+        padding: 8px;
+        border: 1px solid #bd9c5a;
+        background: #fffaf0;
+        border-radius: 4px;
+      }
+
+      .twlcq-building-filter-title {
+        font-weight: bold;
+        margin-bottom: 4px;
+      }
+
+      .twlcq-building-filter-actions {
+        display: flex;
+        gap: 5px;
+        margin: 6px 0;
+      }
+
+      .twlcq-small-button {
+        padding: 3px 7px;
+        border: 1px solid #7d510f;
+        background: #f4e4bc;
+        color: #2f1b00;
+        cursor: pointer;
+        border-radius: 3px;
+      }
+
+      .twlcq-building-filter-list {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+        gap: 4px 8px;
+        margin-top: 6px;
+      }
+
+      .twlcq-checkbox-label {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-weight: normal;
+        line-height: 1.3;
+      }
+
+      .twlcq-checkbox-label input {
+        width: auto;
+        min-height: auto;
+        padding: 0;
+        margin: 0;
+      }
 
       .twlcq-settings-panel {
         display: none;
@@ -1011,15 +1278,33 @@
         "</div>" +
         "<button type='button' class='twlcq-save-settings'>Save settings</button>" +
       "</div>" +
-      "<div class='twlcq-muted'>Settings are saved locally in this browser. Saving reloads the current queue list automatically.</div>";
+      "<div class='twlcq-building-filter-panel'>" +
+        "<div class='twlcq-building-filter-title'>Building filter</div>" +
+        "<div class='twlcq-muted'>Unchecked buildings are hidden from the result list. All buildings are selected by default.</div>" +
+        "<div class='twlcq-building-filter-actions'>" +
+          "<button type='button' class='twlcq-small-button twlcq-building-select-all'>Select all</button>" +
+          "<button type='button' class='twlcq-small-button twlcq-building-select-none'>Clear all</button>" +
+        "</div>" +
+        "<div class='twlcq-building-filter-list'></div>" +
+      "</div>" +
+      "<div class='twlcq-muted'>Settings are saved in TribalWars.scriptData when available, with local browser storage as fallback. Saving reloads the current queue list automatically.</div>";
 
     ui.sortBySelect = panel.querySelector(".twlcq-sort-by");
     ui.redWarningInput = panel.querySelector(".twlcq-red-warning");
     ui.orangeWarningInput = panel.querySelector(".twlcq-orange-warning");
     ui.yellowWarningInput = panel.querySelector(".twlcq-yellow-warning");
+    ui.buildingFilterList = panel.querySelector(".twlcq-building-filter-list");
 
     const saveButton = panel.querySelector(".twlcq-save-settings");
     saveButton.addEventListener("click", saveCurrentSettingsFromUi);
+
+    panel.querySelector(".twlcq-building-select-all").addEventListener("click", function () {
+      setAllBuildingFilterCheckboxes(true);
+    });
+
+    panel.querySelector(".twlcq-building-select-none").addEventListener("click", function () {
+      setAllBuildingFilterCheckboxes(false);
+    });
 
     ui.settingsPanel = panel;
     syncSettingsPanel();
@@ -1070,7 +1355,7 @@
 
     const help = document.createElement("p");
     help.className = "twlcq-help";
-    help.textContent = "Shows the top 15 construction queue entries. Default sorting is by single building duration. Use the settings icon to switch to total village queue duration or adjust warning thresholds.";
+    help.textContent = "Shows the top 15 construction queue entries. Default sorting is by single building duration. Use the settings icon to switch sorting, adjust warning thresholds, or filter by building type.";
 
     const settingsPanel = createSettingsPanel();
 
