@@ -76,7 +76,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.24";
+  const SCRIPT_VERSION = "1.7.25";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -583,7 +583,13 @@
     if (!node || node.nodeType !== 1) return "";
 
     const element = node;
-    const classText = element.className && typeof element.className === "string" ? element.className : "";
+    let classText = "";
+    if (typeof element.className === "string") {
+      classText = element.className;
+    } else if (element.className && typeof element.className.baseVal === "string") {
+      classText = element.className.baseVal;
+    }
+
     const markerText = cleanText([
       classText,
       element.getAttribute && element.getAttribute("src"),
@@ -592,9 +598,9 @@
       element.getAttribute && element.getAttribute("data-title")
     ].filter(Boolean).join(" ")).toLowerCase();
 
-    if (/wood|timber|lumber|holz|bois|madera|legno|drewno/.test(markerText)) return "wood";
-    if (/stone|clay|loam|lehm|argile|arcilla|argilla|glina/.test(markerText)) return "stone";
-    if (/iron|eisen|fer|hierro|ferro|zelazo|żelazo/.test(markerText)) return "iron";
+    if (/(^|[\s_-])(wood|res-wood|resource-wood)([\s_-]|$)|timber|lumber|holz|bois|madera|legno|drewno/.test(markerText)) return "wood";
+    if (/(^|[\s_-])(stone|clay|res-stone|resource-stone|resource-clay)([\s_-]|$)|loam|lehm|argile|arcilla|argilla|glina/.test(markerText)) return "stone";
+    if (/(^|[\s_-])(iron|res-iron|resource-iron)([\s_-]|$)|eisen|fer|hierro|ferro|zelazo|żelazo/.test(markerText)) return "iron";
 
     return "";
   }
@@ -614,7 +620,6 @@
 
   function parseResourceCellByMarkers(cell) {
     const resources = emptyResources();
-    const markers = [];
     const sequence = [];
 
     function walk(node) {
@@ -623,7 +628,6 @@
       if (node.nodeType === 1) {
         const key = getTransportResourceKeyFromNode(node);
         if (key) {
-          markers.push(key);
           sequence.push({ type: "marker", key: key });
         }
 
@@ -633,7 +637,7 @@
 
       if (node.nodeType === 3) {
         extractNumericTokens(node.textContent || "").forEach(item => {
-          sequence.push({ type: "number", value: item.value });
+          sequence.push({ type: "number", value: item.value, token: item.token });
         });
       }
     }
@@ -682,10 +686,18 @@
   }
 
   function getLikelyTransportResourceCell(row) {
-    const cells = Array.from(row.children || []);
+    const cells = Array.from(row.children || []).filter(cell => !/^th$/i.test(cell.tagName || ""));
     if (!cells.length) return null;
 
-    const markedCells = cells.filter(cell => hasTransportResourceMarker(cell) && totalResources(parseResourceCellByMarkers(cell)) > 0);
+    // Standard incoming trader table:
+    // checkbox, icon, sender, origin, target/village, arrival, arrives in, merchants, resources.
+    // The resources cell is normally the last cell. Prefer that cell so the "Arrives in"
+    // timer is never interpreted as a resource amount.
+    if (cells.length >= 8) {
+      return cells[cells.length - 1];
+    }
+
+    const markedCells = cells.filter(cell => hasTransportResourceMarker(cell) && extractNumericTokens(cell.textContent || "").length > 0);
     if (markedCells.length) return markedCells[markedCells.length - 1];
 
     const numericCells = cells.filter(cell => extractNumericTokens(cell.textContent || "").length > 0);
@@ -694,16 +706,20 @@
     return cells[cells.length - 1] || null;
   }
 
-  function extractTransportResourcesFromRow(row) {
-    const classResources = extractResourcesFromRow(row);
-    if (totalResources(classResources) > 0) {
-      return {
-        resources: classResources,
-        method: "class-resource-columns",
-        resourceCellText: ""
-      };
-    }
+  function isIncomingHeaderOrControlRow(row) {
+    if (!row) return true;
+    if (row.querySelector && row.querySelector("th")) return true;
 
+    const text = cleanText(row.textContent || "");
+    if (!text) return true;
+    if (/^select all$/i.test(text)) return true;
+    if (/sender/i.test(text) && /origin/i.test(text) && /resources/i.test(text)) return true;
+    if (/recipient/i.test(text) && /arrival/i.test(text) && /resources/i.test(text)) return true;
+
+    return false;
+  }
+
+  function extractTransportResourcesFromRow(row) {
     const resourceCell = getLikelyTransportResourceCell(row);
     const cellText = cleanText(resourceCell ? resourceCell.textContent : "").slice(0, 160);
 
@@ -733,6 +749,15 @@
       };
     }
 
+    const classResources = extractResourcesFromRow(row);
+    if (totalResources(classResources) > 0) {
+      return {
+        resources: classResources,
+        method: "class-resource-columns-fallback",
+        resourceCellText: cellText
+      };
+    }
+
     return {
       resources: emptyResources(),
       method: "resource-cell-empty",
@@ -743,7 +768,7 @@
   function rowTextLooksLikeTransportWithResources(text) {
     const normalized = cleanText(text);
     // Typical trader rows end with merchants and one to three resource amounts, e.g. "35 7.777 27.223".
-    return /\d+\s+\d[\d.]{2,}(?:\s+\d[\d.]{2,}){0,2}/.test(normalized);
+    return /\b\d+\s+\d[\d.]{2,}(?:\s+\d[\d.]{2,}){0,2}\b/.test(normalized);
   }
 
   function parseMerchants(row) {
@@ -1083,10 +1108,25 @@
     };
 
     rows.forEach((row, rowIndex) => {
+      const rowText = cleanText(row.textContent).slice(0, 240);
+
+      if (isIncomingHeaderOrControlRow(row)) {
+        if (diagnostics.skippedSamples.length < 8) {
+          diagnostics.skippedSamples.push({
+            rowIndex: rowIndex,
+            reason: "header/control row",
+            parserMethod: "row-skipped-before-resource-parse",
+            resourceCellText: "",
+            looksLikeTransportResources: false,
+            text: rowText
+          });
+        }
+        return;
+      }
+
       const resourceParse = extractTransportResourcesFromRow(row);
       const resources = resourceParse.resources;
       const total = totalResources(resources);
-      const rowText = cleanText(row.textContent).slice(0, 240);
 
       if (total <= 0) {
         diagnostics.rowsSkippedNoResources += 1;
@@ -1954,7 +1994,8 @@
       rejectedTinyResourceFragments: [],
       relayCandidates: [],
       relayAccepted: [],
-      relayRejected: []
+      relayRejected: [],
+      targetExclusions: []
     };
 
     const villages = state.villages.slice();
@@ -2217,6 +2258,31 @@
     return b.totalNeed - a.totalNeed;
   }
 
+  function determineTargetNoNeedReason(hasTemplateData, queueCoverage, needBeforeWarehouseCap, needAfterWarehouseCap, warehouseCap) {
+    if (!hasTemplateData) {
+      return "AM template assigned but template definition was not loaded or matched";
+    }
+
+    if (!queueCoverage || !(queueCoverage.plannedBuilds > 0)) {
+      return "queue coverage already satisfied, or no next template building found within coverage horizon";
+    }
+
+    if (totalResources(needBeforeWarehouseCap || emptyResources()) <= 0) {
+      return "current + incoming resources already cover the simulated template need";
+    }
+
+    if (warehouseCap && totalResources(needBeforeWarehouseCap || emptyResources()) > 0 && totalResources(needAfterWarehouseCap || emptyResources()) <= 0) {
+      return "90% target warehouse cap removed all remaining need";
+    }
+
+    return "no positive requestable need after current resources, incoming resources and warehouse cap";
+  }
+
+  function pushTargetExclusionDiagnostic(data) {
+    if (!state.debug || !state.debug.targetExclusions) return;
+    state.debug.targetExclusions.push(data);
+  }
+
   function buildTargets(villages, stats, settings) {
     return villages.map(village => {
       const current = getCurrentResourcesWithIncoming(village);
@@ -2257,6 +2323,7 @@
         };
       }
 
+      const needBeforeWarehouseCap = cloneResources(need);
       const warehouseCap = capNeedToTargetWarehouse(village, need, settings);
       need = warehouseCap.need;
 
@@ -2303,6 +2370,39 @@
       }
 
       const totalNeed = totalResources(need);
+
+      if (settings.useAmTemplates && hasTemplate && totalNeed <= 0) {
+        pushTargetExclusionDiagnostic({
+          coord: village.coord,
+          id: village.id,
+          name: village.name,
+          points: village.points || 0,
+          amTemplateName: village.amTemplateName || "",
+          hasTemplateData: hasTemplateData,
+          queueCount: village.queueCount || 0,
+          queueHours: queueHours,
+          queueCoverage: formatQueueCoverage(queueCoverage),
+          plannedBuilds: queueCoverage ? queueCoverage.plannedBuilds : 0,
+          current: getCurrentResourcesOnly(village),
+          incoming: cloneResources(village.incoming || emptyResources()),
+          currentPlusIncoming: getCurrentResourcesWithIncoming(village),
+          constructionNeed: cloneResources(constructionNeed || emptyResources()),
+          needBeforeWarehouseCap: cloneResources(needBeforeWarehouseCap || emptyResources()),
+          needAfterWarehouseCap: cloneResources(need || emptyResources()),
+          warehouseSpace: warehouseCap ? cloneResources(warehouseCap.space || emptyResources()) : null,
+          warehouseReduced: warehouseCap ? cloneResources(warehouseCap.reduced || emptyResources()) : emptyResources(),
+          currentOverLimit: warehouseCap ? warehouseCap.currentOverLimit : null,
+          reason: determineTargetNoNeedReason(hasTemplateData, queueCoverage, needBeforeWarehouseCap, need, warehouseCap),
+          nextBuilds: (queueCoverage && queueCoverage.details ? queueCoverage.details : []).slice(0, 5).map(detail => ({
+            building: detail.building,
+            level: detail.level,
+            reason: detail.reason,
+            seconds: detail.seconds,
+            resources: cloneResources(detail.resources || emptyResources())
+          }))
+        });
+      }
+
       const targetDraft = {
         village: village,
         need: need,
@@ -3532,7 +3632,8 @@
         originsOverAvailableResourcesOrMerchants: overOrigins.length,
         dataLoadSteps: debug.dataLoad ? debug.dataLoad.length : 0,
         amTemplatesLoaded: debug.amTemplateLoad && debug.amTemplateLoad.loadedTemplates ? debug.amTemplateLoad.loadedTemplates.length : 0,
-        amTemplatesFailed: debug.amTemplateLoad && debug.amTemplateLoad.failedTemplates ? debug.amTemplateLoad.failedTemplates.length : 0
+        amTemplatesFailed: debug.amTemplateLoad && debug.amTemplateLoad.failedTemplates ? debug.amTemplateLoad.failedTemplates.length : 0,
+        targetExclusions: debug.targetExclusions ? debug.targetExclusions.length : 0
       },
       stats: planResult.stats,
       overWarehouse: overWarehouse,
@@ -3557,6 +3658,7 @@
         reason: target.reason
       })),
       unplannedTargets: buildUnplannedTargetDiagnostics(planResult, settings),
+      targetExclusions: debug.targetExclusions || [],
       relayReplenishment: {
         candidates: debug.relayCandidates || [],
         accepted: debug.relayAccepted || [],
@@ -3579,6 +3681,7 @@
     console.log("AM template load", diagnostics.amTemplateLoad);
     console.log("Target planning order", diagnostics.targetPlanningOrder);
     console.log("Unplanned targets", diagnostics.unplannedTargets);
+    console.log("Target exclusions / no-need AM villages", diagnostics.targetExclusions);
     console.log("Relay replenishment", diagnostics.relayReplenishment);
     console.log("Capped targets", diagnostics.cappedTargets);
     console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
