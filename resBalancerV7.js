@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Twactics
  * License: MIT
  *
- * Twactics Resource Planner
+ * Twactics Resource Balancer
  *
  * Helps players create a resource transfer plan based on village resources,
  * merchants, building queues, Account Manager construction templates and incoming transports.
@@ -22,7 +22,7 @@
  * - Stops planning if incoming rows are visible but cannot be parsed, to avoid duplicate overfill requests
  * - Allows relay middlemen without an active queue only when they do not have an active AM construction template
  * - Prioritizes nearest affordable donors in AM construction mode so urgent targets receive resources faster
- * - Adds UI toggle and click/hover help dialogs for Low-point priority and Relay replenishment
+ * - Adds UI toggle and click help dialogs for Low-point priority and Relay replenishment
  * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
  * - Adds grouped plan diagnostics in the console for debugging and optimization
  * - Shows visible incoming and warehouse audit data in copied plans and the Audit section
@@ -70,19 +70,19 @@
 (function () {
   "use strict";
 
-  if (window.twacticsResourcePlannerLoaded) {
-    console.log("Twactics Resource Planner already loaded");
+  if (window.twacticsResourceBalancerLoaded) {
+    console.log("Twactics Resource Balancer already loaded");
     return;
   }
 
-  window.twacticsResourcePlannerLoaded = true;
+  window.twacticsResourceBalancerLoaded = true;
 
-  const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.27";
-  const BOX_ID = "twactics-resource-planner";
-  const STYLE_ID = "twactics-resource-planner-style";
+  const SCRIPT_NAME = "Twactics Resource Balancer";
+  const SCRIPT_VERSION = "1.0.0";
+  const BOX_ID = "twactics-resource-balancer";
+  const STYLE_ID = "twactics-resource-balancer-style";
   const DATA_VERSION = 1;
-  const SETTINGS_STORAGE_KEY = "twacticsResourcePlannerSettings";
+  const SETTINGS_STORAGE_KEY = "twacticsResourceBalancerSettings";
 
   const DEFAULTS = {
     useAmTemplates: true,
@@ -160,7 +160,7 @@
 
   const ui = {};
 
-  window.twacticsResourcePlanner = {
+  window.twacticsResourceBalancer = {
     close: closeDialog,
     state: state,
     exportSettings: exportUserData,
@@ -1982,7 +1982,6 @@
   async function loadAndPlan() {
     try {
       ui.planButton.disabled = true;
-      ui.copyButton.disabled = true;
       if (ui.results) ui.results.innerHTML = "";
 
       const settings = getSettings();
@@ -2038,7 +2037,6 @@
 
       logPlanDiagnostics(planResult, settings);
       renderResults(planResult);
-      ui.copyButton.disabled = !state.plan.length;
 
       setStatus(
         "Loaded " + state.villages.length + " village(s). Planned " +
@@ -4313,119 +4311,6 @@
     };
   }
 
-  function getIncomingLoadSummaryText() {
-    const load = state.lastDiagnostics && state.lastDiagnostics.incomingTransportLoad;
-    const selected = load && load.selected ? load.selected : null;
-
-    if (!selected) {
-      return "Incoming parsed: not available";
-    }
-
-    return "Incoming parsed: " +
-      (selected.rowsParsed || 0) + " row(s), " +
-      ((selected.byCoord && selected.byCoord.length) || 0) + " target(s), total " +
-      formatResources(selected.totals || emptyResources()) +
-      (load.selectedLabel ? " | source: " + load.selectedLabel : "");
-  }
-
-  function formatStorageAuditLine(targetPlan, settings) {
-    const audit = createTargetPlanStorageAudit(targetPlan, settings);
-    const safeText = audit.safeLimit === null ? "unknown" : formatNumber(audit.safeLimit);
-    const capacityText = audit.capacity ? formatNumber(audit.capacity) : "unknown";
-    let overText = "";
-    if (audit.plannedOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.plannedOverSafeLimit)) {
-      overText = " | OVER SAFE LIMIT";
-    } else if (audit.preExistingOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.preExistingOverSafeLimit)) {
-      overText = " | existing over safe: " + formatWarehouseOverResources(audit.preExistingOverSafeLimit);
-    }
-
-    const relayText = targetPlan && targetPlan.isRelay
-      ? " | outgoing before relay " + formatResources(audit.relayOutgoingOffset || emptyResources()) + " | projected after outgoing " + formatResources(audit.projectedBaseAfterOutgoing || emptyResources())
-      : "";
-
-    return "   Target storage audit: capacity " + capacityText +
-      " | 90% safe " + safeText +
-      " | current " + formatResources(audit.current) +
-      " | incoming " + formatResources(audit.incoming) +
-      " | current+incoming " + formatResources(audit.currentPlusIncoming) +
-      relayText +
-      " | after planned " + formatResources(audit.afterPlanned) +
-      overText;
-  }
-
-  function copyPlan() {
-    if (!state.plan.length) {
-      setStatus("No plan to copy.", "warn");
-      return;
-    }
-
-    const lines = [];
-    const settings = state.lastSettings || getSettings();
-
-    lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
-    lines.push("Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance"));
-    if (settings.useAmTemplates) {
-      lines.push("Build coverage target: " + settings.constructionHours + "h queue time");
-    }
-    lines.push("Origin reserve: " + settings.reserveWarehousePercent + "% of warehouse");
-    lines.push("Relay replenishment: " + (settings.enableRelayReplenishment !== false ? "enabled" : "disabled") + " (safety buffer " + (settings.relaySafetyBufferMinutes || DEFAULTS.relaySafetyBufferMinutes) + "m)");
-    lines.push(getIncomingLoadSummaryText());
-    lines.push("");
-
-    state.plan.forEach(targetPlan => {
-      lines.push(
-        targetPlan.id + ". " +
-        (targetPlan.isRelay ? "Relay refill target: " : "Target: ") + targetPlan.target.name +
-        " | " + formatResources(targetPlan.resources) +
-        " | origins: " + targetPlan.launches.length +
-        " | merchants: " + targetPlan.merchantsUsed +
-        " | max distance: " + targetPlan.maxDistance.toFixed(1) +
-        " | arrival: " + (targetPlan.arrivalBalance || "n/a")
-      );
-      lines.push("   Reason: " + targetPlan.targetReason);
-      lines.push(formatStorageAuditLine(targetPlan, settings));
-
-      targetPlan.launches.forEach(launch => {
-        lines.push(
-          "   - " + launch.origin.name +
-          " -> " + (launch.isRelay ? "relay refill " : "") + formatResources(launch.resources) +
-          " | distance: " + launch.distance.toFixed(1) +
-          (launch.travelMinutes !== undefined ? " | approx arrival: " + formatTravelMinutes(launch.travelMinutes) : "")
-        );
-      });
-
-      lines.push("");
-    });
-
-    const text = lines.join("\n");
-
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text)
-        .then(() => setStatus("Plan copied.", "success"))
-        .catch(() => fallbackCopy(text));
-      return;
-    }
-
-    fallbackCopy(text);
-  }
-
-  function fallbackCopy(text) {
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.style.position = "fixed";
-    textarea.style.left = "-9999px";
-    textarea.style.top = "-9999px";
-
-    document.body.appendChild(textarea);
-    textarea.focus();
-    textarea.select();
-
-    const copied = document.execCommand("copy");
-    textarea.remove();
-
-    setStatus(copied ? "Plan copied." : "Could not copy plan.", copied ? "success" : "error");
-  }
-
   function setStatus(message, type) {
     if (!ui.status) return;
 
@@ -4532,7 +4417,7 @@
 
       .twrp-grid {
         display: grid;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-template-columns: repeat(5, minmax(0, 1fr));
         gap: 8px;
         align-items: end;
       }
@@ -4542,6 +4427,7 @@
         font-weight: bold;
         margin-bottom: 4px;
         color: #3b2a18;
+        white-space: nowrap;
       }
 
       .twrp-hint {
@@ -4649,6 +4535,39 @@
         border: 1px solid #b99351;
         border-radius: 5px;
         background: #fffdf7;
+      }
+
+      .twrp-toggle-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: flex-start;
+        margin-top: 8px;
+      }
+
+      .twrp-toggle-row > div {
+        width: 216px;
+        max-width: 100%;
+      }
+
+      .twrp-scriptdata-note {
+        margin-top: 8px;
+        padding: 7px 8px;
+        border: 1px solid #d0ad6a;
+        border-radius: 6px;
+        background: #fffaf0;
+        font-size: 10px;
+        line-height: 1.35;
+        color: #4b3318;
+      }
+
+      .twrp-scriptdata-note code {
+        font-family: monospace;
+        font-size: 10px;
+        background: rgba(255,255,255,0.75);
+        border: 1px solid #ead8b3;
+        border-radius: 3px;
+        padding: 1px 3px;
       }
 
       .twrp-buttons {
@@ -4889,8 +4808,8 @@
     const style = document.getElementById(STYLE_ID);
     if (style) style.remove();
 
-    window.twacticsResourcePlannerLoaded = false;
-    delete window.twacticsResourcePlanner;
+    window.twacticsResourceBalancerLoaded = false;
+    delete window.twacticsResourceBalancer;
 
     if (state.lastSettings && state.lastSettings.debugConsole) console.log(SCRIPT_NAME + " closed");
   }
@@ -4956,7 +4875,7 @@
     button.type = "button";
     button.className = "twrp-info-button";
     button.textContent = "?";
-    button.title = body;
+    button.setAttribute("aria-label", title + " help");
     button.addEventListener("click", function (event) {
       event.preventDefault();
       event.stopPropagation();
@@ -5126,12 +5045,18 @@
       constructionHours.wrap,
       reserveMerchants.wrap,
       reserveWarehousePercent.wrap,
-      maxDistance.wrap,
-      prioritizeLowPoints.wrap,
-      enableRelayReplenishment.wrap
+      maxDistance.wrap
     ].forEach(node => grid.appendChild(node));
 
+    const toggleRow = document.createElement("div");
+    toggleRow.className = "twrp-toggle-row";
+    [
+      prioritizeLowPoints.wrap,
+      enableRelayReplenishment.wrap
+    ].forEach(node => toggleRow.appendChild(node));
+
     panel.appendChild(grid);
+    panel.appendChild(toggleRow);
 
     function updateModeControls() {
       const amMode = planMode.select.value === "am";
@@ -5151,16 +5076,13 @@
     planButton.textContent = "Create plan";
     planButton.addEventListener("click", loadAndPlan);
 
-    const copyButton = document.createElement("button");
-    copyButton.type = "button";
-    copyButton.className = "btn";
-    copyButton.textContent = "Copy plan";
-    copyButton.disabled = true;
-    copyButton.addEventListener("click", copyPlan);
-
     buttons.appendChild(planButton);
-    buttons.appendChild(copyButton);
     panel.appendChild(buttons);
+
+    const scriptDataNote = document.createElement("div");
+    scriptDataNote.className = "twrp-scriptdata-note";
+    scriptDataNote.innerHTML = "<strong>User data:</strong> Supports <code>TribalWars.scriptData</code>. When enabled in the Script Library, personal settings are loaded as JSON before the script runs. Expected format and options are documented in the script description.";
+    panel.appendChild(scriptDataNote);
 
     const status = document.createElement("div");
     status.className = "twrp-status";
@@ -5170,7 +5092,7 @@
 
     const footer = document.createElement("div");
     footer.className = "twrp-footer";
-    footer.textContent = "Created by Twactics";
+    footer.textContent = "Created by Twactics (zidrox)";
 
     body.appendChild(panel);
     body.appendChild(status);
@@ -5189,7 +5111,6 @@
     ui.prioritizeLowPoints = prioritizeLowPoints.input;
     ui.enableRelayReplenishment = enableRelayReplenishment.input;
     ui.planButton = planButton;
-    ui.copyButton = copyButton;
     ui.status = status;
     ui.results = results;
 
