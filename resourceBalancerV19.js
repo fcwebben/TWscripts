@@ -66,7 +66,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.16";
+  const SCRIPT_VERSION = "1.7.17";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -99,6 +99,10 @@
     baseMerchantMinutesPerField: 18,
     targetWarehouseLimitPercent: 90,
     minResourcePerOrigin: 500,
+    dataRequestDelayMs: 350,
+    templateRequestDelayMs: 650,
+    fetchRetryDelayMs: 1200,
+    fetchMaxRetries: 2,
     targetQueueCoverageBuildings: 4,
     queueSoonRefillBuildingCount: 1
   };
@@ -362,20 +366,81 @@
     return url.pathname + url.search;
   }
 
-  async function fetchText(url) {
-    const response = await fetch(url, {
-      method: "GET",
-      credentials: "same-origin",
-      headers: {
-        Accept: "text/html, */*; q=0.01"
-      }
-    });
+  function wait(ms) {
+    return new Promise(resolve => window.setTimeout(resolve, Math.max(0, ms || 0)));
+  }
 
-    if (!response.ok) {
-      throw new Error("HTTP " + response.status + " while loading " + url);
+  function getHttpStatusFromError(err) {
+    const message = err && err.message ? err.message : String(err || "");
+    const match = message.match(/HTTP\s+(\d+)/i);
+    return match ? parseInt(match[1], 10) : 0;
+  }
+
+  async function fetchText(url, options) {
+    const opts = Object.assign({
+      retries: DEFAULTS.fetchMaxRetries,
+      retryDelayMs: DEFAULTS.fetchRetryDelayMs,
+      label: ""
+    }, options || {});
+
+    let attempt = 0;
+    let lastError = null;
+
+    while (attempt <= opts.retries) {
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          credentials: "same-origin",
+          headers: {
+            Accept: "text/html, */*; q=0.01"
+          }
+        });
+
+        if (!response.ok) {
+          const error = new Error("HTTP " + response.status + " while loading " + url);
+          error.status = response.status;
+          throw error;
+        }
+
+        return response.text();
+      } catch (err) {
+        lastError = err;
+        const status = err && err.status ? err.status : getHttpStatusFromError(err);
+        const retryable = status === 429 || status === 502 || status === 503 || status === 504;
+
+        if (!retryable || attempt >= opts.retries) {
+          throw err;
+        }
+
+        const delay = Math.round((opts.retryDelayMs || DEFAULTS.fetchRetryDelayMs) * Math.pow(1.7, attempt));
+        console.warn(SCRIPT_NAME + " fetch retry " + (attempt + 1) + "/" + opts.retries, {
+          label: opts.label || "",
+          status: status,
+          delayMs: delay,
+          url: url
+        });
+        await wait(delay);
+        attempt++;
+      }
     }
 
-    return response.text();
+    throw lastError || new Error("Could not load " + url);
+  }
+
+  async function throttleDataRequest(label, delayMs) {
+    const delay = Math.max(0, delayMs === undefined ? DEFAULTS.dataRequestDelayMs : delayMs);
+    if (!state.debug) state.debug = {};
+    if (!state.debug.dataLoad) state.debug.dataLoad = [];
+
+    state.debug.dataLoad.push({
+      label: label || "data request",
+      delayMs: delay,
+      timestamp: new Date().toISOString()
+    });
+
+    if (delay > 0) {
+      await wait(delay);
+    }
   }
 
   function parseHtml(html) {
@@ -1091,7 +1156,7 @@
     let html;
 
     try {
-      html = await fetchText(mainUrl);
+      html = await fetchText(mainUrl, { label: "Account Manager village overview" });
     } catch (err) {
       console.warn(SCRIPT_NAME + " could not load Account Manager data:", err);
       return result;
@@ -1121,13 +1186,14 @@
     });
 
     const options = Array.from(doc.querySelectorAll('select[name="template"] option'));
-    const templateFetches = [];
+    const templateQueue = [];
+    const seenTemplateIds = new Set();
 
     options.forEach(option => {
       const optionName = normalizeTemplateName(option.textContent);
       const templateId = option.value;
 
-      if (!optionName || !templateId) return;
+      if (!optionName || !templateId || seenTemplateIds.has(String(templateId))) return;
 
       const matchesAssigned = Array.from(assignedTemplateNames).some(name => {
         return name === optionName || optionName.includes(name) || name.includes(optionName);
@@ -1135,13 +1201,41 @@
 
       if (!matchesAssigned) return;
 
-      templateFetches.push(loadTemplateDefinition(templateId, optionName));
+      seenTemplateIds.add(String(templateId));
+      templateQueue.push({
+        id: templateId,
+        name: optionName
+      });
     });
 
-    const templateDefs = await Promise.all(templateFetches);
+    if (!state.debug) state.debug = {};
+    state.debug.amTemplateLoad = {
+      assignedTemplates: Array.from(assignedTemplateNames),
+      queuedTemplates: templateQueue.map(item => ({ id: item.id, name: item.name })),
+      loadedTemplates: [],
+      failedTemplates: [],
+      delayMs: DEFAULTS.templateRequestDelayMs
+    };
 
-    templateDefs.forEach(def => {
-      if (!def || !def.name) return;
+    for (let i = 0; i < templateQueue.length; i++) {
+      const item = templateQueue[i];
+      setStatus("Loading AM template " + (i + 1) + "/" + templateQueue.length + ": " + item.name + "...", "warn");
+
+      await throttleDataRequest("AM template delay before " + item.name, DEFAULTS.templateRequestDelayMs);
+
+      const def = await loadTemplateDefinition(item.id, item.name);
+
+      if (!def || !def.name) {
+        state.debug.amTemplateLoad.failedTemplates.push({ id: item.id, name: item.name });
+        continue;
+      }
+
+      state.debug.amTemplateLoad.loadedTemplates.push({
+        id: item.id,
+        name: def.name,
+        buildings: def.buildings ? def.buildings.length : 0
+      });
+
       result.templateDefsByName.set(def.name, def);
 
       Array.from(assignedTemplateNames).forEach(assignedName => {
@@ -1149,7 +1243,7 @@
           result.templateDefsByName.set(assignedName, def);
         }
       });
-    });
+    }
 
     return result;
   }
@@ -1162,7 +1256,7 @@
     });
 
     try {
-      const html = await fetchText(url);
+      const html = await fetchText(url, { label: "AM template " + templateName, retries: DEFAULTS.fetchMaxRetries, retryDelayMs: DEFAULTS.fetchRetryDelayMs });
       const doc = parseHtml(html);
       const buildings = [];
 
@@ -1570,15 +1664,35 @@
         templateDefsByName: new Map()
       };
 
-      const productionData = await loadProductionData();
-      const results = await Promise.all([
-        loadBuildingsData(),
-        loadIncomingData(productionData),
-        settings.useAmTemplates ? loadAccountManagerData() : Promise.resolve(emptyAmData),
-        settings.useAmTemplates ? loadBuildingConstants() : Promise.resolve(new Map())
-      ]);
+      state.debug = {
+        dataLoad: []
+      };
 
-      mergeLoadedData(productionData, results[0], results[1], results[2], results[3], settings);
+      setStatus("Loading production data: resources, warehouse capacity and merchants...", "warn");
+      const productionData = await loadProductionData();
+      await throttleDataRequest("after production data");
+
+      setStatus("Loading building queues...", "warn");
+      const buildingsData = await loadBuildingsData();
+      await throttleDataRequest("after building queues");
+
+      setStatus("Loading incoming transports from group 0...", "warn");
+      const incomingData = await loadIncomingData(productionData);
+
+      let buildingConstants = new Map();
+      let amData = emptyAmData;
+
+      if (settings.useAmTemplates) {
+        await throttleDataRequest("before building constants");
+        setStatus("Loading building cost data...", "warn");
+        buildingConstants = await loadBuildingConstants();
+
+        await throttleDataRequest("before Account Manager templates");
+        setStatus("Loading Account Manager templates sequentially...", "warn");
+        amData = await loadAccountManagerData();
+      }
+
+      mergeLoadedData(productionData, buildingsData, incomingData, amData, buildingConstants, settings);
 
       const planResult = createTransferPlan(settings);
       state.plan = planResult.targetPlans;
@@ -1606,6 +1720,8 @@
     const previousDebug = state.debug || {};
     state.debug = {
       incomingTransportLoad: previousDebug.incomingTransportLoad || null,
+      dataLoad: previousDebug.dataLoad || [],
+      amTemplateLoad: previousDebug.amTemplateLoad || null,
       cappedTargets: [],
       skippedSmallShipments: [],
       rejectedTinyResourceFragments: []
@@ -2683,7 +2799,11 @@
         reserveMerchants: settings.reserveMerchants,
         arrivalBalanceWindowMinutes: settings.arrivalBalanceWindowMinutes,
         merchantMinutesPerField: settings.merchantMinutesPerField,
-        prioritizeLowPoints: settings.prioritizeLowPoints
+        prioritizeLowPoints: settings.prioritizeLowPoints,
+        dataRequestDelayMs: DEFAULTS.dataRequestDelayMs,
+        templateRequestDelayMs: DEFAULTS.templateRequestDelayMs,
+        fetchRetryDelayMs: DEFAULTS.fetchRetryDelayMs,
+        fetchMaxRetries: DEFAULTS.fetchMaxRetries
       },
       counts: {
         villages: state.villages.length,
@@ -2698,7 +2818,10 @@
         queueCoverageTargetBuildings: settings.targetQueueCoverageBuildings,
         targetsWithIncoming: debug.incomingTransportLoad && debug.incomingTransportLoad.selected && debug.incomingTransportLoad.selected.byCoord ? debug.incomingTransportLoad.selected.byCoord.length : 0,
         targetsOverSafeWarehouseLimit: overWarehouse.length,
-        originsOverAvailableResourcesOrMerchants: overOrigins.length
+        originsOverAvailableResourcesOrMerchants: overOrigins.length,
+        dataLoadSteps: debug.dataLoad ? debug.dataLoad.length : 0,
+        amTemplatesLoaded: debug.amTemplateLoad && debug.amTemplateLoad.loadedTemplates ? debug.amTemplateLoad.loadedTemplates.length : 0,
+        amTemplatesFailed: debug.amTemplateLoad && debug.amTemplateLoad.failedTemplates ? debug.amTemplateLoad.failedTemplates.length : 0
       },
       stats: planResult.stats,
       overWarehouse: overWarehouse,
@@ -2706,6 +2829,8 @@
       targetWarehouseAudit: targetWarehouseAudit,
       originUsageAudit: originUsageAudit,
       incomingTransportLoad: debug.incomingTransportLoad || null,
+      dataLoad: debug.dataLoad || [],
+      amTemplateLoad: debug.amTemplateLoad || null,
       targetPlanningOrder: (planResult.targets || []).slice(0, 40).map(target => ({
         order: target.planningOrder,
         coord: target.village.coord,
@@ -2732,6 +2857,8 @@
     console.log("Target warehouse audit", targetWarehouseAudit);
     console.log("Origin usage audit", originUsageAudit);
     console.log("Incoming transport load", diagnostics.incomingTransportLoad);
+    console.log("Data load steps", diagnostics.dataLoad);
+    console.log("AM template load", diagnostics.amTemplateLoad);
     console.log("Target planning order", diagnostics.targetPlanningOrder);
     console.log("Capped targets", diagnostics.cappedTargets);
     console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
