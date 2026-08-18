@@ -16,6 +16,7 @@
  * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
  * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
  * - Adds grouped plan diagnostics in the console for debugging and optimization
+ * - Shows visible incoming and warehouse audit data in copied plans and the Audit section
  * - Uses current origin resources only when planning requestable origin availability
  * - Creates either an AM construction plan or a warehouse-percentage balance plan after a manual user click
  * - Allows one grouped manual request action per target row
@@ -65,7 +66,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.13";
+  const SCRIPT_VERSION = "1.7.15";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -340,6 +341,7 @@
     }
 
     Object.keys(params || {}).forEach(key => {
+      if (key.indexOf("__") === 0) return;
       if (params[key] !== undefined && params[key] !== null && params[key] !== "") {
         url.searchParams.set(key, String(params[key]));
       }
@@ -348,6 +350,8 @@
     if (
       currentGroup &&
       params &&
+      !params.__skipGroup &&
+      params.group === undefined &&
       (params.screen === "overview_villages" || params.screen === "am_village")
     ) {
       url.searchParams.set("group", currentGroup);
@@ -646,12 +650,13 @@
 
     if (!table) return -1;
 
-    const headerRows = Array.from(table.querySelectorAll("thead tr, tr")).slice(0, 3);
+    const headerRows = Array.from(table.querySelectorAll("thead tr, tr")).slice(0, 4);
     const targetPatterns = [
       /target/i,
       /destination/i,
       /recipient/i,
       /to village/i,
+      /target village/i,
       /mottag/i,
       /mål/i,
       /ziel/i,
@@ -666,12 +671,24 @@
 
       for (let i = 0; i < cells.length; i++) {
         const text = cleanText(cells[i].textContent);
+        const links = Array.from(cells[i].querySelectorAll("a[href]")).map(link => link.getAttribute("href") || "").join(" ");
+
+        if (/order=target_village_name/i.test(links)) {
+          return i;
+        }
+
         if (!text) continue;
 
-        const isOrigin = originPatterns.some(pattern => pattern.test(text));
+        const isOrigin = originPatterns.some(pattern => pattern.test(text)) || /order=start_village_name/i.test(links);
         const isTarget = targetPatterns.some(pattern => pattern.test(text));
 
         if (isTarget && !isOrigin) {
+          return i;
+        }
+
+        // English Tribal Wars trader overview labels the target column simply as "Village".
+        // The origin column is labeled "Origin", so a plain Village header is safe here.
+        if (/^village$/i.test(text) && !isOrigin) {
           return i;
         }
       }
@@ -689,10 +706,24 @@
     if (!link || !lookup) return "";
 
     const href = link.getAttribute("href") || "";
-    const id = getParam("village", href) || getParam("id", href) || "";
 
-    if (id && lookup.byId.has(String(id))) {
-      return lookup.byId.get(String(id));
+    // In overview pages, links often include village=<current village id> even when the
+    // link points to a player or another screen. Do not use that value for transport rows.
+    if (/screen=info_village/i.test(href)) {
+      const id = getParam("id", href) || "";
+      if (id && lookup.byId.has(String(id))) {
+        return lookup.byId.get(String(id));
+      }
+
+      const coord = getCoordFromText(link.textContent || "");
+      if (coord) return coord;
+    }
+
+    if (/screen=overview/i.test(href)) {
+      const id = getParam("village", href) || "";
+      if (id && lookup.byId.has(String(id))) {
+        return lookup.byId.get(String(id));
+      }
     }
 
     return "";
@@ -719,6 +750,18 @@
       }
     }
 
+    // Fallback for the standard incoming trader table:
+    // checkbox, icon, sender, origin, target/village, arrival, arrives in, merchants, resources.
+    if (cells.length >= 9) {
+      const standardTargetCellCoord = getCoordFromText(cells[4].textContent);
+      if (standardTargetCellCoord) {
+        return {
+          coord: standardTargetCellCoord,
+          method: "standard-trader-target-cell"
+        };
+      }
+    }
+
     const knownLinkCoords = Array.from(row.querySelectorAll("a[href]")).map(link => getKnownVillageCoordFromLink(link, lookup)).filter(Boolean);
     const uniqueKnownLinkCoords = Array.from(new Set(knownLinkCoords));
 
@@ -731,7 +774,7 @@
 
     const coordMatches = cleanText(row.textContent).match(/\d{1,3}\|\d{1,3}/g) || [];
 
-    if (coordMatches.length) {
+    if (coordMatches.length >= 2) {
       return {
         coord: coordMatches[coordMatches.length - 1],
         method: uniqueKnownLinkCoords.length > 1 ? "last-coordinate-fallback-ambiguous-links" : "last-coordinate-fallback"
@@ -785,6 +828,7 @@
       detectionMethods: {},
       totals: emptyResources(),
       ambiguousRows: [],
+      parsedSamples: [],
       skippedSamples: [],
       byCoord: []
     };
@@ -815,6 +859,16 @@
         return;
       }
 
+      if (diagnostics.parsedSamples.length < 12) {
+        diagnostics.parsedSamples.push({
+          rowIndex: rowIndex,
+          method: detected.method,
+          selectedCoord: coord,
+          resources: cloneResources(resources),
+          text: rowText
+        });
+      }
+
       if (/ambiguous|fallback/.test(detected.method) && diagnostics.ambiguousRows.length < 20) {
         diagnostics.ambiguousRows.push({
           rowIndex: rowIndex,
@@ -842,16 +896,42 @@
     const lookup = buildVillageLookupContext(villages);
     const incomingUrlSpecs = [
       {
+        label: "incoming-group-0-all-pages",
         screen: "overview_villages",
         mode: "trader",
         type: "inc",
-        page: "-1"
+        group: "0",
+        page: "-1",
+        __skipGroup: true
       },
       {
+        label: "incoming-group-0-page-0-debug",
         screen: "overview_villages",
         mode: "trader",
-        type: "incoming",
-        page: "-1"
+        type: "inc",
+        group: "0",
+        page: "0",
+        __skipGroup: true,
+        __debugOnly: true
+      },
+      {
+        label: "incoming-without-group-debug",
+        screen: "overview_villages",
+        mode: "trader",
+        type: "inc",
+        page: "-1",
+        __skipGroup: true,
+        __debugOnly: true
+      },
+      {
+        label: "all-transports-group-0-debug-only",
+        screen: "overview_villages",
+        mode: "trader",
+        type: "all",
+        group: "0",
+        page: "-1",
+        __skipGroup: true,
+        __debugOnly: true
       }
     ];
 
@@ -859,25 +939,26 @@
     let selected = null;
 
     for (let i = 0; i < incomingUrlSpecs.length; i++) {
-      const url = buildGameUrl(incomingUrlSpecs[i]);
+      const spec = incomingUrlSpecs[i];
+      const url = buildGameUrl(spec);
 
       try {
         const html = await fetchText(url);
         const doc = parseHtml(html);
-        const rows = Array.from(doc.querySelectorAll("#trades_table tbody tr, #content_value .row_a, #content_value .row_b"));
+        const rows = Array.from(doc.querySelectorAll("#trades_table tbody tr.row_a, #trades_table tbody tr.row_b, #trades_table tbody tr"));
         const parsed = parseIncomingRows(doc, rows, lookup, url);
+        parsed.diagnostics.label = spec.label || "incoming";
+        parsed.diagnostics.debugOnly = Boolean(spec.__debugOnly);
         attempts.push(parsed.diagnostics);
 
-        if (!selected || parsed.diagnostics.rowsParsed > selected.diagnostics.rowsParsed) {
+        if (!spec.__debugOnly && (!selected || parsed.diagnostics.rowsParsed > selected.diagnostics.rowsParsed)) {
           selected = parsed;
-        }
-
-        if (parsed.diagnostics.rowsParsed > 0) {
-          break;
         }
       } catch (err) {
         attempts.push({
+          label: spec.label || "incoming",
           url: url,
+          debugOnly: Boolean(spec.__debugOnly),
           error: err && err.message ? err.message : String(err),
           rowsSeen: 0,
           rowsParsed: 0
@@ -900,6 +981,7 @@
     if (!state.debug) state.debug = {};
     state.debug.incomingTransportLoad = {
       selectedUrl: selected.diagnostics.url || "",
+      selectedLabel: selected.diagnostics.label || "",
       attempts: attempts,
       selected: selected.diagnostics
     };
@@ -1517,7 +1599,9 @@
   }
 
   function createTransferPlan(settings) {
+    const previousDebug = state.debug || {};
     state.debug = {
+      incomingTransportLoad: previousDebug.incomingTransportLoad || null,
       cappedTargets: [],
       skippedSmallShipments: [],
       rejectedTinyResourceFragments: []
@@ -2695,6 +2779,7 @@
       total: targetPlan.total,
       merchantsUsed: targetPlan.merchantsUsed,
       arrivalBalance: targetPlan.arrivalBalance,
+      targetStorageAudit: createTargetPlanStorageAudit(targetPlan, state.lastSettings || getSettings()),
       payload: debugPayload,
       payloadOriginCount: targetPlan.launches.length,
       payloadResourceKeys: Object.keys(debugPayload).length
@@ -2781,7 +2866,10 @@
 
       appendCell(row, String(targetPlan.id));
       appendCell(row, targetPlan.target.name, "twrp-left twrp-target-name");
-      appendCell(row, formatResources(targetPlan.resources) + "\n" + (targetPlan.arrivalBalance || ""), "twrp-left twrp-resource-cell");
+      const targetAudit = createTargetPlanStorageAudit(targetPlan, state.lastSettings || getSettings());
+      const incomingLine = totalResources(targetAudit.incoming) > 0 ? "\nIncoming: " + formatResources(targetAudit.incoming) : "\nIncoming: -";
+      const safeLine = targetAudit.safeLimit === null ? "" : "\nAfter: " + formatResources(targetAudit.afterPlanned) + " / safe " + formatNumber(targetAudit.safeLimit);
+      appendCell(row, formatResources(targetPlan.resources) + "\n" + (targetPlan.arrivalBalance || "") + incomingLine + safeLine, "twrp-left twrp-resource-cell");
 
       const originsCell = document.createElement("td");
       originsCell.className = "twrp-left";
@@ -2844,6 +2932,28 @@
     const summary = document.createElement("summary");
     summary.textContent = "Audit";
     details.appendChild(summary);
+
+    const incomingTitle = document.createElement("div");
+    incomingTitle.className = "twrp-section-title";
+    incomingTitle.textContent = "Incoming / target warehouse audit";
+    details.appendChild(incomingTitle);
+
+    const settings = state.lastSettings || getSettings();
+    details.appendChild(createMiniTable(
+      ["Village", "Current", "Incoming", "Planned", "After", "Safe", "Over"],
+      (planResult.targetPlans || []).map(plan => {
+        const audit = createTargetPlanStorageAudit(plan, settings);
+        return [
+          plan.target.name,
+          formatResources(audit.current),
+          formatResources(audit.incoming),
+          formatResources(audit.planned),
+          formatResources(audit.afterPlanned),
+          audit.safeLimit === null ? "unknown" : formatNumber(audit.safeLimit),
+          audit.overSafeLimit && (audit.overSafeLimit.wood || audit.overSafeLimit.stone || audit.overSafeLimit.iron) ? "YES" : "no"
+        ];
+      })
+    ));
 
     const targetTitle = document.createElement("div");
     targetTitle.className = "twrp-section-title";
@@ -2948,6 +3058,70 @@
     return hours + "h" + (rest ? " " + rest + "m" : "");
   }
 
+  function createTargetPlanStorageAudit(targetPlan, settings) {
+    const target = targetPlan && targetPlan.target ? targetPlan.target : {};
+    const current = getCurrentResourcesOnly(target);
+    const incoming = cloneResources(target.incoming || emptyResources());
+    const currentPlusIncoming = getCurrentResourcesWithIncoming(target);
+    const planned = cloneResources(targetPlan && targetPlan.resources ? targetPlan.resources : emptyResources());
+    const safeLimit = getTargetWarehouseLimit(target, settings || DEFAULTS);
+    const afterPlanned = {
+      wood: currentPlusIncoming.wood + (planned.wood || 0),
+      stone: currentPlusIncoming.stone + (planned.stone || 0),
+      iron: currentPlusIncoming.iron + (planned.iron || 0)
+    };
+
+    return {
+      target: target.coord || "",
+      targetId: target.id || "",
+      capacity: target.capacity || 0,
+      safeLimitPercent: settings && settings.targetWarehouseLimitPercent !== undefined ? settings.targetWarehouseLimitPercent : DEFAULTS.targetWarehouseLimitPercent,
+      safeLimit: safeLimit,
+      current: current,
+      incoming: incoming,
+      currentPlusIncoming: currentPlusIncoming,
+      planned: planned,
+      afterPlanned: afterPlanned,
+      overSafeLimit: safeLimit !== null ? {
+        wood: afterPlanned.wood > safeLimit,
+        stone: afterPlanned.stone > safeLimit,
+        iron: afterPlanned.iron > safeLimit
+      } : null
+    };
+  }
+
+  function getIncomingLoadSummaryText() {
+    const load = state.lastDiagnostics && state.lastDiagnostics.incomingTransportLoad;
+    const selected = load && load.selected ? load.selected : null;
+
+    if (!selected) {
+      return "Incoming parsed: not available";
+    }
+
+    return "Incoming parsed: " +
+      (selected.rowsParsed || 0) + " row(s), " +
+      ((selected.byCoord && selected.byCoord.length) || 0) + " target(s), total " +
+      formatResources(selected.totals || emptyResources()) +
+      (load.selectedLabel ? " | source: " + load.selectedLabel : "");
+  }
+
+  function formatStorageAuditLine(targetPlan, settings) {
+    const audit = createTargetPlanStorageAudit(targetPlan, settings);
+    const safeText = audit.safeLimit === null ? "unknown" : formatNumber(audit.safeLimit);
+    const capacityText = audit.capacity ? formatNumber(audit.capacity) : "unknown";
+    const overText = audit.overSafeLimit && (audit.overSafeLimit.wood || audit.overSafeLimit.stone || audit.overSafeLimit.iron)
+      ? " | OVER SAFE LIMIT"
+      : "";
+
+    return "   Target storage audit: capacity " + capacityText +
+      " | 90% safe " + safeText +
+      " | current " + formatResources(audit.current) +
+      " | incoming " + formatResources(audit.incoming) +
+      " | current+incoming " + formatResources(audit.currentPlusIncoming) +
+      " | after planned " + formatResources(audit.afterPlanned) +
+      overText;
+  }
+
   function copyPlan() {
     if (!state.plan.length) {
       setStatus("No plan to copy.", "warn");
@@ -2960,6 +3134,7 @@
     lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
     lines.push("Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance"));
     lines.push("Origin reserve: " + settings.reserveWarehousePercent + "% of warehouse");
+    lines.push(getIncomingLoadSummaryText());
     lines.push("");
 
     state.plan.forEach(targetPlan => {
@@ -2973,6 +3148,7 @@
         " | arrival: " + (targetPlan.arrivalBalance || "n/a")
       );
       lines.push("   Reason: " + targetPlan.targetReason);
+      lines.push(formatStorageAuditLine(targetPlan, settings));
 
       targetPlan.launches.forEach(launch => {
         lines.push(
