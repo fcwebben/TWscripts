@@ -14,6 +14,7 @@
  * - Reads incoming transport data
  * - Counts incoming resources for target need and 90% target warehouse safety calculations
  * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
+ * - Parses warehouse capacity after resource columns and rejects points-column values as capacity
  * - Treats Build coverage as target queue time coverage, not only number of queued buildings
  * - Caps warehouse safety per resource so one overflowing resource does not block other resources
  * - Creates optional conservative relay replenishment requests after direct target requests
@@ -77,7 +78,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.26";
+  const SCRIPT_VERSION = "1.7.27";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -799,24 +800,78 @@
     };
   }
 
-  function parseCapacity(row) {
+  function getSinglePositiveNumberFromCell(cell) {
+    const numbers = extractNumericTokens(cell ? cell.textContent : "");
+    return numbers.length === 1 ? numbers[0].value : 0;
+  }
+
+  function cellLooksLikeVillageNameOrCoord(cell) {
+    const text = cleanText(cell ? cell.textContent : "");
+    return /\d{1,3}\|\d{1,3}/.test(text);
+  }
+
+  function cellLooksLikeFarmUsage(cell) {
+    const text = cleanText(cell ? cell.textContent : "");
+    return /\d[\d.]*\s*\/\s*\d[\d.]*/.test(text);
+  }
+
+  function cellLooksLikeResourceCell(cell) {
+    return Boolean(cell && cell.querySelector && cell.querySelector(".wood, .stone, .iron"));
+  }
+
+  function cellLooksLikeMerchantCell(cell) {
+    return Boolean(cell && cell.querySelector && cell.querySelector('a[href*="market"], a[href*="screen=market"]'));
+  }
+
+  function isLikelyWarehouseCapacityCell(cell, value, resources) {
+    if (!value || value < 1000 || value > 1000000) return false;
+    if (cellLooksLikeVillageNameOrCoord(cell)) return false;
+    if (cellLooksLikeFarmUsage(cell)) return false;
+    if (cellLooksLikeResourceCell(cell)) return false;
+    if (cellLooksLikeMerchantCell(cell)) return false;
+
+    const maxCurrentResource = Math.max(
+      resources && resources.wood || 0,
+      resources && resources.stone || 0,
+      resources && resources.iron || 0
+    );
+
+    // A village cannot currently hold more of a resource than its warehouse capacity.
+    // If a parsed value is below the current stored resource amount, it is almost always
+    // the points column or another metadata column, not warehouse capacity.
+    if (maxCurrentResource > 0 && value < maxCurrentResource) return false;
+
+    return true;
+  }
+
+  function parseCapacity(row, resources) {
     const cells = Array.from(row.children);
+    const resourceIndexes = [];
 
-    for (let i = 0; i < cells.length; i++) {
-      const text = cleanText(cells[i].textContent);
-      const numbers = text.match(/\d[\d.]{2,}/g);
+    cells.forEach((cell, index) => {
+      if (cellLooksLikeResourceCell(cell)) {
+        resourceIndexes.push(index);
+      }
+    });
 
-      if (numbers && numbers.length === 1) {
-        const value = parseNumber(numbers[0]);
+    const lastResourceIndex = resourceIndexes.length ? Math.max.apply(null, resourceIndexes) : -1;
 
-        if (value >= 1000 && value <= 1000000) {
-          const hasResourceIcon = cells[i].querySelector(".wood, .stone, .iron");
-          const hasMarketLink = cells[i].querySelector('a[href*="market"]');
-
-          if (!hasResourceIcon && !hasMarketLink) {
-            return value;
-          }
+    // First preference: the first sane single-number cell after the resource columns.
+    // This avoids accidentally reading the village points column as warehouse capacity.
+    if (lastResourceIndex >= 0) {
+      for (let i = lastResourceIndex + 1; i < cells.length; i++) {
+        const value = getSinglePositiveNumberFromCell(cells[i]);
+        if (isLikelyWarehouseCapacityCell(cells[i], value, resources)) {
+          return value;
         }
+      }
+    }
+
+    // Fallback: search the entire row, but still reject values below current resources.
+    for (let i = 0; i < cells.length; i++) {
+      const value = getSinglePositiveNumberFromCell(cells[i]);
+      if (isLikelyWarehouseCapacityCell(cells[i], value, resources)) {
+        return value;
       }
     }
 
@@ -890,7 +945,7 @@
         iron: resources.iron,
         merchants: merchants.available,
         merchantsTotal: merchants.total,
-        capacity: parseCapacity(row),
+        capacity: parseCapacity(row, resources),
         points: parsePoints(row),
         farmUsed: farm.used,
         farmMax: farm.max,
