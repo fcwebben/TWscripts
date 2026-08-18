@@ -16,7 +16,10 @@
  * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
  * - Treats Build coverage as target queue time coverage, not only number of queued buildings
  * - Caps warehouse safety per resource so one overflowing resource does not block other resources
- * - Creates conservative relay replenishment requests after direct target requests
+ * - Creates optional conservative relay replenishment requests after direct target requests
+ * - Allows relay middlemen without an active queue only when they do not have an active AM construction template
+ * - Prioritizes nearest affordable donors in AM construction mode so urgent targets receive resources faster
+ * - Adds UI toggle and click/hover help dialogs for Low-point priority and Relay replenishment
  * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
  * - Adds grouped plan diagnostics in the console for debugging and optimization
  * - Shows visible incoming and warehouse audit data in copied plans and the Audit section
@@ -71,7 +74,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.21";
+  const SCRIPT_VERSION = "1.7.23";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -274,7 +277,8 @@
       ui.reserveMerchants,
       ui.reserveWarehousePercent,
       ui.maxDistance,
-      ui.prioritizeLowPoints
+      ui.prioritizeLowPoints,
+      ui.enableRelayReplenishment
     ].forEach(input => {
       if (!input || input.__twacticsSettingsAutoSave) return;
       input.__twacticsSettingsAutoSave = true;
@@ -1615,7 +1619,7 @@
     const arrivalBalanceWindowMinutes = DEFAULTS.arrivalBalanceWindowMinutes;
     const prioritizeLowPoints = ui.prioritizeLowPoints.checked;
     const savedSettings = state.savedSettings || {};
-    const enableRelayReplenishment = savedSettings.enableRelayReplenishment !== undefined ? savedSettings.enableRelayReplenishment !== false : DEFAULTS.enableRelayReplenishment;
+    const enableRelayReplenishment = ui.enableRelayReplenishment ? ui.enableRelayReplenishment.checked : (savedSettings.enableRelayReplenishment !== undefined ? savedSettings.enableRelayReplenishment !== false : DEFAULTS.enableRelayReplenishment);
     const relaySafetyBufferMinutes = savedSettings.relaySafetyBufferMinutes !== undefined ? Math.max(0, Math.min(360, parseFloatSafe(savedSettings.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes))) : DEFAULTS.relaySafetyBufferMinutes;
 
     return {
@@ -1638,7 +1642,7 @@
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
-      donorPreference: DEFAULTS.donorPreference,
+      donorPreference: useAmTemplates ? "distance_optimized" : DEFAULTS.donorPreference,
       donorDistancePenalty: DEFAULTS.donorDistancePenalty,
       noTemplateDonorBonus: DEFAULTS.noTemplateDonorBonus,
       farmBlockedDonorBonus: DEFAULTS.farmBlockedDonorBonus,
@@ -2614,6 +2618,8 @@
       const middlemanId = String(middleman.id);
       const queueSeconds = Math.max(0, middleman.queueEndSeconds || 0);
       const queueHours = queueSeconds / 3600;
+      const middlemanHasTemplate = Boolean(middleman.amTemplateName);
+      const middlemanQueueEmpty = queueSeconds <= 0;
       const candidateBase = {
         middleman: middleman.coord,
         middlemanId: middleman.id,
@@ -2621,6 +2627,8 @@
         outgoing: cloneResources(outgoing.resources),
         outgoingTotal: outgoing.total,
         queueHours: queueHours,
+        hasAmTemplate: middlemanHasTemplate,
+        amTemplateName: middleman.amTemplateName || "",
         targets: outgoing.targetNames.slice(0, 5)
       };
 
@@ -2638,8 +2646,8 @@
         return;
       }
 
-      if (queueSeconds <= 0) {
-        pushRelayRejected(candidateBase, "middleman has no active construction queue");
+      if (middlemanHasTemplate && middlemanQueueEmpty) {
+        pushRelayRejected(candidateBase, "middleman has active AM template but no construction queue");
         return;
       }
 
@@ -2679,7 +2687,7 @@
             if (settings.maxDistance > 0 && distance > settings.maxDistance) return false;
 
             const travelMinutes = getTravelMinutes(distance, settings);
-            if (queueSeconds < ((travelMinutes + relaySafetyBufferMinutes) * 60)) return false;
+            if (middlemanHasTemplate && queueSeconds < ((travelMinutes + relaySafetyBufferMinutes) * 60)) return false;
 
             return true;
           })
@@ -2728,6 +2736,10 @@
         donor.usedTotal += totalResources(shipment.resources);
         donor.usedTransfers += 1;
 
+        const relayReason = middlemanHasTemplate
+          ? "Relay refill after this village sent resources onward; queue buffer " + formatTravelMinutes(queueSeconds / 60) + ", refill arrives in ~" + formatTravelMinutes(match.travelMinutes) + " + " + relaySafetyBufferMinutes + "m safety"
+          : "Relay refill after this village sent resources onward; middleman has no active AM template, so no queue buffer is required";
+
         const relayLaunch = {
           id: launchId++,
           origin: donor.village,
@@ -2743,7 +2755,7 @@
           targetPriorityTier: 90,
           targetQueueCoverage: null,
           donorScore: match.score,
-          targetReason: "Relay refill after this village sent resources onward; queue buffer " + formatTravelMinutes(queueSeconds / 60) + ", refill arrives in ~" + formatTravelMinutes(match.travelMinutes) + " + " + relaySafetyBufferMinutes + "m safety",
+          targetReason: relayReason,
           donorReason: donor.reason,
           isRelay: true,
           relayMiddleman: middleman.coord,
@@ -2763,7 +2775,9 @@
             total: relayLaunch.total,
             travelMinutes: Math.round(match.travelMinutes),
             queueHours: Math.round(queueHours * 10) / 10,
-            safetyBufferMinutes: relaySafetyBufferMinutes,
+            hasAmTemplate: middlemanHasTemplate,
+            amTemplateName: middleman.amTemplateName || "",
+            safetyBufferMinutes: middlemanHasTemplate ? relaySafetyBufferMinutes : 0,
             remainingRelayNeed: cloneResources(relayNeed)
           });
         }
@@ -3712,21 +3726,41 @@
       ])
     ));
 
-    const relayAccepted = state.lastDiagnostics && state.lastDiagnostics.relayReplenishment ? state.lastDiagnostics.relayReplenishment.accepted : [];
-    if (relayAccepted && relayAccepted.length) {
+    const relayData = state.lastDiagnostics && state.lastDiagnostics.relayReplenishment ? state.lastDiagnostics.relayReplenishment : null;
+    const relayAccepted = relayData && relayData.accepted ? relayData.accepted : [];
+    const relayRejected = relayData && relayData.rejected ? relayData.rejected : [];
+    const relayRows = [];
+
+    relayAccepted.slice(0, 8).forEach(row => {
+      relayRows.push([
+        "Accepted",
+        row.middleman || row.name || "",
+        row.origin || "",
+        formatResources(row.resources || emptyResources()),
+        (row.queueHours || 0).toFixed ? row.queueHours.toFixed(1) + "h" : String(row.queueHours || ""),
+        "refill arrives in ~" + formatTravelMinutes(row.travelMinutes || 0)
+      ]);
+    });
+
+    relayRejected.slice(0, Math.max(0, 12 - relayRows.length)).forEach(row => {
+      relayRows.push([
+        "Rejected",
+        row.middleman || row.name || "",
+        "-",
+        formatResources(row.outgoing || emptyResources()),
+        (row.queueHours || 0).toFixed ? row.queueHours.toFixed(1) + "h" : String(row.queueHours || ""),
+        row.reason || "not eligible"
+      ]);
+    });
+
+    if (relayRows.length) {
       const relayTitle = document.createElement("div");
       relayTitle.className = "twrp-section-title";
-      relayTitle.textContent = "Relay replenishment";
+      relayTitle.textContent = "Relay replenishment audit";
       details.appendChild(relayTitle);
       details.appendChild(createMiniTable(
-        ["Middleman", "Refill origin", "Resources", "Arrival", "Queue"],
-        relayAccepted.slice(0, 12).map(row => [
-          row.middleman,
-          row.origin,
-          formatResources(row.resources || emptyResources()),
-          formatTravelMinutes(row.travelMinutes || 0),
-          (row.queueHours || 0).toFixed ? row.queueHours.toFixed(1) + "h" : String(row.queueHours || "")
-        ])
+        ["Status", "Middleman", "Refill origin", "Resources/outgoing", "Queue", "Reason"],
+        relayRows
       ));
     }
 
@@ -4132,6 +4166,78 @@
         min-height: 13px;
       }
 
+      .twrp-label-row {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        margin-bottom: 4px;
+      }
+
+      .twrp-label-row .twrp-label {
+        margin-bottom: 0;
+      }
+
+      .twrp-info-button {
+        width: 16px;
+        height: 16px;
+        border: 1px solid #b99351;
+        border-radius: 50%;
+        background: #fffdf7;
+        color: #6d4b18;
+        cursor: pointer;
+        font-size: 10px;
+        line-height: 14px;
+        padding: 0;
+        font-weight: bold;
+      }
+
+      .twrp-info-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1000000;
+        background: rgba(0,0,0,0.22);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+      }
+
+      .twrp-info-dialog {
+        width: min(460px, 94vw);
+        background: #fff7e5;
+        border: 1px solid #8f6a2f;
+        border-radius: 8px;
+        box-shadow: 0 12px 35px rgba(0,0,0,0.35);
+        color: #2e2112;
+      }
+
+      .twrp-info-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 9px 10px;
+        background: linear-gradient(180deg, #d8b776, #bd8f43);
+        border-bottom: 1px solid #8f6a2f;
+        font-weight: bold;
+      }
+
+      .twrp-info-content {
+        padding: 11px;
+        line-height: 1.45;
+        white-space: pre-line;
+      }
+
+      .twrp-info-close {
+        width: 24px;
+        height: 24px;
+        border: 1px solid #7d510f;
+        background: #fff4d5;
+        color: #2f1b00;
+        border-radius: 5px;
+        cursor: pointer;
+        font-weight: bold;
+      }
+
       .twrp-select,
       .twrp-input {
         width: 100%;
@@ -4404,6 +4510,77 @@
     console.log(SCRIPT_NAME + " closed");
   }
 
+  function showInfoDialog(title, body) {
+    const old = document.querySelector(".twrp-info-overlay");
+    if (old) old.remove();
+
+    const overlay = document.createElement("div");
+    overlay.className = "twrp-info-overlay";
+
+    const dialog = document.createElement("div");
+    dialog.className = "twrp-info-dialog";
+
+    const head = document.createElement("div");
+    head.className = "twrp-info-head";
+
+    const titleNode = document.createElement("div");
+    titleNode.textContent = title;
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "twrp-info-close";
+    close.textContent = "x";
+
+    const content = document.createElement("div");
+    content.className = "twrp-info-content";
+    content.textContent = body;
+
+    function removeDialog() {
+      overlay.remove();
+    }
+
+    close.addEventListener("click", removeDialog);
+    overlay.addEventListener("click", function (event) {
+      if (event.target === overlay) removeDialog();
+    });
+
+    head.appendChild(titleNode);
+    head.appendChild(close);
+    dialog.appendChild(head);
+    dialog.appendChild(content);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  }
+
+  function addInfoButton(wrap, title, body) {
+    const label = wrap.querySelector(".twrp-label");
+    if (!label) return;
+
+    let labelRow = label.parentNode && label.parentNode.classList && label.parentNode.classList.contains("twrp-label-row")
+      ? label.parentNode
+      : null;
+
+    if (!labelRow) {
+      labelRow = document.createElement("div");
+      labelRow.className = "twrp-label-row";
+      wrap.insertBefore(labelRow, label);
+      labelRow.appendChild(label);
+    }
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "twrp-info-button";
+    button.textContent = "?";
+    button.title = body;
+    button.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      showInfoDialog(title, body);
+    });
+
+    labelRow.appendChild(button);
+  }
+
   function addHint(wrap, text) {
     const hint = document.createElement("div");
     hint.className = "twrp-hint";
@@ -4537,13 +4714,27 @@
     const reserveWarehousePercent = createInput("Origin reserve", initialSettings.reserveWarehousePercent);
     const maxDistance = createInput("Max distance", initialSettings.maxDistance);
     const prioritizeLowPoints = createCheckbox("Low-point priority", initialSettings.prioritizeLowPoints);
+    const enableRelayReplenishment = createCheckbox("Relay replenishment", initialSettings.enableRelayReplenishment !== false);
 
     addHint(planMode.wrap, "AM template or WH %");
     addHint(constructionHours.wrap, "hours");
     addHint(reserveMerchants.wrap, "kept home");
     addHint(reserveWarehousePercent.wrap, "% warehouse");
     addHint(maxDistance.wrap, "0 = any");
-    addHint(prioritizeLowPoints.wrap, "boost smaller villages");
+    addHint(prioritizeLowPoints.wrap, "lowest points first");
+    addHint(enableRelayReplenishment.wrap, "refill used origins");
+
+    addInfoButton(
+      prioritizeLowPoints.wrap,
+      "Low-point priority",
+      "Prioritizes lower-point target villages within the same queue urgency.\n\nExample: if one 800-point village and one 6,000-point village both need resources to reach the 8h build coverage target, the 800-point village is planned first.\n\nIt does not mean higher-point villages are ignored. If resources and donors are still available, the planner continues upward."
+    );
+
+    addInfoButton(
+      enableRelayReplenishment.wrap,
+      "Relay replenishment",
+      "After normal target requests, the planner can refill origin villages that just sent resources onward.\n\nExample: Village A sends resources to a target. Village B can send a refill to Village A, so Village A is not drained after helping.\n\nIf Village A has an active AM construction template, it must also have an active queue and the refill must arrive before the queue risks stopping.\n\nIf Village A has no active AM construction template, it may be used as a finished/idle middleman even without a queue. Relay still respects the 90% warehouse cap per resource."
+    );
 
     [
       planMode.wrap,
@@ -4551,7 +4742,8 @@
       reserveMerchants.wrap,
       reserveWarehousePercent.wrap,
       maxDistance.wrap,
-      prioritizeLowPoints.wrap
+      prioritizeLowPoints.wrap,
+      enableRelayReplenishment.wrap
     ].forEach(node => grid.appendChild(node));
 
     panel.appendChild(grid);
@@ -4610,6 +4802,7 @@
     ui.reserveWarehousePercent = reserveWarehousePercent.input;
     ui.maxDistance = maxDistance.input;
     ui.prioritizeLowPoints = prioritizeLowPoints.input;
+    ui.enableRelayReplenishment = enableRelayReplenishment.input;
     ui.planButton = planButton;
     ui.copyButton = copyButton;
     ui.status = status;
