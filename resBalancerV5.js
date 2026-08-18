@@ -47,7 +47,8 @@
  *     "maxDistance": 0,
  *     "prioritizeLowPoints": true,
  *     "enableRelayReplenishment": true,
- *     "relaySafetyBufferMinutes": 30
+ *     "relaySafetyBufferMinutes": 30,
+ *     "debugConsole": false
  *   }
  * }
  */
@@ -76,7 +77,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.25";
+  const SCRIPT_VERSION = "1.7.26";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -116,7 +117,8 @@
     targetQueueCoverageBuildings: 4,
     queueSoonRefillBuildingCount: 1,
     enableRelayReplenishment: true,
-    relaySafetyBufferMinutes: 30
+    relaySafetyBufferMinutes: 30,
+    debugConsole: false
   };
 
   const BUILDING_NAMES = {
@@ -221,7 +223,8 @@
       maxDistance: Math.max(0, parseFloatSafe(source.maxDistance, DEFAULTS.maxDistance)),
       prioritizeLowPoints: source.prioritizeLowPoints !== false,
       enableRelayReplenishment: source.enableRelayReplenishment !== false,
-      relaySafetyBufferMinutes: Math.max(0, Math.min(360, parseFloatSafe(source.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes)))
+      relaySafetyBufferMinutes: Math.max(0, Math.min(360, parseFloatSafe(source.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes))),
+      debugConsole: source.debugConsole === true
     };
   }
 
@@ -612,6 +615,34 @@
       .some(child => Boolean(getTransportResourceKeyFromNode(child))));
   }
 
+  function dedupeResourceMarkerKeys(keys) {
+    const result = [];
+    (keys || []).forEach(key => {
+      if (!key) return;
+      if (result[result.length - 1] === key) return;
+      result.push(key);
+    });
+    return result;
+  }
+
+  function getResourceMarkerKeysFromCell(cell) {
+    const keys = [];
+
+    function walk(node) {
+      if (!node || node.nodeType !== 1) return;
+
+      const key = getTransportResourceKeyFromNode(node);
+      if (key) {
+        keys.push(key);
+      }
+
+      Array.from(node.childNodes || []).forEach(walk);
+    }
+
+    walk(cell);
+    return dedupeResourceMarkerKeys(keys);
+  }
+
   function extractNumericTokens(text) {
     return (cleanText(text).match(/\d[\d.,]*/g) || [])
       .map(token => ({ token: token, value: parseNumber(token) }))
@@ -620,54 +651,33 @@
 
   function parseResourceCellByMarkers(cell) {
     const resources = emptyResources();
-    const sequence = [];
+    const amounts = extractNumericTokens(cell ? cell.textContent : "").map(item => item.value);
+    const markerKeys = getResourceMarkerKeysFromCell(cell);
 
-    function walk(node) {
-      if (!node) return;
-
-      if (node.nodeType === 1) {
-        const key = getTransportResourceKeyFromNode(node);
-        if (key) {
-          sequence.push({ type: "marker", key: key });
-        }
-
-        Array.from(node.childNodes || []).forEach(walk);
-        return;
-      }
-
-      if (node.nodeType === 3) {
-        extractNumericTokens(node.textContent || "").forEach(item => {
-          sequence.push({ type: "number", value: item.value, token: item.token });
-        });
-      }
+    if (!amounts.length || !markerKeys.length) {
+      return resources;
     }
 
-    walk(cell);
+    // Prefer mapping by visual marker order. The previous DOM-walk parser could split
+    // thousands-formatted text like "12.153" into smaller fragments on some TW pages.
+    // We now parse full visible numeric tokens from the whole resource cell and only use
+    // icons/classes to decide which resource each full token belongs to.
+    let keysForAmounts = [];
 
-    let pendingMarkerKey = "";
-    let fallbackIndex = 0;
-    const fallbackOrder = ["wood", "stone", "iron"];
+    if (markerKeys.length >= amounts.length) {
+      keysForAmounts = markerKeys.slice(0, amounts.length);
+    } else if (amounts.length === 3) {
+      keysForAmounts = ["wood", "stone", "iron"];
+    } else if (markerKeys.length === 1 && amounts.length === 1) {
+      keysForAmounts = markerKeys.slice();
+    }
 
-    sequence.forEach(item => {
-      if (item.type === "marker") {
-        pendingMarkerKey = item.key || "";
-        return;
-      }
-
-      if (item.type !== "number" || item.value <= 0) return;
-
-      let key = pendingMarkerKey || "";
-      if (!key) {
-        key = fallbackOrder[fallbackIndex] || "";
-        fallbackIndex += 1;
-      }
-
+    for (let i = 0; i < amounts.length; i++) {
+      const key = keysForAmounts[i] || "";
       if (key && resources[key] !== undefined) {
-        resources[key] += item.value;
+        resources[key] += amounts[i];
       }
-
-      pendingMarkerKey = "";
-    });
+    }
 
     return resources;
   }
@@ -1299,10 +1309,12 @@
         stopReason: "Incoming transport rows were visible but no resource amounts could be parsed."
       };
 
-      console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION + " - stopped planning");
-      console.log("Selected incoming parser result", selected.diagnostics);
-      console.log("Incoming parser attempts", attempts);
-      console.groupEnd();
+        if (state.lastSettings && state.lastSettings.debugConsole) {
+        console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION + " - stopped planning");
+        console.log("Selected incoming parser result", selected.diagnostics);
+        console.log("Incoming parser attempts", attempts);
+        console.groupEnd();
+      }
 
       throw new Error("Incoming transports are visible but could not be parsed safely. Planning stopped to avoid duplicate requests and warehouse overfill. Update the script or copy diagnostics.");
     }
@@ -1315,11 +1327,13 @@
       selected: selected.diagnostics
     };
 
-    console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION);
-    console.log("Selected incoming parser result", selected.diagnostics);
-    console.log("Incoming parser attempts", attempts);
-    console.log("Incoming by target coord", selected.diagnostics.byCoord || []);
-    console.groupEnd();
+    if (state.lastSettings && state.lastSettings.debugConsole) {
+      console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION);
+      console.log("Selected incoming parser result", selected.diagnostics);
+      console.log("Incoming parser attempts", attempts);
+      console.log("Incoming by target coord", selected.diagnostics.byCoord || []);
+      console.groupEnd();
+    }
 
     return selected.incoming;
   }
@@ -1870,6 +1884,7 @@
     const savedSettings = state.savedSettings || {};
     const enableRelayReplenishment = ui.enableRelayReplenishment ? ui.enableRelayReplenishment.checked : (savedSettings.enableRelayReplenishment !== undefined ? savedSettings.enableRelayReplenishment !== false : DEFAULTS.enableRelayReplenishment);
     const relaySafetyBufferMinutes = savedSettings.relaySafetyBufferMinutes !== undefined ? Math.max(0, Math.min(360, parseFloatSafe(savedSettings.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes))) : DEFAULTS.relaySafetyBufferMinutes;
+    const debugConsole = savedSettings.debugConsole === true;
 
     return {
       useAmTemplates: useAmTemplates,
@@ -1904,7 +1919,8 @@
       prioritizeNoTemplateDonors: useAmTemplates,
       prioritizeLowPoints: prioritizeLowPoints,
       enableRelayReplenishment: enableRelayReplenishment,
-      relaySafetyBufferMinutes: relaySafetyBufferMinutes
+      relaySafetyBufferMinutes: relaySafetyBufferMinutes,
+      debugConsole: debugConsole
     };
   }
 
@@ -3669,27 +3685,29 @@
       rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments || []
     };
 
-    console.groupCollapsed(SCRIPT_NAME + " plan diagnostics " + SCRIPT_VERSION);
-    console.log("Summary", diagnostics.counts);
-    console.log("Settings", diagnostics.settings);
-    console.log("Targets over 90% warehouse safety limit", overWarehouse);
-    console.log("Origins over available resources/merchants", overOrigins);
-    console.log("Target warehouse audit", targetWarehouseAudit);
-    console.log("Origin usage audit", originUsageAudit);
-    console.log("Incoming transport load", diagnostics.incomingTransportLoad);
-    console.log("Data load steps", diagnostics.dataLoad);
-    console.log("AM template load", diagnostics.amTemplateLoad);
-    console.log("Target planning order", diagnostics.targetPlanningOrder);
-    console.log("Unplanned targets", diagnostics.unplannedTargets);
-    console.log("Target exclusions / no-need AM villages", diagnostics.targetExclusions);
-    console.log("Relay replenishment", diagnostics.relayReplenishment);
-    console.log("Capped targets", diagnostics.cappedTargets);
-    console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
-    console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
-    console.log("Full diagnostics", diagnostics);
-    console.groupEnd();
-
     state.lastDiagnostics = diagnostics;
+
+    if (settings.debugConsole) {
+      console.groupCollapsed(SCRIPT_NAME + " plan diagnostics " + SCRIPT_VERSION);
+      console.log("Summary", diagnostics.counts);
+      console.log("Settings", diagnostics.settings);
+      console.log("Targets over 90% warehouse safety limit", overWarehouse);
+      console.log("Origins over available resources/merchants", overOrigins);
+      console.log("Target warehouse audit", targetWarehouseAudit);
+      console.log("Origin usage audit", originUsageAudit);
+      console.log("Incoming transport load", diagnostics.incomingTransportLoad);
+      console.log("Data load steps", diagnostics.dataLoad);
+      console.log("AM template load", diagnostics.amTemplateLoad);
+      console.log("Target planning order", diagnostics.targetPlanningOrder);
+      console.log("Unplanned targets", diagnostics.unplannedTargets);
+      console.log("Target exclusions / no-need AM villages", diagnostics.targetExclusions);
+      console.log("Relay replenishment", diagnostics.relayReplenishment);
+      console.log("Capped targets", diagnostics.cappedTargets);
+      console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
+      console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
+      console.log("Full diagnostics", diagnostics);
+      console.groupEnd();
+    }
   }
 
   function getFirstEnabledSendButton() {
@@ -3832,7 +3850,7 @@
 
     const debugPayload = Object.assign({}, data);
 
-    console.log(SCRIPT_NAME + " grouped request", {
+    if (state.lastSettings && state.lastSettings.debugConsole) console.log(SCRIPT_NAME + " grouped request", {
       target: targetPlan.target.coord,
       targetId: targetPlan.target.id,
       origins: targetPlan.launches.map(launch => ({
@@ -3855,7 +3873,7 @@
     try {
       const response = await postMarketAction(options, data);
 
-      console.log(SCRIPT_NAME + " grouped request response", {
+      if (state.lastSettings && state.lastSettings.debugConsole) console.log(SCRIPT_NAME + " grouped request response", {
         target: targetPlan.target.coord,
         targetId: targetPlan.target.id,
         success: !responseHasError(response),
@@ -4819,7 +4837,7 @@
     window.twacticsResourcePlannerLoaded = false;
     delete window.twacticsResourcePlanner;
 
-    console.log(SCRIPT_NAME + " closed");
+    if (state.lastSettings && state.lastSettings.debugConsole) console.log(SCRIPT_NAME + " closed");
   }
 
   function showInfoDialog(title, body) {
