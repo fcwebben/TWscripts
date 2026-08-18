@@ -12,7 +12,7 @@
  * - Reads building overview data
  * - Reads Account Manager construction template data when AM construction mode is selected
  * - Reads incoming transport data
- * - Counts incoming resources for target need calculations
+ * - Counts incoming resources for target need and 90% target warehouse safety calculations
  * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
  * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
  * - Adds grouped plan diagnostics in the console for debugging and optimization
@@ -65,7 +65,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.11";
+  const SCRIPT_VERSION = "1.7.13";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -621,37 +621,296 @@
     return villages;
   }
 
-  async function loadIncomingData() {
-    const url = buildGameUrl({
-      screen: "overview_villages",
-      mode: "trader",
-      type: "inc",
-      page: "-1"
-    });
+  function buildVillageLookupContext(villages) {
+    const byId = new Map();
+    const coords = new Set();
 
-    const html = await fetchText(url);
-    const doc = parseHtml(html);
-    const rows = Array.from(doc.querySelectorAll("#trades_table tbody tr, #content_value .row_a, #content_value .row_b"));
-    const incoming = new Map();
-
-    rows.forEach(row => {
-      const resources = extractResourcesFromRow(row);
-      const coordMatches = cleanText(row.textContent).match(/\d{1,3}\|\d{1,3}/g) || [];
-      const coord = coordMatches[coordMatches.length - 1];
-
-      if (!coord) return;
-
-      if (!incoming.has(coord)) {
-        incoming.set(coord, emptyResources());
+    (villages || []).forEach(village => {
+      if (village && village.id !== undefined && village.id !== null) {
+        byId.set(String(village.id), village.coord);
       }
 
-      const current = incoming.get(coord);
-      current.wood += resources.wood;
-      current.stone += resources.stone;
-      current.iron += resources.iron;
+      if (village && village.coord) {
+        coords.add(village.coord);
+      }
     });
 
-    return incoming;
+    return {
+      byId: byId,
+      coords: coords
+    };
+  }
+
+  function getIncomingTargetHeaderIndex(doc) {
+    const table = doc.querySelector("#trades_table") || doc.querySelector("table.vis") || doc.querySelector("table");
+
+    if (!table) return -1;
+
+    const headerRows = Array.from(table.querySelectorAll("thead tr, tr")).slice(0, 3);
+    const targetPatterns = [
+      /target/i,
+      /destination/i,
+      /recipient/i,
+      /to village/i,
+      /mottag/i,
+      /mål/i,
+      /ziel/i,
+      /destin/i,
+      /cible/i,
+      /destino/i
+    ];
+    const originPatterns = [/origin/i, /source/i, /from/i, /ursprung/i, /från/i, /von/i, /origen/i];
+
+    for (let r = 0; r < headerRows.length; r++) {
+      const cells = Array.from(headerRows[r].querySelectorAll("th, td"));
+
+      for (let i = 0; i < cells.length; i++) {
+        const text = cleanText(cells[i].textContent);
+        if (!text) continue;
+
+        const isOrigin = originPatterns.some(pattern => pattern.test(text));
+        const isTarget = targetPatterns.some(pattern => pattern.test(text));
+
+        if (isTarget && !isOrigin) {
+          return i;
+        }
+      }
+    }
+
+    return -1;
+  }
+
+  function getCoordFromText(text) {
+    const matches = cleanText(text).match(/\d{1,3}\|\d{1,3}/g) || [];
+    return matches.length ? matches[matches.length - 1] : "";
+  }
+
+  function getKnownVillageCoordFromLink(link, lookup) {
+    if (!link || !lookup) return "";
+
+    const href = link.getAttribute("href") || "";
+    const id = getParam("village", href) || getParam("id", href) || "";
+
+    if (id && lookup.byId.has(String(id))) {
+      return lookup.byId.get(String(id));
+    }
+
+    return "";
+  }
+
+  function detectIncomingTargetCoord(row, headerIndex, lookup) {
+    const cells = Array.from(row.children || []);
+
+    if (headerIndex >= 0 && cells[headerIndex]) {
+      const headerCellCoord = getCoordFromText(cells[headerIndex].textContent);
+      if (headerCellCoord) {
+        return {
+          coord: headerCellCoord,
+          method: "target-header-cell"
+        };
+      }
+
+      const headerCellKnownLink = Array.from(cells[headerIndex].querySelectorAll("a[href]")).map(link => getKnownVillageCoordFromLink(link, lookup)).find(Boolean);
+      if (headerCellKnownLink) {
+        return {
+          coord: headerCellKnownLink,
+          method: "target-header-link"
+        };
+      }
+    }
+
+    const knownLinkCoords = Array.from(row.querySelectorAll("a[href]")).map(link => getKnownVillageCoordFromLink(link, lookup)).filter(Boolean);
+    const uniqueKnownLinkCoords = Array.from(new Set(knownLinkCoords));
+
+    if (uniqueKnownLinkCoords.length === 1) {
+      return {
+        coord: uniqueKnownLinkCoords[0],
+        method: "single-known-village-link"
+      };
+    }
+
+    const coordMatches = cleanText(row.textContent).match(/\d{1,3}\|\d{1,3}/g) || [];
+
+    if (coordMatches.length) {
+      return {
+        coord: coordMatches[coordMatches.length - 1],
+        method: uniqueKnownLinkCoords.length > 1 ? "last-coordinate-fallback-ambiguous-links" : "last-coordinate-fallback"
+      };
+    }
+
+    if (uniqueKnownLinkCoords.length) {
+      return {
+        coord: uniqueKnownLinkCoords[uniqueKnownLinkCoords.length - 1],
+        method: "last-known-village-link-fallback"
+      };
+    }
+
+    return {
+      coord: "",
+      method: "not-found"
+    };
+  }
+
+  function addIncomingToMap(incoming, coord, resources) {
+    if (!incoming.has(coord)) {
+      incoming.set(coord, emptyResources());
+    }
+
+    const current = incoming.get(coord);
+    current.wood += resources.wood || 0;
+    current.stone += resources.stone || 0;
+    current.iron += resources.iron || 0;
+  }
+
+  function summarizeIncomingMap(incoming) {
+    return Array.from(incoming.entries())
+      .map(([coord, resources]) => ({
+        coord: coord,
+        resources: cloneResources(resources),
+        total: totalResources(resources)
+      }))
+      .sort((a, b) => b.total - a.total);
+  }
+
+  function parseIncomingRows(doc, rows, lookup, url) {
+    const incoming = new Map();
+    const headerIndex = getIncomingTargetHeaderIndex(doc);
+    const diagnostics = {
+      url: url,
+      headerTargetIndex: headerIndex,
+      rowsSeen: rows.length,
+      rowsParsed: 0,
+      rowsSkippedNoResources: 0,
+      rowsSkippedNoTargetCoord: 0,
+      detectionMethods: {},
+      totals: emptyResources(),
+      ambiguousRows: [],
+      skippedSamples: [],
+      byCoord: []
+    };
+
+    rows.forEach((row, rowIndex) => {
+      const resources = extractResourcesFromRow(row);
+      const total = totalResources(resources);
+      const rowText = cleanText(row.textContent).slice(0, 240);
+
+      if (total <= 0) {
+        diagnostics.rowsSkippedNoResources += 1;
+        if (diagnostics.skippedSamples.length < 8) {
+          diagnostics.skippedSamples.push({ rowIndex: rowIndex, reason: "no resources", text: rowText });
+        }
+        return;
+      }
+
+      const detected = detectIncomingTargetCoord(row, headerIndex, lookup);
+      const coord = detected.coord;
+
+      diagnostics.detectionMethods[detected.method] = (diagnostics.detectionMethods[detected.method] || 0) + 1;
+
+      if (!coord) {
+        diagnostics.rowsSkippedNoTargetCoord += 1;
+        if (diagnostics.skippedSamples.length < 8) {
+          diagnostics.skippedSamples.push({ rowIndex: rowIndex, reason: "no target coord", resources: cloneResources(resources), text: rowText });
+        }
+        return;
+      }
+
+      if (/ambiguous|fallback/.test(detected.method) && diagnostics.ambiguousRows.length < 20) {
+        diagnostics.ambiguousRows.push({
+          rowIndex: rowIndex,
+          method: detected.method,
+          selectedCoord: coord,
+          resources: cloneResources(resources),
+          text: rowText
+        });
+      }
+
+      addIncomingToMap(incoming, coord, resources);
+      addResources(diagnostics.totals, resources);
+      diagnostics.rowsParsed += 1;
+    });
+
+    diagnostics.byCoord = summarizeIncomingMap(incoming);
+
+    return {
+      incoming: incoming,
+      diagnostics: diagnostics
+    };
+  }
+
+  async function loadIncomingData(villages) {
+    const lookup = buildVillageLookupContext(villages);
+    const incomingUrlSpecs = [
+      {
+        screen: "overview_villages",
+        mode: "trader",
+        type: "inc",
+        page: "-1"
+      },
+      {
+        screen: "overview_villages",
+        mode: "trader",
+        type: "incoming",
+        page: "-1"
+      }
+    ];
+
+    const attempts = [];
+    let selected = null;
+
+    for (let i = 0; i < incomingUrlSpecs.length; i++) {
+      const url = buildGameUrl(incomingUrlSpecs[i]);
+
+      try {
+        const html = await fetchText(url);
+        const doc = parseHtml(html);
+        const rows = Array.from(doc.querySelectorAll("#trades_table tbody tr, #content_value .row_a, #content_value .row_b"));
+        const parsed = parseIncomingRows(doc, rows, lookup, url);
+        attempts.push(parsed.diagnostics);
+
+        if (!selected || parsed.diagnostics.rowsParsed > selected.diagnostics.rowsParsed) {
+          selected = parsed;
+        }
+
+        if (parsed.diagnostics.rowsParsed > 0) {
+          break;
+        }
+      } catch (err) {
+        attempts.push({
+          url: url,
+          error: err && err.message ? err.message : String(err),
+          rowsSeen: 0,
+          rowsParsed: 0
+        });
+      }
+    }
+
+    if (!selected) {
+      selected = {
+        incoming: new Map(),
+        diagnostics: {
+          rowsSeen: 0,
+          rowsParsed: 0,
+          totals: emptyResources(),
+          byCoord: []
+        }
+      };
+    }
+
+    if (!state.debug) state.debug = {};
+    state.debug.incomingTransportLoad = {
+      selectedUrl: selected.diagnostics.url || "",
+      attempts: attempts,
+      selected: selected.diagnostics
+    };
+
+    console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION);
+    console.log("Selected incoming parser result", selected.diagnostics);
+    console.log("Incoming parser attempts", attempts);
+    console.log("Incoming by target coord", selected.diagnostics.byCoord || []);
+    console.groupEnd();
+
+    return selected.incoming;
   }
 
   async function loadBuildingsData() {
@@ -1225,15 +1484,15 @@
         templateDefsByName: new Map()
       };
 
+      const productionData = await loadProductionData();
       const results = await Promise.all([
-        loadProductionData(),
         loadBuildingsData(),
-        loadIncomingData(),
+        loadIncomingData(productionData),
         settings.useAmTemplates ? loadAccountManagerData() : Promise.resolve(emptyAmData),
         settings.useAmTemplates ? loadBuildingConstants() : Promise.resolve(new Map())
       ]);
 
-      mergeLoadedData(results[0], results[1], results[2], results[3], results[4], settings);
+      mergeLoadedData(productionData, results[0], results[1], results[2], results[3], settings);
 
       const planResult = createTransferPlan(settings);
       state.plan = planResult.targetPlans;
@@ -2249,6 +2508,8 @@
         cappedTargets: debug.cappedTargets ? debug.cappedTargets.length : 0,
         skippedSmallShipments: debug.skippedSmallShipments ? debug.skippedSmallShipments.length : 0,
         rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments ? debug.rejectedTinyResourceFragments.length : 0,
+        incomingRowsParsed: debug.incomingTransportLoad && debug.incomingTransportLoad.selected ? debug.incomingTransportLoad.selected.rowsParsed : 0,
+        targetsWithIncoming: debug.incomingTransportLoad && debug.incomingTransportLoad.selected && debug.incomingTransportLoad.selected.byCoord ? debug.incomingTransportLoad.selected.byCoord.length : 0,
         targetsOverSafeWarehouseLimit: overWarehouse.length,
         originsOverAvailableResourcesOrMerchants: overOrigins.length
       },
@@ -2257,6 +2518,7 @@
       overOrigins: overOrigins,
       targetWarehouseAudit: targetWarehouseAudit,
       originUsageAudit: originUsageAudit,
+      incomingTransportLoad: debug.incomingTransportLoad || null,
       cappedTargets: debug.cappedTargets || [],
       skippedSmallShipments: debug.skippedSmallShipments || [],
       rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments || []
@@ -2269,6 +2531,7 @@
     console.log("Origins over available resources/merchants", overOrigins);
     console.log("Target warehouse audit", targetWarehouseAudit);
     console.log("Origin usage audit", originUsageAudit);
+    console.log("Incoming transport load", diagnostics.incomingTransportLoad);
     console.log("Capped targets", diagnostics.cappedTargets);
     console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
     console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
