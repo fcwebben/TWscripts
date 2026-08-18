@@ -14,6 +14,8 @@
  * - Reads incoming transport data
  * - Counts incoming resources for target need and 90% target warehouse safety calculations
  * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
+ * - Treats Build coverage as target queue time coverage, not only number of queued buildings
+ * - Caps warehouse safety per resource so one overflowing resource does not block other resources
  * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
  * - Adds grouped plan diagnostics in the console for debugging and optimization
  * - Shows visible incoming and warehouse audit data in copied plans and the Audit section
@@ -66,7 +68,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.17";
+  const SCRIPT_VERSION = "1.7.20";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -81,7 +83,7 @@
     lowFarmBlockedReservePercent: 1,
     lowFarmFreePercent: 4,
     merchantCapacity: 1000,
-    minShipment: 700,
+    minShipment: 500,
     maxDistance: 0,
     emptyQueueBoost: 80,
     lowPointsBoost: 35,
@@ -1817,17 +1819,40 @@
     };
   }
 
+  function getTargetCurrentOverWarehouseLimit(village, settings) {
+    const limit = getTargetWarehouseLimit(village, settings);
+
+    if (limit === null) {
+      return null;
+    }
+
+    const current = getCurrentResourcesWithIncoming(village);
+
+    return {
+      wood: current.wood > limit,
+      stone: current.stone > limit,
+      iron: current.iron > limit
+    };
+  }
+
+  function hasAnyWarehouseLimitOverflow(over) {
+    return Boolean(over && (over.wood || over.stone || over.iron));
+  }
+
   function capNeedToTargetWarehouse(village, need, settings) {
     const space = getTargetWarehouseSpace(village, settings);
     const capped = cloneResources(need || emptyResources());
     const reduced = emptyResources();
+    const currentOverLimit = getTargetCurrentOverWarehouseLimit(village, settings);
 
     if (!space) {
       return {
         need: capped,
         reduced: reduced,
         limited: false,
-        space: null
+        space: null,
+        currentOverLimit: currentOverLimit,
+        blockedByCurrentOverLimit: false
       };
     }
 
@@ -1841,7 +1866,9 @@
       need: capped,
       reduced: reduced,
       limited: totalResources(reduced) > 0,
-      space: space
+      space: space,
+      currentOverLimit: currentOverLimit,
+      blockedByCurrentOverLimit: false
     };
   }
 
@@ -1867,39 +1894,67 @@
 
   function getTargetQueueCoverage(village, settings) {
     const currentQueueCount = Math.max(0, village.queueCount || 0);
-    const targetQueueCount = Math.max(1, settings.targetQueueCoverageBuildings || DEFAULTS.targetQueueCoverageBuildings);
-    const queueHours = (village.queueEndSeconds || 0) / 3600;
-    const hasTemplate = Boolean(village.amTemplateName);
+    const currentQueueHours = (village.queueEndSeconds || 0) / 3600;
+    const targetQueueHours = Math.max(0, settings.constructionHours || DEFAULTS.constructionHours);
+    const horizonSeconds = targetQueueHours * 3600;
     const details = village.ownNeedDetails || [];
+    const resources = emptyResources();
+    const selected = [];
+    let simulatedSeconds = Math.max(0, village.queueEndSeconds || 0);
 
-    let wantedBuilds = Math.max(0, targetQueueCount - currentQueueCount);
+    details.forEach(detail => {
+      if (horizonSeconds <= 0 || simulatedSeconds >= horizonSeconds) return;
+      const detailResources = detail && detail.resources ? detail.resources : emptyResources();
+      if (totalResources(detailResources) <= 0) return;
 
-    if (wantedBuilds <= 0 && hasTemplate && queueHours <= Math.max(1, settings.constructionHours || DEFAULTS.constructionHours)) {
-      wantedBuilds = Math.max(0, settings.queueSoonRefillBuildingCount || DEFAULTS.queueSoonRefillBuildingCount);
-    }
+      addResources(resources, detailResources);
+      selected.push(detail);
+      simulatedSeconds += Math.max(0, detail.seconds || 0);
+    });
 
-    wantedBuilds = Math.min(targetQueueCount, wantedBuilds);
-
-    const summed = sumNeedDetails(details, wantedBuilds);
+    const simulatedQueueHours = simulatedSeconds / 3600;
 
     return {
       currentQueueCount: currentQueueCount,
-      targetQueueCount: targetQueueCount,
-      queueHours: queueHours,
-      wantedBuilds: wantedBuilds,
-      plannedBuilds: summed.count,
-      details: summed.details,
-      resources: summed.resources,
-      mode: wantedBuilds > 0 ? "queue coverage" : "already covered"
+      targetQueueCount: targetQueueHours,
+      targetQueueHours: targetQueueHours,
+      currentQueueHours: currentQueueHours,
+      queueHours: currentQueueHours,
+      missingQueueHours: Math.max(0, targetQueueHours - currentQueueHours),
+      wantedBuilds: selected.length,
+      plannedBuilds: selected.length,
+      details: selected,
+      resources: resources,
+      simulatedQueueHours: simulatedQueueHours,
+      mode: selected.length > 0 ? "time coverage" : "already covered"
     };
+  }
+
+  function formatQueueCoverage(queueCoverage) {
+    if (!queueCoverage) return "";
+
+    const current = Number.isFinite(queueCoverage.currentQueueHours) ? queueCoverage.currentQueueHours : 0;
+    const target = Number.isFinite(queueCoverage.targetQueueHours) ? queueCoverage.targetQueueHours : DEFAULTS.constructionHours;
+    const simulated = Number.isFinite(queueCoverage.simulatedQueueHours) ? queueCoverage.simulatedQueueHours : current;
+    const builds = queueCoverage.plannedBuilds || 0;
+
+    if (builds > 0) {
+      return current.toFixed(1) + "h -> " + Math.min(simulated, Math.max(target, current)).toFixed(1) + "h, +" + builds + " build(s)";
+    }
+
+    return current.toFixed(1) + "h / " + target.toFixed(1) + "h";
   }
 
   function getTargetPriorityTier(target, settings) {
     if (!settings.useAmTemplates) return 50;
+
+    const queueHours = Math.max(0, target.queueHours || 0);
+    const horizonHours = Math.max(1, settings.constructionHours || DEFAULTS.constructionHours);
+
     if (target.queueEmpty) return 0;
-    if ((target.queueCoverage && target.queueCoverage.currentQueueCount || 0) < (settings.targetQueueCoverageBuildings || DEFAULTS.targetQueueCoverageBuildings)) return 1;
-    if (target.queueHours <= 1) return 2;
-    if (target.queueHours <= Math.max(1, settings.constructionHours || DEFAULTS.constructionHours)) return 3;
+    if (queueHours <= 1) return 1;
+    if (queueHours <= Math.min(3, horizonHours)) return 2;
+    if (queueHours < horizonHours) return 3;
     return 4;
   }
 
@@ -1913,13 +1968,16 @@
     const tierDiff = (a.priorityTier || 0) - (b.priorityTier || 0);
     if (tierDiff) return tierDiff;
 
+    const queueDiff = (a.queueHours || 0) - (b.queueHours || 0);
+    if (Math.abs(queueDiff) > 0.05) return queueDiff;
+
     if (settings.prioritizeLowPoints) {
       const pointDiff = (a.village.points || 0) - (b.village.points || 0);
       if (pointDiff) return pointDiff;
     }
 
-    const queueDiff = (a.queueHours || 0) - (b.queueHours || 0);
-    if (Math.abs(queueDiff) > 0.05) return queueDiff;
+    const missingHourDiff = (b.queueCoverage && b.queueCoverage.missingQueueHours || 0) - (a.queueCoverage && a.queueCoverage.missingQueueHours || 0);
+    if (Math.abs(missingHourDiff) > 0.05) return missingHourDiff;
 
     const plannedBuildDiff = (b.queueCoverage && b.queueCoverage.plannedBuilds || 0) - (a.queueCoverage && a.queueCoverage.plannedBuilds || 0);
     if (plannedBuildDiff) return plannedBuildDiff;
@@ -1980,14 +2038,17 @@
           currentWithIncoming: getCurrentResourcesWithIncoming(village),
           remainingSafeSpace: cloneResources(warehouseCap.space || emptyResources()),
           reduced: cloneResources(warehouseCap.reduced || emptyResources()),
-          cappedNeed: cloneResources(need)
+          cappedNeed: cloneResources(need),
+          currentOverLimit: warehouseCap.currentOverLimit || null
         });
       }
 
       if (settings.useAmTemplates) {
-        const queueCoverageMissing = queueCoverage ? Math.max(0, queueCoverage.targetQueueCount - queueCoverage.currentQueueCount) : 0;
+        const queueCoverageMissingHours = queueCoverage ? Math.max(0, queueCoverage.missingQueueHours || 0) : 0;
+        const queueCoverageBuilds = queueCoverage ? Math.max(0, queueCoverage.plannedBuilds || 0) : 0;
         score = totalResources(need) / 1000;
-        score += queueCoverageMissing * 60;
+        score += queueCoverageMissingHours * 35;
+        score += queueCoverageBuilds * 12;
 
         if (hasTemplate) {
           score += 10;
@@ -2055,7 +2116,7 @@
     }
 
     if (settings.useAmTemplates && queueCoverage && queueCoverage.wantedBuilds > 0) {
-      reasons.push("queue coverage " + queueCoverage.plannedBuilds + "/" + queueCoverage.targetQueueCount + " build(s)");
+      reasons.push("build coverage " + formatQueueCoverage(queueCoverage));
     }
 
     if (lowPointRatio > 0.5 && settings.prioritizeLowPoints) {
@@ -2063,7 +2124,10 @@
     }
 
     if (warehouseCap && warehouseCap.limited) {
-      reasons.push("90% target warehouse safety limit reduced by " + formatNumber(totalResources(warehouseCap.reduced)));
+      const overLimitText = warehouseCap.currentOverLimit && hasAnyWarehouseLimitOverflow(warehouseCap.currentOverLimit)
+        ? " (resource-specific cap; already over: " + formatWarehouseOverResources(warehouseCap.currentOverLimit) + ")"
+        : "";
+      reasons.push("90% target warehouse safety limit reduced by " + formatNumber(totalResources(warehouseCap.reduced)) + overLimitText);
     }
 
     if (totalNeed > 0) {
@@ -2717,6 +2781,23 @@
         iron: currentWithIncoming.iron + (plan.resources.iron || 0)
       };
 
+      const planned = cloneResources(plan.resources || emptyResources());
+      const overSafeLimit = safeLimit !== null ? {
+        wood: afterPlanned.wood > safeLimit,
+        stone: afterPlanned.stone > safeLimit,
+        iron: afterPlanned.iron > safeLimit
+      } : null;
+      const plannedOverSafeLimit = safeLimit !== null ? {
+        wood: planned.wood > 0 && afterPlanned.wood > safeLimit,
+        stone: planned.stone > 0 && afterPlanned.stone > safeLimit,
+        iron: planned.iron > 0 && afterPlanned.iron > safeLimit
+      } : null;
+      const preExistingOverSafeLimit = safeLimit !== null ? {
+        wood: currentWithIncoming.wood > safeLimit,
+        stone: currentWithIncoming.stone > safeLimit,
+        iron: currentWithIncoming.iron > safeLimit
+      } : null;
+
       return {
         target: target.coord,
         targetId: target.id,
@@ -2724,13 +2805,11 @@
         targetSafeLimitPercent: settings.targetWarehouseLimitPercent,
         safeLimit: safeLimit,
         currentPlusIncoming: currentWithIncoming,
-        planned: cloneResources(plan.resources || emptyResources()),
+        planned: planned,
         afterPlanned: afterPlanned,
-        overSafeLimit: safeLimit !== null ? {
-          wood: afterPlanned.wood > safeLimit,
-          stone: afterPlanned.stone > safeLimit,
-          iron: afterPlanned.iron > safeLimit
-        } : null,
+        overSafeLimit: overSafeLimit,
+        plannedOverSafeLimit: plannedOverSafeLimit,
+        preExistingOverSafeLimit: preExistingOverSafeLimit,
         total: plan.total,
         origins: plan.launches ? plan.launches.length : 0,
         arrivalBalance: plan.arrivalBalance
@@ -2779,10 +2858,123 @@
     }));
   }
 
+
+  function getTargetUsableDonorDiagnostics(target, donors, settings) {
+    const counts = {
+      checked: 0,
+      sameVillage: 0,
+      blockedForTarget: 0,
+      noMerchants: 0,
+      noAvailableResources: 0,
+      noResourceFragmentAtLeastMinimum: 0,
+      outsideMaxDistance: 0,
+      noMatchingNeededResource: 0,
+      usable: 0
+    };
+    const samples = [];
+    const need = target && target.need ? target.need : emptyResources();
+
+    (donors || []).forEach(donor => {
+      counts.checked += 1;
+      let status = "usable";
+      const distance = getDistance(donor.village.coord, target.village.coord);
+      const matchingResources = {
+        wood: Math.min(Math.max(0, donor.available.wood || 0), Math.max(0, need.wood || 0)),
+        stone: Math.min(Math.max(0, donor.available.stone || 0), Math.max(0, need.stone || 0)),
+        iron: Math.min(Math.max(0, donor.available.iron || 0), Math.max(0, need.iron || 0))
+      };
+
+      if (donor.village.coord === target.village.coord) {
+        counts.sameVillage += 1;
+        status = "same village";
+      } else if (donor.blockedTargetIds && donor.blockedTargetIds.has(String(target.village.id))) {
+        counts.blockedForTarget += 1;
+        status = "blocked after tiny/failed shipment attempt";
+      } else if (donor.merchantsAvailable <= 0) {
+        counts.noMerchants += 1;
+        status = "no merchants";
+      } else if (totalResources(donor.available) < settings.minShipment) {
+        counts.noAvailableResources += 1;
+        status = "available below minimum shipment";
+      } else if (!hasResourceAtLeast(donor.available, settings.minResourcePerOrigin)) {
+        counts.noResourceFragmentAtLeastMinimum += 1;
+        status = "no resource fragment >= minimum";
+      } else if (settings.maxDistance > 0 && distance > settings.maxDistance) {
+        counts.outsideMaxDistance += 1;
+        status = "outside max distance";
+      } else if (!hasResourceAtLeast(matchingResources, settings.minResourcePerOrigin)) {
+        counts.noMatchingNeededResource += 1;
+        status = "no matching needed resource >= minimum";
+      } else {
+        counts.usable += 1;
+      }
+
+      if ((status === "usable" || samples.length < 12) && samples.length < 20) {
+        samples.push({
+          origin: donor.village.coord,
+          originId: donor.village.id,
+          name: donor.village.name,
+          distance: Math.round(distance * 10) / 10,
+          merchantsAvailable: donor.merchantsAvailable,
+          available: cloneResources(donor.available),
+          matchingResources: matchingResources,
+          status: status
+        });
+      }
+    });
+
+    return {
+      counts: counts,
+      samples: samples
+    };
+  }
+
+  function buildUnplannedTargetDiagnostics(planResult, settings) {
+    const plannedTargetIds = new Set((planResult.launches || []).map(launch => String(launch.target.id)));
+    return (planResult.targets || [])
+      .filter(target => totalResources(target.need || emptyResources()) > 0)
+      .filter(target => !plannedTargetIds.has(String(target.village.id)))
+      .slice(0, 40)
+      .map(target => {
+        let reason = "not planned";
+        const totalNeed = totalResources(target.need || emptyResources());
+        const donorDiagnostics = getTargetUsableDonorDiagnostics(target, planResult.donors || [], settings);
+
+        if (totalNeed < settings.minShipment) {
+          reason = "target need below minimum shipment";
+        } else if (!donorDiagnostics.counts.usable) {
+          if (donorDiagnostics.counts.outsideMaxDistance > 0) {
+            reason = "no usable donor inside max distance";
+          } else if (donorDiagnostics.counts.noMatchingNeededResource > 0) {
+            reason = "no donor with matching needed resource above minimum";
+          } else if (donorDiagnostics.counts.noMerchants > 0) {
+            reason = "donors had no merchants left";
+          } else {
+            reason = "no usable donor found";
+          }
+        }
+
+        return {
+          coord: target.village.coord,
+          targetId: target.village.id,
+          name: target.village.name,
+          points: target.village.points || 0,
+          priorityTier: target.priorityTier,
+          queueCount: target.queueCoverage ? target.queueCoverage.currentQueueCount : target.village.queueCount || 0,
+          queueHours: target.queueHours,
+          totalNeed: totalNeed,
+          need: cloneResources(target.need || emptyResources()),
+          reason: reason,
+          targetReason: target.reason,
+          donorDiagnostics: donorDiagnostics
+        };
+      });
+  }
+
   function logPlanDiagnostics(planResult, settings) {
     const targetWarehouseAudit = buildTargetWarehouseAudit(planResult.targetPlans, settings);
     const originUsageAudit = buildOriginUsagePlanAudit(planResult.launches, settings);
-    const overWarehouse = targetWarehouseAudit.filter(row => row.overSafeLimit && (row.overSafeLimit.wood || row.overSafeLimit.stone || row.overSafeLimit.iron));
+    const overWarehouse = targetWarehouseAudit.filter(row => row.plannedOverSafeLimit && (row.plannedOverSafeLimit.wood || row.plannedOverSafeLimit.stone || row.plannedOverSafeLimit.iron));
     const overOrigins = originUsageAudit.filter(row => row.overOriginWood || row.overOriginStone || row.overOriginIron || row.overOriginMerchants);
     const debug = state.debug || {};
 
@@ -2792,6 +2984,7 @@
         mode: settings.useAmTemplates ? "AM construction" : "Warehouse balance",
         targetWarehouseLimitPercent: settings.targetWarehouseLimitPercent,
         minResourcePerOrigin: settings.minResourcePerOrigin,
+        targetQueueCoverageHours: settings.constructionHours,
         targetQueueCoverageBuildings: settings.targetQueueCoverageBuildings,
         minShipment: settings.minShipment,
         maxDistance: settings.maxDistance,
@@ -2815,6 +3008,7 @@
         skippedSmallShipments: debug.skippedSmallShipments ? debug.skippedSmallShipments.length : 0,
         rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments ? debug.rejectedTinyResourceFragments.length : 0,
         incomingRowsParsed: debug.incomingTransportLoad && debug.incomingTransportLoad.selected ? debug.incomingTransportLoad.selected.rowsParsed : 0,
+        queueCoverageTargetHours: settings.constructionHours,
         queueCoverageTargetBuildings: settings.targetQueueCoverageBuildings,
         targetsWithIncoming: debug.incomingTransportLoad && debug.incomingTransportLoad.selected && debug.incomingTransportLoad.selected.byCoord ? debug.incomingTransportLoad.selected.byCoord.length : 0,
         targetsOverSafeWarehouseLimit: overWarehouse.length,
@@ -2839,11 +3033,13 @@
         priorityTier: target.priorityTier,
         queueCount: target.queueCoverage ? target.queueCoverage.currentQueueCount : target.village.queueCount || 0,
         queueHours: target.queueHours,
+        queueCoverage: formatQueueCoverage(target.queueCoverage),
         plannedBuilds: target.queueCoverage ? target.queueCoverage.plannedBuilds : 0,
         totalNeed: target.totalNeed,
         need: cloneResources(target.need || emptyResources()),
         reason: target.reason
       })),
+      unplannedTargets: buildUnplannedTargetDiagnostics(planResult, settings),
       cappedTargets: debug.cappedTargets || [],
       skippedSmallShipments: debug.skippedSmallShipments || [],
       rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments || []
@@ -2860,6 +3056,7 @@
     console.log("Data load steps", diagnostics.dataLoad);
     console.log("AM template load", diagnostics.amTemplateLoad);
     console.log("Target planning order", diagnostics.targetPlanningOrder);
+    console.log("Unplanned targets", diagnostics.unplannedTargets);
     console.log("Capped targets", diagnostics.cappedTargets);
     console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
     console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
@@ -3194,7 +3391,7 @@
           formatResources(audit.planned),
           formatResources(audit.afterPlanned),
           audit.safeLimit === null ? "unknown" : formatNumber(audit.safeLimit),
-          audit.overSafeLimit && (audit.overSafeLimit.wood || audit.overSafeLimit.stone || audit.overSafeLimit.iron) ? "YES" : "no"
+          formatAuditOverLabel(audit)
         ];
       })
     ));
@@ -3209,7 +3406,7 @@
       planResult.targets.slice(0, 12).map(target => [
         target.village.name,
         formatResources(target.need),
-        (target.queueCoverage ? target.queueCoverage.currentQueueCount + "/" + target.queueCoverage.targetQueueCount + " builds, " : "") + target.queueHours.toFixed(1) + "h",
+        target.queueCoverage ? formatQueueCoverage(target.queueCoverage) : target.queueHours.toFixed(1) + "h",
         String(target.village.points || 0),
         target.reason
       ])
@@ -3290,6 +3487,28 @@
     return parts.length ? parts.join(" / ") : "-";
   }
 
+  function formatWarehouseOverResources(over) {
+    const parts = [];
+
+    if (over && over.wood) parts.push("wood");
+    if (over && over.stone) parts.push("clay");
+    if (over && over.iron) parts.push("iron");
+
+    return parts.length ? parts.join(" / ") : "none";
+  }
+
+  function formatAuditOverLabel(audit) {
+    if (audit.plannedOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.plannedOverSafeLimit)) {
+      return "YES";
+    }
+
+    if (audit.preExistingOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.preExistingOverSafeLimit)) {
+      return "existing: " + formatWarehouseOverResources(audit.preExistingOverSafeLimit);
+    }
+
+    return "no";
+  }
+
   function formatNumber(value) {
     return new Intl.NumberFormat().format(Math.round(value || 0));
   }
@@ -3316,6 +3535,22 @@
       iron: currentPlusIncoming.iron + (planned.iron || 0)
     };
 
+    const overSafeLimit = safeLimit !== null ? {
+      wood: afterPlanned.wood > safeLimit,
+      stone: afterPlanned.stone > safeLimit,
+      iron: afterPlanned.iron > safeLimit
+    } : null;
+    const plannedOverSafeLimit = safeLimit !== null ? {
+      wood: planned.wood > 0 && afterPlanned.wood > safeLimit,
+      stone: planned.stone > 0 && afterPlanned.stone > safeLimit,
+      iron: planned.iron > 0 && afterPlanned.iron > safeLimit
+    } : null;
+    const preExistingOverSafeLimit = safeLimit !== null ? {
+      wood: currentPlusIncoming.wood > safeLimit,
+      stone: currentPlusIncoming.stone > safeLimit,
+      iron: currentPlusIncoming.iron > safeLimit
+    } : null;
+
     return {
       target: target.coord || "",
       targetId: target.id || "",
@@ -3327,11 +3562,9 @@
       currentPlusIncoming: currentPlusIncoming,
       planned: planned,
       afterPlanned: afterPlanned,
-      overSafeLimit: safeLimit !== null ? {
-        wood: afterPlanned.wood > safeLimit,
-        stone: afterPlanned.stone > safeLimit,
-        iron: afterPlanned.iron > safeLimit
-      } : null
+      overSafeLimit: overSafeLimit,
+      plannedOverSafeLimit: plannedOverSafeLimit,
+      preExistingOverSafeLimit: preExistingOverSafeLimit
     };
   }
 
@@ -3354,9 +3587,12 @@
     const audit = createTargetPlanStorageAudit(targetPlan, settings);
     const safeText = audit.safeLimit === null ? "unknown" : formatNumber(audit.safeLimit);
     const capacityText = audit.capacity ? formatNumber(audit.capacity) : "unknown";
-    const overText = audit.overSafeLimit && (audit.overSafeLimit.wood || audit.overSafeLimit.stone || audit.overSafeLimit.iron)
-      ? " | OVER SAFE LIMIT"
-      : "";
+    let overText = "";
+    if (audit.plannedOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.plannedOverSafeLimit)) {
+      overText = " | OVER SAFE LIMIT";
+    } else if (audit.preExistingOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.preExistingOverSafeLimit)) {
+      overText = " | existing over safe: " + formatWarehouseOverResources(audit.preExistingOverSafeLimit);
+    }
 
     return "   Target storage audit: capacity " + capacityText +
       " | 90% safe " + safeText +
@@ -3378,6 +3614,9 @@
 
     lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
     lines.push("Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance"));
+    if (settings.useAmTemplates) {
+      lines.push("Build coverage target: " + settings.constructionHours + "h queue time");
+    }
     lines.push("Origin reserve: " + settings.reserveWarehousePercent + "% of warehouse");
     lines.push(getIncomingLoadSummaryText());
     lines.push("");
