@@ -17,6 +17,8 @@
  * - Treats Build coverage as target queue time coverage, not only number of queued buildings
  * - Caps warehouse safety per resource so one overflowing resource does not block other resources
  * - Creates optional conservative relay replenishment requests after direct target requests
+ * - Parses incoming trader resources from both icon/class markup and plain resource cells
+ * - Stops planning if incoming rows are visible but cannot be parsed, to avoid duplicate overfill requests
  * - Allows relay middlemen without an active queue only when they do not have an active AM construction template
  * - Prioritizes nearest affordable donors in AM construction mode so urgent targets receive resources faster
  * - Adds UI toggle and click/hover help dialogs for Low-point priority and Relay replenishment
@@ -74,7 +76,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.23";
+  const SCRIPT_VERSION = "1.7.24";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -577,6 +579,173 @@
     };
   }
 
+  function getTransportResourceKeyFromNode(node) {
+    if (!node || node.nodeType !== 1) return "";
+
+    const element = node;
+    const classText = element.className && typeof element.className === "string" ? element.className : "";
+    const markerText = cleanText([
+      classText,
+      element.getAttribute && element.getAttribute("src"),
+      element.getAttribute && element.getAttribute("alt"),
+      element.getAttribute && element.getAttribute("title"),
+      element.getAttribute && element.getAttribute("data-title")
+    ].filter(Boolean).join(" ")).toLowerCase();
+
+    if (/wood|timber|lumber|holz|bois|madera|legno|drewno/.test(markerText)) return "wood";
+    if (/stone|clay|loam|lehm|argile|arcilla|argilla|glina/.test(markerText)) return "stone";
+    if (/iron|eisen|fer|hierro|ferro|zelazo|żelazo/.test(markerText)) return "iron";
+
+    return "";
+  }
+
+  function hasTransportResourceMarker(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (getTransportResourceKeyFromNode(node)) return true;
+    return Boolean(node.querySelector && Array.from(node.querySelectorAll("*"))
+      .some(child => Boolean(getTransportResourceKeyFromNode(child))));
+  }
+
+  function extractNumericTokens(text) {
+    return (cleanText(text).match(/\d[\d.,]*/g) || [])
+      .map(token => ({ token: token, value: parseNumber(token) }))
+      .filter(item => item.value > 0);
+  }
+
+  function parseResourceCellByMarkers(cell) {
+    const resources = emptyResources();
+    const markers = [];
+    const sequence = [];
+
+    function walk(node) {
+      if (!node) return;
+
+      if (node.nodeType === 1) {
+        const key = getTransportResourceKeyFromNode(node);
+        if (key) {
+          markers.push(key);
+          sequence.push({ type: "marker", key: key });
+        }
+
+        Array.from(node.childNodes || []).forEach(walk);
+        return;
+      }
+
+      if (node.nodeType === 3) {
+        extractNumericTokens(node.textContent || "").forEach(item => {
+          sequence.push({ type: "number", value: item.value });
+        });
+      }
+    }
+
+    walk(cell);
+
+    let pendingMarkerKey = "";
+    let fallbackIndex = 0;
+    const fallbackOrder = ["wood", "stone", "iron"];
+
+    sequence.forEach(item => {
+      if (item.type === "marker") {
+        pendingMarkerKey = item.key || "";
+        return;
+      }
+
+      if (item.type !== "number" || item.value <= 0) return;
+
+      let key = pendingMarkerKey || "";
+      if (!key) {
+        key = fallbackOrder[fallbackIndex] || "";
+        fallbackIndex += 1;
+      }
+
+      if (key && resources[key] !== undefined) {
+        resources[key] += item.value;
+      }
+
+      pendingMarkerKey = "";
+    });
+
+    return resources;
+  }
+
+  function parsePlainResourceCell(cell) {
+    const resources = emptyResources();
+    const fallbackOrder = ["wood", "stone", "iron"];
+    const tokens = extractNumericTokens(cell ? cell.textContent : "");
+
+    tokens.slice(0, 3).forEach((item, index) => {
+      const key = fallbackOrder[index];
+      if (key) resources[key] += item.value;
+    });
+
+    return resources;
+  }
+
+  function getLikelyTransportResourceCell(row) {
+    const cells = Array.from(row.children || []);
+    if (!cells.length) return null;
+
+    const markedCells = cells.filter(cell => hasTransportResourceMarker(cell) && totalResources(parseResourceCellByMarkers(cell)) > 0);
+    if (markedCells.length) return markedCells[markedCells.length - 1];
+
+    const numericCells = cells.filter(cell => extractNumericTokens(cell.textContent || "").length > 0);
+    if (numericCells.length) return numericCells[numericCells.length - 1];
+
+    return cells[cells.length - 1] || null;
+  }
+
+  function extractTransportResourcesFromRow(row) {
+    const classResources = extractResourcesFromRow(row);
+    if (totalResources(classResources) > 0) {
+      return {
+        resources: classResources,
+        method: "class-resource-columns",
+        resourceCellText: ""
+      };
+    }
+
+    const resourceCell = getLikelyTransportResourceCell(row);
+    const cellText = cleanText(resourceCell ? resourceCell.textContent : "").slice(0, 160);
+
+    if (!resourceCell) {
+      return {
+        resources: emptyResources(),
+        method: "no-resource-cell",
+        resourceCellText: ""
+      };
+    }
+
+    const markerResources = parseResourceCellByMarkers(resourceCell);
+    if (totalResources(markerResources) > 0) {
+      return {
+        resources: markerResources,
+        method: "resource-cell-markers",
+        resourceCellText: cellText
+      };
+    }
+
+    const plainResources = parsePlainResourceCell(resourceCell);
+    if (totalResources(plainResources) > 0) {
+      return {
+        resources: plainResources,
+        method: "plain-resource-cell-fallback",
+        resourceCellText: cellText
+      };
+    }
+
+    return {
+      resources: emptyResources(),
+      method: "resource-cell-empty",
+      resourceCellText: cellText
+    };
+  }
+
+  function rowTextLooksLikeTransportWithResources(text) {
+    const normalized = cleanText(text);
+    // Typical trader rows end with merchants and one to three resource amounts, e.g. "35 7.777 27.223".
+    return /\d+\s+\d[\d.]{2,}(?:\s+\d[\d.]{2,}){0,2}/.test(normalized);
+  }
+
   function parseMerchants(row) {
     const marketLink = row.querySelector('a[href*="market"]');
     const text = cleanText(marketLink ? marketLink.textContent : row.textContent);
@@ -914,14 +1083,22 @@
     };
 
     rows.forEach((row, rowIndex) => {
-      const resources = extractResourcesFromRow(row);
+      const resourceParse = extractTransportResourcesFromRow(row);
+      const resources = resourceParse.resources;
       const total = totalResources(resources);
       const rowText = cleanText(row.textContent).slice(0, 240);
 
       if (total <= 0) {
         diagnostics.rowsSkippedNoResources += 1;
         if (diagnostics.skippedSamples.length < 8) {
-          diagnostics.skippedSamples.push({ rowIndex: rowIndex, reason: "no resources", text: rowText });
+          diagnostics.skippedSamples.push({
+            rowIndex: rowIndex,
+            reason: "no resources",
+            parserMethod: resourceParse.method,
+            resourceCellText: resourceParse.resourceCellText,
+            looksLikeTransportResources: rowTextLooksLikeTransportWithResources(rowText),
+            text: rowText
+          });
         }
         return;
       }
@@ -943,6 +1120,8 @@
         diagnostics.parsedSamples.push({
           rowIndex: rowIndex,
           method: detected.method,
+          resourceParserMethod: resourceParse.method,
+          resourceCellText: resourceParse.resourceCellText,
           selectedCoord: coord,
           resources: cloneResources(resources),
           text: rowText
@@ -953,6 +1132,8 @@
         diagnostics.ambiguousRows.push({
           rowIndex: rowIndex,
           method: detected.method,
+          resourceParserMethod: resourceParse.method,
+          resourceCellText: resourceParse.resourceCellText,
           selectedCoord: coord,
           resources: cloneResources(resources),
           text: rowText
@@ -970,6 +1151,15 @@
       incoming: incoming,
       diagnostics: diagnostics
     };
+  }
+
+  function hasSuspiciousUnparsedIncomingRows(diagnostics) {
+    if (!diagnostics || diagnostics.rowsParsed > 0) return false;
+    if ((diagnostics.rowsSeen || 0) <= 3) return false;
+
+    return (diagnostics.skippedSamples || []).some(sample => {
+      return Boolean(sample && (sample.looksLikeTransportResources || rowTextLooksLikeTransportWithResources(sample.text || "")));
+    });
   }
 
   async function loadIncomingData(villages) {
@@ -1056,6 +1246,25 @@
           byCoord: []
         }
       };
+    }
+
+    if (hasSuspiciousUnparsedIncomingRows(selected.diagnostics)) {
+      if (!state.debug) state.debug = {};
+      state.debug.incomingTransportLoad = {
+        selectedUrl: selected.diagnostics.url || "",
+        selectedLabel: selected.diagnostics.label || "",
+        attempts: attempts,
+        selected: selected.diagnostics,
+        stoppedPlanning: true,
+        stopReason: "Incoming transport rows were visible but no resource amounts could be parsed."
+      };
+
+      console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION + " - stopped planning");
+      console.log("Selected incoming parser result", selected.diagnostics);
+      console.log("Incoming parser attempts", attempts);
+      console.groupEnd();
+
+      throw new Error("Incoming transports are visible but could not be parsed safely. Planning stopped to avoid duplicate requests and warehouse overfill. Update the script or copy diagnostics.");
     }
 
     if (!state.debug) state.debug = {};
