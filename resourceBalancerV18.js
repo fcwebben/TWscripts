@@ -66,7 +66,7 @@
   window.twacticsResourcePlannerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.15";
+  const SCRIPT_VERSION = "1.7.16";
   const BOX_ID = "twactics-resource-planner";
   const STYLE_ID = "twactics-resource-planner-style";
   const DATA_VERSION = 1;
@@ -98,7 +98,9 @@
     arrivalBalanceWindowMinutes: 30,
     baseMerchantMinutesPerField: 18,
     targetWarehouseLimitPercent: 90,
-    minResourcePerOrigin: 500
+    minResourcePerOrigin: 500,
+    targetQueueCoverageBuildings: 4,
+    queueSoonRefillBuildingCount: 1
   };
 
   const BUILDING_NAMES = {
@@ -1525,6 +1527,8 @@
       merchantMinutesPerField: getMerchantMinutesPerField(),
       targetWarehouseLimitPercent: DEFAULTS.targetWarehouseLimitPercent,
       minResourcePerOrigin: DEFAULTS.minResourcePerOrigin,
+      targetQueueCoverageBuildings: DEFAULTS.targetQueueCoverageBuildings,
+      queueSoonRefillBuildingCount: DEFAULTS.queueSoonRefillBuildingCount,
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
@@ -1610,6 +1614,9 @@
     const villages = state.villages.slice();
     const stats = calculateGlobalStats(villages);
     const targets = buildTargets(villages, stats, settings);
+    targets.forEach((target, index) => {
+      target.planningOrder = index + 1;
+    });
     const donors = buildDonors(villages, stats, settings);
     const launches = matchDonorsToTargets(targets, donors, settings);
     const targetPlans = groupLaunchesByTarget(launches, settings);
@@ -1722,6 +1729,88 @@
     };
   }
 
+  function sumNeedDetails(details, limit) {
+    const need = emptyResources();
+    const selected = [];
+    const maxItems = Math.max(0, limit || 0);
+
+    (details || []).forEach(detail => {
+      if (selected.length >= maxItems) return;
+      const resources = detail && detail.resources ? detail.resources : emptyResources();
+      if (totalResources(resources) <= 0) return;
+      addResources(need, resources);
+      selected.push(detail);
+    });
+
+    return {
+      resources: need,
+      details: selected,
+      count: selected.length
+    };
+  }
+
+  function getTargetQueueCoverage(village, settings) {
+    const currentQueueCount = Math.max(0, village.queueCount || 0);
+    const targetQueueCount = Math.max(1, settings.targetQueueCoverageBuildings || DEFAULTS.targetQueueCoverageBuildings);
+    const queueHours = (village.queueEndSeconds || 0) / 3600;
+    const hasTemplate = Boolean(village.amTemplateName);
+    const details = village.ownNeedDetails || [];
+
+    let wantedBuilds = Math.max(0, targetQueueCount - currentQueueCount);
+
+    if (wantedBuilds <= 0 && hasTemplate && queueHours <= Math.max(1, settings.constructionHours || DEFAULTS.constructionHours)) {
+      wantedBuilds = Math.max(0, settings.queueSoonRefillBuildingCount || DEFAULTS.queueSoonRefillBuildingCount);
+    }
+
+    wantedBuilds = Math.min(targetQueueCount, wantedBuilds);
+
+    const summed = sumNeedDetails(details, wantedBuilds);
+
+    return {
+      currentQueueCount: currentQueueCount,
+      targetQueueCount: targetQueueCount,
+      queueHours: queueHours,
+      wantedBuilds: wantedBuilds,
+      plannedBuilds: summed.count,
+      details: summed.details,
+      resources: summed.resources,
+      mode: wantedBuilds > 0 ? "queue coverage" : "already covered"
+    };
+  }
+
+  function getTargetPriorityTier(target, settings) {
+    if (!settings.useAmTemplates) return 50;
+    if (target.queueEmpty) return 0;
+    if ((target.queueCoverage && target.queueCoverage.currentQueueCount || 0) < (settings.targetQueueCoverageBuildings || DEFAULTS.targetQueueCoverageBuildings)) return 1;
+    if (target.queueHours <= 1) return 2;
+    if (target.queueHours <= Math.max(1, settings.constructionHours || DEFAULTS.constructionHours)) return 3;
+    return 4;
+  }
+
+  function sortTargetsForPlanning(a, b, settings) {
+    if (!settings.useAmTemplates) {
+      const scoreDiff = b.score - a.score;
+      if (scoreDiff) return scoreDiff;
+      return b.totalNeed - a.totalNeed;
+    }
+
+    const tierDiff = (a.priorityTier || 0) - (b.priorityTier || 0);
+    if (tierDiff) return tierDiff;
+
+    if (settings.prioritizeLowPoints) {
+      const pointDiff = (a.village.points || 0) - (b.village.points || 0);
+      if (pointDiff) return pointDiff;
+    }
+
+    const queueDiff = (a.queueHours || 0) - (b.queueHours || 0);
+    if (Math.abs(queueDiff) > 0.05) return queueDiff;
+
+    const plannedBuildDiff = (b.queueCoverage && b.queueCoverage.plannedBuilds || 0) - (a.queueCoverage && a.queueCoverage.plannedBuilds || 0);
+    if (plannedBuildDiff) return plannedBuildDiff;
+
+    return b.totalNeed - a.totalNeed;
+  }
+
   function buildTargets(villages, stats, settings) {
     return villages.map(village => {
       const current = getCurrentResourcesWithIncoming(village);
@@ -1743,8 +1832,11 @@
       let need = emptyResources();
       let score = 0;
 
+      let queueCoverage = null;
+
       if (settings.useAmTemplates) {
-        constructionNeed = cloneResources(village.ownNeed || emptyResources());
+        queueCoverage = getTargetQueueCoverage(village, settings);
+        constructionNeed = cloneResources(queueCoverage.resources || emptyResources());
         need = {
           wood: Math.max(0, constructionNeed.wood - current.wood),
           stone: Math.max(0, constructionNeed.stone - current.stone),
@@ -1777,7 +1869,9 @@
       }
 
       if (settings.useAmTemplates) {
+        const queueCoverageMissing = queueCoverage ? Math.max(0, queueCoverage.targetQueueCount - queueCoverage.currentQueueCount) : 0;
         score = totalResources(need) / 1000;
+        score += queueCoverageMissing * 60;
 
         if (hasTemplate) {
           score += 10;
@@ -1788,17 +1882,11 @@
         }
 
         if (hasTemplate) {
-          score += queueSoon * 30;
+          score += queueSoon * 20;
         }
-
-        score += lowPointRatio * settings.lowPointsBoost;
 
         if (!hasTemplateData && hasTemplate) {
           score *= 0.35;
-        }
-
-        if (settings.priorityMode === "construction_first") {
-          score += totalResources(need) / 700;
         }
       } else {
         score = totalResources(need) / 1000;
@@ -1806,8 +1894,7 @@
       }
 
       const totalNeed = totalResources(need);
-
-      return {
+      const targetDraft = {
         village: village,
         need: need,
         initialNeed: cloneResources(need),
@@ -1823,15 +1910,19 @@
         hasTemplateData: hasTemplateData,
         queueEmpty: queueEmpty,
         queueHours: queueHours,
+        queueCoverage: queueCoverage,
         lowPointRatio: lowPointRatio,
-        reason: buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap)
+        reason: buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap, queueCoverage)
       };
+
+      targetDraft.priorityTier = getTargetPriorityTier(targetDraft, settings);
+      return targetDraft;
     })
-      .filter(target => target.totalNeed >= settings.minShipment || (settings.useAmTemplates && target.totalNeed > 0 && target.score > settings.emptyQueueBoost))
-      .sort((a, b) => b.score - a.score);
+      .filter(target => target.totalNeed >= settings.minShipment || (settings.useAmTemplates && target.totalNeed > 0))
+      .sort((a, b) => sortTargetsForPlanning(a, b, settings));
   }
 
-  function buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap) {
+  function buildTargetReason(village, totalNeed, hasTemplate, queueEmpty, queueHours, lowPointRatio, settings, warehouseTarget, warehouseCap, queueCoverage) {
     const reasons = [];
 
     if (!settings.useAmTemplates) {
@@ -1845,6 +1936,10 @@
       reasons.push("AM queue ends soon");
     } else if (hasTemplate) {
       reasons.push("AM template active");
+    }
+
+    if (settings.useAmTemplates && queueCoverage && queueCoverage.wantedBuilds > 0) {
+      reasons.push("queue coverage " + queueCoverage.plannedBuilds + "/" + queueCoverage.targetQueueCount + " build(s)");
     }
 
     if (lowPointRatio > 0.5 && settings.prioritizeLowPoints) {
@@ -2263,6 +2358,9 @@
           travelMinutes: match.travelMinutes,
           arrivalBucket: match.arrivalBucket,
           targetScore: target.score,
+          targetOrder: target.planningOrder || 999999,
+          targetPriorityTier: target.priorityTier,
+          targetQueueCoverage: target.queueCoverage || null,
           donorScore: match.score,
           targetReason: target.reason,
           donorReason: donor.reason
@@ -2288,7 +2386,10 @@
           total: 0,
           merchantsUsed: 0,
           maxDistance: 0,
-          targetReason: launch.targetReason
+          targetReason: launch.targetReason,
+          targetOrder: launch.targetOrder || 999999,
+          targetPriorityTier: launch.targetPriorityTier,
+          targetQueueCoverage: launch.targetQueueCoverage || null
         });
       }
 
@@ -2307,7 +2408,7 @@
       plan.arrivalBalance = createArrivalBalanceSummary(plan, settings || DEFAULTS);
     });
 
-    return plans.sort((a, b) => b.total - a.total);
+    return plans.sort((a, b) => (a.targetOrder || 999999) - (b.targetOrder || 999999));
   }
 
   function buildDonorAudit(donors, targets, launches, settings) {
@@ -2575,6 +2676,7 @@
         mode: settings.useAmTemplates ? "AM construction" : "Warehouse balance",
         targetWarehouseLimitPercent: settings.targetWarehouseLimitPercent,
         minResourcePerOrigin: settings.minResourcePerOrigin,
+        targetQueueCoverageBuildings: settings.targetQueueCoverageBuildings,
         minShipment: settings.minShipment,
         maxDistance: settings.maxDistance,
         reserveWarehousePercent: settings.reserveWarehousePercent,
@@ -2593,6 +2695,7 @@
         skippedSmallShipments: debug.skippedSmallShipments ? debug.skippedSmallShipments.length : 0,
         rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments ? debug.rejectedTinyResourceFragments.length : 0,
         incomingRowsParsed: debug.incomingTransportLoad && debug.incomingTransportLoad.selected ? debug.incomingTransportLoad.selected.rowsParsed : 0,
+        queueCoverageTargetBuildings: settings.targetQueueCoverageBuildings,
         targetsWithIncoming: debug.incomingTransportLoad && debug.incomingTransportLoad.selected && debug.incomingTransportLoad.selected.byCoord ? debug.incomingTransportLoad.selected.byCoord.length : 0,
         targetsOverSafeWarehouseLimit: overWarehouse.length,
         originsOverAvailableResourcesOrMerchants: overOrigins.length
@@ -2603,6 +2706,19 @@
       targetWarehouseAudit: targetWarehouseAudit,
       originUsageAudit: originUsageAudit,
       incomingTransportLoad: debug.incomingTransportLoad || null,
+      targetPlanningOrder: (planResult.targets || []).slice(0, 40).map(target => ({
+        order: target.planningOrder,
+        coord: target.village.coord,
+        name: target.village.name,
+        points: target.village.points || 0,
+        priorityTier: target.priorityTier,
+        queueCount: target.queueCoverage ? target.queueCoverage.currentQueueCount : target.village.queueCount || 0,
+        queueHours: target.queueHours,
+        plannedBuilds: target.queueCoverage ? target.queueCoverage.plannedBuilds : 0,
+        totalNeed: target.totalNeed,
+        need: cloneResources(target.need || emptyResources()),
+        reason: target.reason
+      })),
       cappedTargets: debug.cappedTargets || [],
       skippedSmallShipments: debug.skippedSmallShipments || [],
       rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments || []
@@ -2616,6 +2732,7 @@
     console.log("Target warehouse audit", targetWarehouseAudit);
     console.log("Origin usage audit", originUsageAudit);
     console.log("Incoming transport load", diagnostics.incomingTransportLoad);
+    console.log("Target planning order", diagnostics.targetPlanningOrder);
     console.log("Capped targets", diagnostics.cappedTargets);
     console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
     console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
@@ -2961,11 +3078,12 @@
     details.appendChild(targetTitle);
 
     details.appendChild(createMiniTable(
-      ["Village", "Need", "Queue", "Reason"],
+      ["Village", "Need", "Queue", "Points", "Reason"],
       planResult.targets.slice(0, 12).map(target => [
         target.village.name,
         formatResources(target.need),
-        target.queueHours.toFixed(1) + "h",
+        (target.queueCoverage ? target.queueCoverage.currentQueueCount + "/" + target.queueCoverage.targetQueueCount + " builds, " : "") + target.queueHours.toFixed(1) + "h",
+        String(target.village.points || 0),
         target.reason
       ])
     ));
