@@ -1,6 +1,6 @@
 /*
  * Twactics Advanced Mass Scavenging
- * Version: 0.2.0
+ * Version: 0.2.1
  *
  * Clean-room mass scavenging helper with per-village allocation and preview-first sending.
  *
@@ -56,7 +56,7 @@
   "use strict";
 
   const NAME = "Twactics Advanced Mass Scavenging";
-  const VERSION = "0.2.0";
+  const VERSION = "0.2.1";
   const ROOT = "twactics-advanced-mass-scavenging";
   const PREVIEW = ROOT + "-preview";
   const STYLE = ROOT + "-style";
@@ -597,7 +597,10 @@
   function scavengeScripts(html) {
     const scripts = [];
     $(html).find("script").each((i, s) => {
-      const text = s.textContent || "";
+      // Use raw script HTML first. On some worlds, textContent can normalize the
+      // ScavengeMassScreen payload in a way that makes the village data block
+      // fail JSON.parse even though the raw innerHTML is parseable.
+      const text = $(s).html() || s.innerHTML || s.textContent || "";
       if (text.indexOf("ScavengeMassScreen") >= 0 || text.indexOf("loot_factor") >= 0 || text.indexOf("unit_counts_home") >= 0) {
         scripts.push(text);
       }
@@ -655,7 +658,8 @@
 
   function parseVillages(html, page, url) {
     const blocks = jsonBlocks(html);
-    const parsed = blocks.map(json).filter(Boolean);
+    const parsedEntries = blocks.map((block, idx) => ({ blockIndex: idx, value: json(block), raw: block }));
+    const parsed = parsedEntries.filter(entry => entry.value !== null && entry.value !== undefined);
     const villages = [];
     const parseDebug = {
       page: page,
@@ -663,15 +667,26 @@
       scriptCount: scavengeScripts(html).length,
       blockCount: blocks.length,
       parsedBlockCount: parsed.length,
+      failedBlockCount: blocks.length - parsed.length,
+      failedBlocks: parsedEntries
+        .filter(entry => entry.value === null || entry.value === undefined)
+        .map(entry => ({
+          blockIndex: entry.blockIndex,
+          length: entry.raw ? entry.raw.length : 0,
+          sampleStart: entry.raw ? entry.raw.slice(0, 160) : "",
+          sampleEnd: entry.raw ? entry.raw.slice(-160) : ""
+        })),
       candidateCounts: [],
       sampleKeys: []
     };
 
-    parsed.forEach((obj, idx) => {
+    parsed.forEach(entry => {
+      const obj = entry.value;
       const found = [];
       collectVillagesDeep(obj, found, 0);
-      parseDebug.candidateCounts.push({ blockIndex: idx, villages: found.length });
+      parseDebug.candidateCounts.push({ blockIndex: entry.blockIndex, villages: found.length });
       if (obj && typeof obj === "object" && !Array.isArray(obj)) parseDebug.sampleKeys.push(Object.keys(obj).slice(0, 8));
+      if (Array.isArray(obj) && obj.length) parseDebug.sampleKeys.push(["array", "length=" + obj.length]);
       found.forEach(v => villages.push(v));
     });
 
@@ -710,7 +725,48 @@
     return !!(x && typeof x === "object" && x.village_id !== undefined && x.options && x.unit_counts_home);
   }
 
-  function json(text) { try { return JSON.parse(text); } catch (e) { return null; } }
+  function decodeHtml(text) {
+    if (!text || typeof document === "undefined") return text;
+    const textarea = document.createElement("textarea");
+    textarea.innerHTML = text;
+    return textarea.value;
+  }
+
+  function json(text) {
+    if (!text) return null;
+
+    const variants = [];
+    const trimmed = String(text).trim();
+    variants.push(trimmed);
+
+    const decoded = decodeHtml(trimmed);
+    if (decoded !== trimmed) variants.push(decoded.trim());
+
+    for (let i = 0; i < variants.length; i++) {
+      try {
+        return JSON.parse(variants[i]);
+      } catch (e) {}
+    }
+
+    for (let i = 0; i < variants.length; i++) {
+      try {
+        const parsed = JSON.parse("[" + variants[i] + "]");
+        return parsed && parsed[0] !== undefined ? parsed[0] : null;
+      } catch (e) {}
+    }
+
+    // Last-resort parser for ScavengeMassScreen object literals. This data comes
+    // from the current Tribal Wars page response, not an external source. It is
+    // used only to read the existing game-state object when strict JSON parsing
+    // fails on some worlds/locales.
+    for (let i = 0; i < variants.length; i++) {
+      try {
+        return Function('"use strict"; return (' + variants[i] + ');')();
+      } catch (e) {}
+    }
+
+    return null;
+  }
 
   function buildPlan(villages, constants, settings) {
     const requests = [];
