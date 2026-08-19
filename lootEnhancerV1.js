@@ -220,26 +220,33 @@ window.FarmGod.Library = (function () {
     let pageText = url.match('am_farm')
       ? `&Farm_page=${page}`
       : `&page=${page}`;
+    let requestUrl = url + pageText;
 
     return twLib
       .ajax({
-        url: url + pageText,
+        url: requestUrl,
       })
       .then((html) => {
-        return wrapFn(page, $(html));
+        return wrapFn(page, $(html), requestUrl);
       });
   };
 
   const processAllPages = function (url, processorFn) {
     let page = url.match('am_farm') || url.match('scavenge_mass') ? 0 : -1;
-    let wrapFn = function (page, $html) {
+    let wrapFn = function (page, $html, requestUrl) {
       let dnp = determineNextPage(page, $html);
+      let meta = {
+        baseUrl: url,
+        requestUrl: requestUrl || url,
+        page: page,
+        nextPage: dnp
+      };
 
       if (dnp) {
-        processorFn($html);
+        processorFn($html, meta);
         return processPage(url, dnp, wrapFn);
       } else {
-        return processorFn($html);
+        return processorFn($html, meta);
       }
     };
 
@@ -507,6 +514,7 @@ window.FarmGod.Main = (function (Library, Translation) {
                 optionNewbarbs,
                 optionLosses
               ).then((data) => {
+                exposeFarmGodDebug(data);
                 Dialog.close();
 
                 let plan = createPlanning(
@@ -515,6 +523,10 @@ window.FarmGod.Main = (function (Library, Translation) {
                   optionMaxloot,
                   data
                 );
+                exposeFarmGodDebug(data);
+                console.groupCollapsed('FarmGod planning debug');
+                console.log('Planning decisions', data.debug.planning);
+                console.groupEnd();
                 $('.farmGodContent').remove();
                 $('#am_widget_Farm')
                   .first()
@@ -695,6 +707,71 @@ window.FarmGod.Main = (function (Library, Translation) {
   };
 
 
+  const formatDebugTimestamp = function (timestamp) {
+    let parsed = parseInt(timestamp, 10);
+    if (!parsed) return '';
+
+    try {
+      return new Date(parsed * 1000).toLocaleString();
+    } catch (err) {
+      return String(parsed);
+    }
+  };
+
+  const collectCommandHeaders = function ($html) {
+    return $html
+      .find('#commands_table')
+      .find('tr')
+      .first()
+      .find('th, td')
+      .map((i, el) => $(el).text().trim().replace(/\s+/g, ' '))
+      .get();
+  };
+
+  const collectCommandCellTexts = function ($row) {
+    return $row
+      .find('td')
+      .map((i, el) => $(el).text().trim().replace(/\s+/g, ' '))
+      .get();
+  };
+
+  const summarizeCommandMap = function (commands) {
+    return Object.keys(commands || {})
+      .sort()
+      .map((key) => {
+        return {
+          key: key,
+          count: commands[key].length,
+          arrivals: commands[key].map((timestamp) => ({
+            timestamp: timestamp,
+            localTime: formatDebugTimestamp(timestamp)
+          }))
+        };
+      });
+  };
+
+  const exposeFarmGodDebug = function (data) {
+    window.FarmGod.debug = data.debug || {};
+    window.FarmGod.lastData = data;
+    window.FarmGod.getCommandDebug = function () {
+      return window.FarmGod.debug && window.FarmGod.debug.commands;
+    };
+    window.FarmGod.copyCommandDebug = function () {
+      const debug = window.FarmGod.getCommandDebug();
+      const json = JSON.stringify(debug, null, 2);
+
+      if (typeof copy === 'function') {
+        copy(json);
+        console.log('FarmGod command debug copied to clipboard.');
+      } else {
+        console.log(json);
+      }
+
+      return debug;
+    };
+  };
+
+
   const getCommandTargetKeys = function (coord, targetId) {
     let keys = [];
 
@@ -767,7 +844,7 @@ window.FarmGod.Main = (function (Library, Translation) {
 
   const targetHasArrivalConflict = function (commands, coord, targetId, arrival, minSeconds) {
     return getCommandArrivals(commands, coord, targetId).some((timestamp) => {
-      return Math.abs(timestamp - arrival) < minSeconds;
+      return Math.abs(timestamp - arrival) <= minSeconds;
     });
   };
 
@@ -776,6 +853,28 @@ window.FarmGod.Main = (function (Library, Translation) {
       villages: {},
       commands: {},
       farms: { templates: {}, farms: {} },
+      debug: {
+        commands: {
+          source: 'overview_villages?mode=commands&type=attack',
+          sourcePages: [],
+          tableFound: false,
+          headers: [],
+          rowsSeen: 0,
+          rowsParsed: 0,
+          rowsSkipped: 0,
+          rows: [],
+          commandMap: []
+        },
+        planning: {
+          source: 'createPlanning',
+          rows: [],
+          planned: 0,
+          skippedByExistingCommand: 0,
+          skippedByArrivalConflict: 0,
+          skippedByUnits: 0,
+          skippedByDistance: 0
+        }
+      }
     };
 
     let villagesProcessor = ($html) => {
@@ -874,26 +973,81 @@ window.FarmGod.Main = (function (Library, Translation) {
       return data;
     };
 
-    let commandsProcessor = ($html) => {
-      $html
-        .find('#commands_table')
-        .find('.row_a, .row_ax, .row_b, .row_bx')
-        .map((i, el) => {
-          let $el = $(el);
-          let coord = $el
-            .find('.quickedit-label')
-            .first()
-            .text()
-            .toCoord();
-          let targetId = getCommandTargetId($el);
-          let arrivalText = getCommandArrivalText($el);
-          let arrivalTimestamp = parseCommandArrivalTimestamp(arrivalText);
+    let commandsProcessor = ($html, meta = {}) => {
+      const $table = $html.find('#commands_table');
+      const $rows = $table.find('.row_a, .row_ax, .row_b, .row_bx');
+      const debug = data.debug.commands;
 
-          if (!arrivalTimestamp) return;
+      debug.tableFound = debug.tableFound || $table.length > 0;
+      debug.sourcePages.push({
+        baseUrl: meta.baseUrl || '',
+        requestUrl: meta.requestUrl || '',
+        page: meta.page,
+        nextPage: meta.nextPage,
+        tableFound: $table.length > 0,
+        rowCount: $rows.length
+      });
 
-          addCommandArrival(data.commands, coord, targetId, arrivalTimestamp);
-        });
+      if (!debug.headers.length) {
+        debug.headers = collectCommandHeaders($html);
+      }
 
+      $rows.each((i, el) => {
+        let $el = $(el);
+        let quickeditText = $el.find('.quickedit-label').first().text().trim();
+        let coord = quickeditText.toCoord();
+        let targetId = getCommandTargetId($el);
+        let arrivalText = getCommandArrivalText($el);
+        let arrivalTimestamp = parseCommandArrivalTimestamp(arrivalText);
+        let rowDebug = {
+          page: meta.page,
+          requestUrl: meta.requestUrl || '',
+          rowIndex: i,
+          rawText: $el.text().trim().replace(/\s+/g, ' '),
+          cells: collectCommandCellTexts($el),
+          quickeditLabelText: quickeditText,
+          parsedCoord: coord || '',
+          parsedTargetId: targetId || '',
+          arrivalText: arrivalText || '',
+          arrivalTimestamp: arrivalTimestamp || 0,
+          arrivalLocalTime: formatDebugTimestamp(arrivalTimestamp),
+          storedKeys: getCommandTargetKeys(coord, targetId),
+          stored: false,
+          skipReason: ''
+        };
+
+        debug.rowsSeen += 1;
+
+        if (!arrivalTimestamp) {
+          debug.rowsSkipped += 1;
+          rowDebug.skipReason = 'arrival timestamp could not be parsed';
+          debug.rows.push(rowDebug);
+          return;
+        }
+
+        if (!coord && !targetId) {
+          debug.rowsSkipped += 1;
+          rowDebug.skipReason = 'no target coord or target village id parsed';
+          debug.rows.push(rowDebug);
+          return;
+        }
+
+        addCommandArrival(data.commands, coord, targetId, arrivalTimestamp);
+        rowDebug.stored = true;
+        debug.rowsParsed += 1;
+        debug.rows.push(rowDebug);
+      });
+
+      debug.commandMap = summarizeCommandMap(data.commands);
+
+      console.groupCollapsed('FarmGod command table debug');
+      console.log('Fetch source pages', debug.sourcePages);
+      console.log('Headers', debug.headers);
+      console.log('Parsed rows', debug.rows);
+      console.log('Command map used for spacing', debug.commandMap);
+      console.groupEnd();
+
+      exposeFarmGodDebug(data);
       return data;
     };
 
@@ -1040,8 +1194,45 @@ window.FarmGod.Main = (function (Library, Translation) {
     ])
       .then(filterFarms)
       .then(() => {
+        if (data.debug && data.debug.commands) {
+          data.debug.commands.commandMap = summarizeCommandMap(data.commands);
+        }
+        exposeFarmGodDebug(data);
         return data;
       });
+  };
+
+  const getMovementSpeedFactor = function () {
+    const candidates = [];
+
+    if (typeof game_data !== 'undefined') {
+      if (game_data.unit_speed !== undefined) candidates.push(game_data.unit_speed);
+      if (game_data.world_config && game_data.world_config.unit_speed !== undefined) candidates.push(game_data.world_config.unit_speed);
+      if (game_data.config && game_data.config.unit_speed !== undefined) candidates.push(game_data.config.unit_speed);
+      if (game_data.speed !== undefined) candidates.push(game_data.speed);
+      if (game_data.world_config && game_data.world_config.speed !== undefined) candidates.push(game_data.world_config.speed);
+      if (game_data.config && game_data.config.speed !== undefined) candidates.push(game_data.config.speed);
+    }
+
+    for (let i = 0; i < candidates.length; i++) {
+      let value = parseFloat(String(candidates[i]).replace(',', '.'));
+      if (Number.isFinite(value) && value > 0) return value;
+    }
+
+    return 1;
+  };
+
+  const getFarmTravelSeconds = function (distance, template) {
+    let unitSpeed = template && template.speed ? parseFloat(template.speed) : 0;
+    let speedFactor = getMovementSpeedFactor();
+
+    if (!Number.isFinite(unitSpeed) || unitSpeed <= 0) return 0;
+
+    // Unit speeds from /interface.php?func=get_unit_info are base minutes per field.
+    // Fast worlds shorten travel time by the unit/world speed factor. Without this
+    // correction, the planner thinks attacks land much later than they really do and
+    // can allow arrivals closer together than the selected spacing.
+    return Math.round((distance * unitSpeed * 60) / speedFactor);
   };
 
   const createPlanning = function (
@@ -1077,7 +1268,7 @@ window.FarmGod.Main = (function (Library, Translation) {
         let distance = lib.getDistance(prop, el.coord);
         let arrival = Math.round(
           serverTime +
-          distance * template.speed * 60 +
+          getFarmTravelSeconds(distance, template) +
           Math.round(plan.counter / 5)
         );
         let maxTimeDiff = Math.round(optionTime * 60);
@@ -1089,12 +1280,63 @@ window.FarmGod.Main = (function (Library, Translation) {
           timeDiff = false;
         }
 
-        if (targetHasArrivalConflict(data.commands, el.coord, targetId, arrival, maxTimeDiff)) {
+        let arrivalConflict = targetHasArrivalConflict(data.commands, el.coord, targetId, arrival, maxTimeDiff);
+        if (arrivalConflict) {
           timeDiff = false;
         }
 
-        if (unitsLeft && timeDiff && distance < optionDistance) {
+        let planned = Boolean(unitsLeft && timeDiff && distance < optionDistance);
+        let planningDebugRow = {
+          originCoord: prop,
+          originName: data.villages[prop].name,
+          targetCoord: el.coord,
+          targetId: targetId,
+          template: template_name,
+          distance: distance,
+          optionDistance: optionDistance,
+          optionTimeMinutes: optionTime,
+          travelSeconds: getFarmTravelSeconds(distance, template),
+          speedFactor: getMovementSpeedFactor(),
+          plannedArrival: arrival,
+          plannedArrivalLocalTime: formatDebugTimestamp(arrival),
+          commandKeysChecked: getCommandTargetKeys(el.coord, targetId),
+          commandArrivals: commandArrivals.map((timestamp) => ({
+            timestamp: timestamp,
+            localTime: formatDebugTimestamp(timestamp),
+            diffSeconds: Math.abs(timestamp - arrival)
+          })),
+          existingCommandBlock: !farmIndex.hasOwnProperty('color') && commandArrivals.length > 0,
+          arrivalConflict: arrivalConflict,
+          hasUnits: Boolean(unitsLeft),
+          inDistance: distance < optionDistance,
+          planned: planned
+        };
+
+        if (!planned) {
+          if (!unitsLeft) {
+            planningDebugRow.skipReason = 'not enough units';
+            data.debug.planning.skippedByUnits += 1;
+          } else if (!(distance < optionDistance)) {
+            planningDebugRow.skipReason = 'outside max distance';
+            data.debug.planning.skippedByDistance += 1;
+          } else if (planningDebugRow.existingCommandBlock) {
+            planningDebugRow.skipReason = 'target already has own command and is not known from farm assistant colors';
+            data.debug.planning.skippedByExistingCommand += 1;
+          } else if (arrivalConflict) {
+            planningDebugRow.skipReason = 'arrival conflict inside selected spacing';
+            data.debug.planning.skippedByArrivalConflict += 1;
+          } else {
+            planningDebugRow.skipReason = 'other timeDiff block';
+          }
+        }
+
+        if (data.debug.planning.rows.length < 500) {
+          data.debug.planning.rows.push(planningDebugRow);
+        }
+
+        if (planned) {
           plan.counter++;
+          data.debug.planning.planned += 1;
           if (!plan.farms.hasOwnProperty(prop)) plan.farms[prop] = [];
 
           plan.farms[prop].push({
