@@ -1,6 +1,6 @@
 /*
  * Twactics Advanced Mass Scavenging
- * Version: 0.2.1
+ * Version: 0.3.0
  *
  * Clean-room mass scavenging helper with per-village allocation and preview-first sending.
  *
@@ -56,7 +56,7 @@
   "use strict";
 
   const NAME = "Twactics Advanced Mass Scavenging";
-  const VERSION = "0.2.1";
+  const VERSION = "0.3.0";
   const ROOT = "twactics-advanced-mass-scavenging";
   const PREVIEW = ROOT + "-preview";
   const STYLE = ROOT + "-style";
@@ -124,6 +124,7 @@
     requests: [],
     groups: [],
     preview: [],
+    skippedPreview: [],
     summary: null,
     groupsMenu: [],
     debug: { fetch: [], calculation: [], parsing: [] },
@@ -269,31 +270,48 @@
     remove(STYLE);
     const style = document.createElement("style");
     style.id = STYLE;
-    style.textContent = "#" + ROOT + ",#" + PREVIEW + "{margin:8px 0;padding:8px;border:1px solid #7d510f;background:#f4e4bc;color:#2d1b0f;font-size:12px}"
-      + "#" + ROOT + " h3,#" + PREVIEW + " h3{margin:4px 0 8px;color:#803000}"
-      + "#" + ROOT + " .twams-grid{display:grid;grid-template-columns:repeat(4,minmax(135px,1fr));gap:8px;margin-bottom:8px}"
-      + "#" + ROOT + " .twams-card,#" + PREVIEW + " .twams-card{border:1px solid #c1a264;background:#fff5da;padding:6px}"
-      + "#" + ROOT + " label{display:block;margin:3px 0;white-space:nowrap}"
-      + "#" + ROOT + " input[type=number]{width:80px}"
-      + "#" + ROOT + " input[type=date]{width:130px}"
-      + "#" + ROOT + " input[type=time]{width:90px}"
-      + "#" + ROOT + " select{max-width:190px}"
-      + "#" + ROOT + " .twams-units{display:flex;gap:5px;flex-wrap:wrap}"
-      + "#" + ROOT + " .twams-unit{border:1px solid #d1b783;background:#f9edcf;text-align:center;padding:4px;min-width:92px;cursor:grab}"
+    style.textContent = "#" + ROOT + ",#" + PREVIEW + "{margin:10px 0 14px;padding:0;border:1px solid #b89454;background:#f4e4bc;color:#2d1b0f;font-size:12px;box-shadow:0 1px 2px rgba(0,0,0,.15);max-width:1120px}"
+      + "#" + ROOT + " *,#" + PREVIEW + " *{box-sizing:border-box}"
+      + "#" + ROOT + " .twams-head,#" + PREVIEW + " .twams-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;background:#c6a768;border-bottom:1px solid #9f7d3c;color:#3b220c}"
+      + "#" + ROOT + " .twams-title,#" + PREVIEW + " .twams-title{font-size:15px;font-weight:bold;color:#4b2600}"
+      + "#" + ROOT + " .twams-subtitle,#" + PREVIEW + " .twams-subtitle{font-size:11px;color:#5c4630;margin-top:2px}"
+      + "#" + ROOT + " .twams-body,#" + PREVIEW + " .twams-body{padding:10px 12px;background:#f4e4bc}"
+      + "#" + ROOT + " .twams-section,#" + PREVIEW + " .twams-section{background:#fff5da;border:1px solid #cfb47a;margin-bottom:10px;padding:10px}"
+      + "#" + ROOT + " .twams-section-title,#" + PREVIEW + " .twams-section-title{font-weight:bold;color:#803000;margin-bottom:8px;display:flex;align-items:center;gap:6px}"
+      + "#" + ROOT + " .twams-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}"
+      + "#" + ROOT + " .twams-row-3{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:10px}"
+      + "#" + ROOT + " .twams-field{display:block;margin:0 0 8px;color:#2d1b0f;font-size:12px}"
+      + "#" + ROOT + " .twams-field span{display:block;font-size:11px;color:#694b27;margin-bottom:3px}"
+      + "#" + ROOT + " input[type=text],#" + ROOT + " input[type=number],#" + ROOT + " input[type=date],#" + ROOT + " input[type=time],#" + ROOT + " select{width:100%;height:26px;border:1px solid #b89454;background:#fffaf0;color:#2d1b0f;padding:2px 5px}"
+      + "#" + ROOT + " .twams-choice-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}"
+      + "#" + ROOT + " .twams-choice-row.twams-two{grid-template-columns:repeat(2,minmax(0,1fr))}"
+      + "#" + ROOT + " .twams-choice{display:block;position:relative;border:1px solid #cfb47a;background:#f9edcf;padding:8px 8px 8px 27px;min-height:54px;cursor:pointer}"
+      + "#" + ROOT + " .twams-choice input{position:absolute;left:8px;top:10px}"
+      + "#" + ROOT + " .twams-choice b{display:block;color:#4b2600;margin-bottom:2px}"
+      + "#" + ROOT + " .twams-choice small{display:block;color:#6b5434;line-height:1.25}"
+      + "#" + ROOT + " .twams-levels{display:flex;gap:6px;flex-wrap:wrap}"
+      + "#" + ROOT + " .twams-level{display:inline-flex;align-items:center;gap:4px;border:1px solid #cfb47a;background:#f9edcf;padding:5px 8px}"
+      + "#" + ROOT + " .twams-units{display:flex;flex-direction:column;gap:5px}"
+      + "#" + ROOT + " .twams-unit{display:grid;grid-template-columns:34px 96px 78px 70px 1fr;gap:8px;align-items:center;border:1px solid #cfb47a;background:#fffaf0;padding:6px;cursor:grab}"
       + "#" + ROOT + " .twams-unit.dragging{opacity:.45}"
-      + "#" + ROOT + " .twams-unit img{display:block;margin:0 auto 3px}"
-      + "#" + ROOT + " .twams-unit-buttons{display:flex;justify-content:center;gap:2px;margin:2px 0}"
-      + "#" + ROOT + " .twams-unit-buttons input{padding:1px 5px}"
-      + "#" + ROOT + " .twams-actions,#" + PREVIEW + " .twams-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}"
-      + "#" + ROOT + " .twams-note,#" + PREVIEW + " .twams-note{font-size:11px;color:#5c4630;margin:6px 0}"
-      + "#" + ROOT + " .twams-status{border:1px solid #d1b783;background:#fffaf0;padding:5px;margin-top:6px}"
-      + "#" + ROOT + " .error{color:#7a0000;border-color:#b33}#" + ROOT + " .success{color:#235c12;border-color:#4c8b2f}#" + ROOT + " .warn{color:#7a4d00;border-color:#c28b00}"
-      + "#" + PREVIEW + " .twams-summary{display:grid;grid-template-columns:repeat(6,minmax(100px,1fr));gap:6px;margin-bottom:8px}"
-      + "#" + PREVIEW + " .twams-summary div{border:1px solid #c1a264;background:#fff5da;padding:6px;text-align:center}"
-      + "#" + PREVIEW + " table{width:100%;border-collapse:collapse}#" + PREVIEW + " th,#" + PREVIEW + " td{border:1px solid #c1a264;padding:4px;text-align:center;vertical-align:top}"
-      + "#" + PREVIEW + " th{background:#c6a768;color:#803000}#" + PREVIEW + " .left{text-align:left}"
+      + "#" + ROOT + " .twams-unit img{width:24px;height:24px;display:block;margin:auto}"
+      + "#" + ROOT + " .twams-unit-name{font-weight:bold;color:#4b2600;text-transform:capitalize}"
+      + "#" + ROOT + " .twams-unit-buttons{display:flex;gap:3px}"
+      + "#" + ROOT + " .twams-unit-buttons input{height:24px;padding:0 7px}"
+      + "#" + ROOT + " .twams-unit .twams-keep{max-width:64px}"
+      + "#" + ROOT + " .twams-actions,#" + PREVIEW + " .twams-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}"
+      + "#" + ROOT + " .twams-note,#" + PREVIEW + " .twams-note{font-size:11px;color:#5c4630;line-height:1.35;margin:5px 0}"
+      + "#" + ROOT + " .twams-status{border-top:1px solid #cfb47a;background:#fffaf0;padding:8px 12px;color:#4b2600}"
+      + "#" + ROOT + " .error{color:#7a0000}#" + ROOT + " .success{color:#235c12}#" + ROOT + " .warn{color:#7a4d00}"
+      + "#" + PREVIEW + " .twams-summary{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;margin-bottom:10px}"
+      + "#" + PREVIEW + " .twams-summary div{border:1px solid #cfb47a;background:#fffaf0;padding:8px;text-align:center;min-height:48px}"
+      + "#" + PREVIEW + " .twams-summary b{color:#803000}"
+      + "#" + PREVIEW + " table{width:100%;border-collapse:collapse;background:#fffaf0}#" + PREVIEW + " th,#" + PREVIEW + " td{border:1px solid #cfb47a;padding:5px;text-align:center;vertical-align:top}"
+      + "#" + PREVIEW + " th{background:#c6a768;color:#4b2600}#" + PREVIEW + " .left{text-align:left}"
+      + "#" + PREVIEW + " .twams-empty{border:1px solid #c28b00;background:#fff8df;padding:10px;margin-bottom:10px;color:#5c3b00}"
       + "#" + PREVIEW + " .twams-locked{opacity:.55}"
-      + "#" + PREVIEW + " .twams-review{border:1px solid #c1a264;background:#fffaf0;padding:6px;margin-top:8px}";
+      + "#" + PREVIEW + " .twams-review{border:1px solid #cfb47a;background:#fffaf0;padding:8px;margin-top:10px}"
+      + "@media(max-width:900px){#" + ROOT + " .twams-row,#" + ROOT + " .twams-row-3,#" + PREVIEW + " .twams-summary{grid-template-columns:1fr 1fr}#" + ROOT + " .twams-choice-row{grid-template-columns:1fr}#" + ROOT + " .twams-unit{grid-template-columns:30px 1fr 72px 62px}}";
     document.head.appendChild(style);
   }
 
@@ -301,32 +319,34 @@
     remove(ROOT);
     const root = document.createElement("div");
     root.id = ROOT;
-    root.innerHTML = '<h3>' + NAME + ' <span style="font-size:11px">v' + VERSION + '</span></h3>'
-      + '<div class="twams-grid">'
-      + '<div class="twams-card"><b>Group</b><label>Village group <select id="twams-group"><option value="0">All villages</option></select></label><div class="twams-note">Saved after Calculate.</div></div>'
-      + '<div class="twams-card"><b>Mode</b>'
-      + radio("mode", "optimize_rph", "Optimize RPH")
-      + radio("mode", "balanced", "Balanced finish time")
-      + radio("mode", "high_first", "High levels first") + '</div>'
-      + '<div class="twams-card"><b>Time mode</b>'
-      + radio("time-mode", "hours", "Duration from now")
-      + radio("time-mode", "finish_at", "Finish at time")
-      + '<div class="twams-note">Off/Def villages can use separate limits.</div></div>'
-      + '<div class="twams-card"><b>Options</b>'
-      + check("premium", "Use premium scavenging") + check("debug", "Debug console")
-      + '<label>Delay ms <input id="twams-delay" type="number" min="0" step="50"></label></div>'
-      + '</div>'
-      + '<div class="twams-grid">'
-      + '<div class="twams-card"><b>Duration mode</b><label>Off hours <input id="twams-max-hours-off" type="number" min="0.25" step="0.25"></label><label>Def hours <input id="twams-max-hours-def" type="number" min="0.25" step="0.25"></label></div>'
-      + '<div class="twams-card"><b>Finish time - Off</b><label>Date <input id="twams-finish-off-date" type="date"></label><label>Time <input id="twams-finish-off-time" type="time"></label></div>'
-      + '<div class="twams-card"><b>Finish time - Def</b><label>Date <input id="twams-finish-def-date" type="date"></label><label>Time <input id="twams-finish-def-time" type="time"></label></div>'
-      + '<div class="twams-card"><b>Levels</b>' + check("level-1", "Level 1") + check("level-2", "Level 2") + check("level-3", "Level 3") + check("level-4", "Level 4") + '</div>'
-      + '</div>'
-      + '<div class="twams-card"><b>Units, keep-home and priority order</b><div class="twams-note">Drag units or use arrows. Left-most/top-most unit is used first when building squads.</div><div id="twams-units" class="twams-units"></div></div>'
-      + '<div class="twams-note">Preview-first: Calculate creates a plan only. Send buttons stay locked until you confirm that you reviewed the plan.</div>'
-      + '<div class="twams-note">User data: supports TribalWars.scriptData. Expected JSON format and options are documented in the script header.</div>'
-      + '<div class="twams-actions"><input type="button" class="btn" id="twams-calc" value="Calculate preview"><input type="button" class="btn" id="twams-copy" value="Copy debug"><input type="button" class="btn" id="twams-close" value="Close"></div>'
-      + '<div id="twams-status" class="twams-status">Ready.</div>';
+    root.innerHTML = '<div class="twams-head"><div><div class="twams-title">' + NAME + ' <span style="font-size:11px">v' + VERSION + '</span></div><div class="twams-subtitle">Preview-first mass scavenging with per-village RPH optimization.</div></div><input type="button" class="btn" id="twams-close" value="Close"></div>'
+      + '<div class="twams-body">'
+      + '<div class="twams-section"><div class="twams-section-title">1. Run setup</div><div class="twams-row-3">'
+      + '<div><label class="twams-field"><span>Village group</span><select id="twams-group"><option value="0">All villages</option></select></label><div class="twams-note">Saved after Calculate. Uses the mass-scavenging group filter.</div></div>'
+      + '<div><div class="twams-note" style="margin-top:0">Optimization mode</div><div class="twams-choice-row">'
+      + choiceRadio("mode", "optimize_rph", "Optimize RPH", "Best resources/hour under the selected max duration.")
+      + choiceRadio("mode", "balanced", "Balanced", "Attempts similar finish time across selected levels.")
+      + choiceRadio("mode", "high_first", "High first", "Fills higher levels before lower levels.")
+      + '</div></div>'
+      + '<div><div class="twams-note" style="margin-top:0">Time mode</div><div class="twams-choice-row twams-two">'
+      + choiceRadio("time-mode", "hours", "Duration", "Use max hours from now.")
+      + choiceRadio("time-mode", "finish_at", "Finish at", "Use a saved finish date/time.")
+      + '</div></div></div></div>'
+      + '<div class="twams-section"><div class="twams-section-title">2. Time targets</div><div class="twams-row">'
+      + '<div><b>Off villages</b><label class="twams-field"><span>Max duration hours</span><input id="twams-max-hours-off" type="number" min="0.25" step="0.25"></label></div>'
+      + '<div><b>Def villages</b><label class="twams-field"><span>Max duration hours</span><input id="twams-max-hours-def" type="number" min="0.25" step="0.25"></label></div>'
+      + '<div><b>Off finish time</b><label class="twams-field"><span>Date</span><input id="twams-finish-off-date" type="date"></label><label class="twams-field"><span>Time</span><input id="twams-finish-off-time" type="time"></label></div>'
+      + '<div><b>Def finish time</b><label class="twams-field"><span>Date</span><input id="twams-finish-def-date" type="date"></label><label class="twams-field"><span>Time</span><input id="twams-finish-def-time" type="time"></label></div>'
+      + '</div><div class="twams-note">In Finish-at mode the script calculates remaining hours from server time. The chosen finish time is saved for next run.</div></div>'
+      + '<div class="twams-section"><div class="twams-section-title">3. Levels and options</div><div class="twams-row">'
+      + '<div><b>Scavenging levels</b><div class="twams-levels">' + levelCheck(1) + levelCheck(2) + levelCheck(3) + levelCheck(4) + '</div></div>'
+      + '<div><b>Premium</b>' + check("premium", "Use premium scavenging") + '<div class="twams-note">Send still requires confirmation when premium is enabled.</div></div>'
+      + '<div><b>Advanced</b>' + check("debug", "Debug console") + '<label class="twams-field"><span>Request delay ms</span><input id="twams-delay" type="number" min="0" step="50"></label></div>'
+      + '<div><b>Safety</b><div class="twams-note">Calculate only creates a preview. Send buttons are locked until you explicitly confirm review.</div></div>'
+      + '</div></div>'
+      + '<div class="twams-section"><div class="twams-section-title">4. Units, keep-home and priority order</div><div class="twams-note">Drag rows or use arrows. Top unit is consumed first when building squads.</div><div id="twams-units" class="twams-units"></div></div>'
+      + '<div class="twams-actions"><input type="button" class="btn" id="twams-calc" value="Calculate preview"><input type="button" class="btn" id="twams-copy" value="Copy debug"></div>'
+      + '</div><div id="twams-status" class="twams-status">Ready.</div>';
 
     mount().prepend(root);
     fillForm();
@@ -334,6 +354,12 @@
     document.getElementById("twams-copy").addEventListener("click", window.TwacticsAdvancedMassScavenging.copyDebug);
     document.getElementById("twams-close").addEventListener("click", () => { remove(ROOT); remove(PREVIEW); });
   }
+
+  function choiceRadio(name, value, title, description) {
+    return '<label class="twams-choice"><input type="radio" name="twams-' + name + '" value="' + esc(value) + '"><b>' + esc(title) + '</b><small>' + esc(description) + '</small></label>';
+  }
+
+  function levelCheck(level) { return '<label class="twams-level"><input type="checkbox" id="twams-level-' + level + '"> Level ' + level + '</label>'; }
 
   function radio(name, value, label) { return '<label><input type="radio" name="twams-' + name + '" value="' + esc(value) + '"> ' + esc(label) + '</label>'; }
   function check(id, label) { return '<label><input type="checkbox" id="twams-' + id + '"> ' + esc(label) + '</label>'; }
@@ -403,8 +429,8 @@
       wrap.setAttribute("draggable", "true");
       wrap.dataset.unit = unit;
       wrap.innerHTML = '<img src="' + unitIcon(unit) + '" title="' + esc(unit) + '">'
-        + '<b>' + esc(unit) + '</b>'
-        + '<div class="twams-unit-buttons"><input type="button" class="btn twams-up" value="^"><input type="button" class="btn twams-down" value="v"></div>'
+        + '<div class="twams-unit-name">' + esc(unit) + '</div>'
+        + '<div class="twams-unit-buttons"><input type="button" class="btn twams-up" value="↑"><input type="button" class="btn twams-down" value="↓"></div>'
         + '<label><input type="checkbox" class="twams-unit-enabled" data-unit="' + esc(unit) + '"> use</label>'
         + '<label>Keep <input type="number" min="0" class="twams-keep" data-unit="' + esc(unit) + '"></label>';
       box.appendChild(wrap);
@@ -514,6 +540,7 @@
       state.requests = [];
       state.groups = [];
       state.preview = [];
+      state.skippedPreview = [];
       state.villages = [];
       state.sendUnlocked = false;
       state.debug = { fetch: [], calculation: [], parsing: [] };
@@ -526,11 +553,16 @@
       const plan = buildPlan(loaded.villages, loaded.constants, state.settings);
       state.requests = plan.requests;
       state.preview = plan.preview;
+      state.skippedPreview = plan.skippedPreview || [];
       state.summary = plan.summary;
       state.debug.calculation = plan.debug;
       state.groups = group(plan.requests, SQUAD_LIMIT);
       renderPreview();
-      status("Preview ready: " + fmt(plan.requests.length) + " requests. Review before sending.", "success");
+      if (plan.requests.length) {
+        status("Preview ready: " + fmt(plan.requests.length) + " requests. Review before sending.", "success");
+      } else {
+        status("No sendable requests found. Check the preview reasons before changing settings.", "warn");
+      }
       if (state.settings.debugConsole) console.log(NAME, state);
     } catch (err) {
       console.error(err);
@@ -771,6 +803,7 @@
   function buildPlan(villages, constants, settings) {
     const requests = [];
     const preview = [];
+    const skippedPreview = [];
     const debug = [];
     let loot = 0;
     let rph = 0;
@@ -778,14 +811,39 @@
     let skippedUnits = 0;
     let skippedLevels = 0;
     let skippedRally = 0;
+    let skippedDuration = 0;
+
+    function pushSkipped(village, reason, details) {
+      if (skippedPreview.length < 60) {
+        skippedPreview.push({
+          id: village && village.village_id,
+          name: village && (village.village_name || village.name || ("Village " + village.village_id)),
+          reason: reason,
+          details: details || ""
+        });
+      }
+      debug.push({ village_id: village && village.village_id, skipped: true, reason: reason, details: details || "" });
+    }
 
     villages.forEach(village => {
-      if (village.has_rally_point !== true) { skippedRally++; return; }
+      if (village.has_rally_point !== true) {
+        skippedRally++;
+        pushSkipped(village, "No rally point", "Village has no rally point.");
+        return;
+      }
       const lvls = availableLevels(village, settings);
-      if (!lvls.length) { skippedLevels++; return; }
+      if (!lvls.length) {
+        skippedLevels++;
+        pushSkipped(village, "No free selected levels", levelStateSummary(village, settings));
+        return;
+      }
       const units = availableUnits(village, settings);
       const totalCarry = unitCarrySum(units, village);
-      if (totalCarry <= 0) { skippedUnits++; return; }
+      if (totalCarry <= 0) {
+        skippedUnits++;
+        pushSkipped(village, "No usable selected units", "Selected units at home after keep-home: " + unitText(units));
+        return;
+      }
       const type = villageType(units);
       const maxHours = maxHoursForType(type, settings);
       const allocation = allocate(totalCarry, lvls, constants, settings, maxHours);
@@ -809,6 +867,9 @@
       if (rows.length) {
         usedVillages++;
         preview.push({ id: village.village_id, name: village.village_name || village.name || "Village " + village.village_id, type: type, maxHours: maxHours, rows: rows });
+      } else {
+        skippedDuration++;
+        pushSkipped(village, "Duration cap too strict", "Available levels: " + lvls.map(l => "L" + l).join(", ") + ". Max " + formatHours(maxHours) + " produced no valid squad with selected units.");
       }
 
       debug.push({ village_id: village.village_id, type: type, maxHours: maxHours, levels: lvls, totalCarry: totalCarry, allocation: allocation, rows: rows });
@@ -817,6 +878,7 @@
     return {
       requests: requests,
       preview: preview,
+      skippedPreview: skippedPreview,
       debug: debug,
       summary: {
         villagesScanned: villages.length,
@@ -828,6 +890,7 @@
         skippedNoRally: skippedRally,
         skippedNoUnits: skippedUnits,
         skippedNoLevels: skippedLevels,
+        skippedDuration: skippedDuration,
         mode: settings.mode,
         timeMode: settings.timeMode,
         maxHoursOff: maxHoursForType("off", settings),
@@ -847,6 +910,36 @@
       out.push(level);
     }
     return out;
+  }
+
+  function levelStateSummary(v, s) {
+    const parts = [];
+    for (let level = 1; level <= 4; level++) {
+      if (s.enabledLevels[level - 1] === false) {
+        parts.push("L" + level + " disabled in settings");
+        continue;
+      }
+      const opt = v.options && (v.options[level] || v.options[String(level)]);
+      if (!opt) {
+        parts.push("L" + level + " missing");
+      } else if (opt.is_locked === true) {
+        parts.push("L" + level + " locked");
+      } else if (opt.scavenging_squad != null) {
+        parts.push("L" + level + " active" + returnTimeText(opt.scavenging_squad));
+      } else {
+        parts.push("L" + level + " free");
+      }
+    }
+    return parts.join("; ");
+  }
+
+  function returnTimeText(squad) {
+    if (!squad || !squad.return_time) return "";
+    try {
+      return " until " + new Date(intVal(squad.return_time, 0) * 1000).toLocaleString();
+    } catch (e) {
+      return "";
+    }
   }
 
   function availableUnits(v, s) {
@@ -1018,9 +1111,11 @@
     remove(PREVIEW);
     const s = state.summary || {};
     const rows = state.preview.slice(0, 50);
+    const skippedRows = (state.skippedPreview || []).slice(0, 40);
     const div = document.createElement("div");
     div.id = PREVIEW;
-    div.innerHTML = '<h3>Scavenging plan preview</h3><div class="twams-summary">'
+    div.innerHTML = '<div class="twams-head"><div><div class="twams-title">Scavenging plan preview</div><div class="twams-subtitle">Review the generated plan before unlocking send buttons.</div></div><input type="button" class="btn" id="twams-preview-close" value="Close preview"></div><div class="twams-body">'
+      + '<div class="twams-summary">'
       + summaryBox("Group", s.groupName || "All")
       + summaryBox("Villages scanned", s.villagesScanned)
       + summaryBox("Villages used", s.villagesUsed)
@@ -1030,13 +1125,16 @@
       + summaryBox("Est. RPH", s.estimatedRph)
       + summaryBox("Off max", formatHours(s.maxHoursOff))
       + summaryBox("Def max", formatHours(s.maxHoursDef))
-      + summaryBox("Skipped no units", s.skippedNoUnits)
-      + summaryBox("Skipped no levels", s.skippedNoLevels)
-      + summaryBox("Skipped no rally", s.skippedNoRally) + '</div>'
-      + '<div class="twams-note">Showing first ' + rows.length + ' planned villages. Use Copy debug for full details.</div>'
-      + previewTable(rows)
-      + '<div class="twams-review"><label><input type="checkbox" id="twams-review-confirm"> I have reviewed this preview and want to unlock send buttons.</label><div id="twams-groups" class="twams-actions twams-locked"></div></div>';
+      + summaryBox("No units", s.skippedNoUnits)
+      + summaryBox("No free levels", s.skippedNoLevels)
+      + summaryBox("No rally", s.skippedNoRally) + '</div>'
+      + emptyPlanMessage(s)
+      + '<div class="twams-section"><div class="twams-section-title">Planned villages</div><div class="twams-note">Showing first ' + rows.length + ' planned villages. Use Copy debug for the full object.</div>' + previewTable(rows) + '</div>'
+      + '<div class="twams-section"><div class="twams-section-title">Skipped villages</div><div class="twams-note">Showing first ' + skippedRows.length + ' skipped villages with reason.</div>' + skippedTable(skippedRows) + '</div>'
+      + '<div class="twams-review"><label><input type="checkbox" id="twams-review-confirm"> I have reviewed this preview and want to unlock send buttons.</label><div id="twams-groups" class="twams-actions twams-locked"></div></div></div>';
     mount().prepend(div);
+    const close = document.getElementById("twams-preview-close");
+    if (close) close.addEventListener("click", () => remove(PREVIEW));
     renderGroupButtons();
     const confirmBox = document.getElementById("twams-review-confirm");
     if (confirmBox) confirmBox.addEventListener("change", () => {
@@ -1045,10 +1143,21 @@
     });
   }
 
+  function emptyPlanMessage(s) {
+    if (s && s.requests > 0) return "";
+    let reason = "No sendable scavenging requests were created.";
+    if (s && s.skippedNoLevels && s.skippedNoLevels >= s.villagesScanned) {
+      reason = "All scanned villages were skipped because no selected scavenging level was free. This usually means every selected level already has an active scavenging run.";
+    } else if (s && s.skippedNoUnits && s.skippedNoUnits >= s.villagesScanned) {
+      reason = "All scanned villages were skipped because no selected units were available after keep-home.";
+    }
+    return '<div class="twams-empty"><b>No groups to send.</b><br>' + esc(reason) + '</div>';
+  }
+
   function summaryBox(label, value) { return '<div><b>' + esc(label) + '</b><br>' + esc(value === undefined || value === null ? 0 : value) + '</div>'; }
 
   function previewTable(rows) {
-    if (!rows.length) return '<div class="twams-note">No valid requests found.</div>';
+    if (!rows.length) return '<div class="twams-note">No planned villages.</div>';
     return '<table><thead><tr><th>Village ID</th><th>Village</th><th>Type</th><th>Max</th><th>Levels</th><th>Loot</th><th>RPH</th><th>Units</th></tr></thead><tbody>'
       + rows.map(v => {
         const details = v.rows.map(r => 'L' + r.level + ': ' + dur(r.duration) + ' / ' + fmt(Math.round(r.rph)) + ' RPH').join('<br>');
@@ -1057,6 +1166,13 @@
         const rph = v.rows.reduce((sum, r) => sum + r.rph, 0);
         return '<tr><td>' + esc(v.id) + '</td><td class="left">' + esc(v.name) + '</td><td>' + esc(v.type) + '</td><td>' + esc(formatHours(v.maxHours)) + '</td><td class="left">' + details + '</td><td>' + fmt(loot) + '</td><td>' + fmt(rph) + '</td><td class="left">' + units + '</td></tr>';
       }).join('') + '</tbody></table>';
+  }
+
+  function skippedTable(rows) {
+    if (!rows.length) return '<div class="twams-note">No skipped villages recorded.</div>';
+    return '<table><thead><tr><th>Village ID</th><th>Village</th><th>Reason</th><th>Details</th></tr></thead><tbody>'
+      + rows.map(v => '<tr><td>' + esc(v.id || '') + '</td><td class="left">' + esc(v.name || '') + '</td><td>' + esc(v.reason || '') + '</td><td class="left">' + esc(v.details || '') + '</td></tr>').join('')
+      + '</tbody></table>';
   }
 
   function renderGroupButtons() {
