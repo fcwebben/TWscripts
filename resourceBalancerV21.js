@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Twactics
  * License: MIT
  *
- * Twactics Resource Planner
+ * Twactics Resource Balancer
  *
  * Helps players create a resource transfer plan based on village resources,
  * merchants, building queues, Account Manager construction templates and incoming transports.
@@ -14,8 +14,17 @@
  * - Reads incoming transport data
  * - Counts incoming resources for target need and 90% target warehouse safety calculations
  * - Caps planned target requests so current + incoming + planned resources stay below 90% of target warehouse capacity
+ * - Parses warehouse capacity after resource columns and rejects points-column values as capacity
  * - Treats Build coverage as target queue time coverage, not only number of queued buildings
  * - Caps warehouse safety per resource so one overflowing resource does not block other resources
+ * - Creates optional conservative relay replenishment requests after direct target requests
+ * - Creates optional overflow/resource rotation requests from idle, farm-blocked or near-full villages
+ * - Parses incoming trader resources from both icon/class markup and plain resource cells
+ * - Stops planning if incoming rows are visible but cannot be parsed, to avoid duplicate overfill requests
+ * - Allows relay middlemen without an active queue only when they do not have an active AM construction template
+ * - Prioritizes moving surplus away from villages without AM construction templates and farm level 30 pressure
+ * - Prioritizes nearest affordable donors in AM construction mode so urgent targets receive resources faster
+ * - Adds UI toggle and click help dialogs for Low-point priority and Relay replenishment
  * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
  * - Adds grouped plan diagnostics in the console for debugging and optimization
  * - Shows visible incoming and warehouse audit data in copied plans and the Audit section
@@ -39,7 +48,13 @@
  *     "reserveMerchants": 0,
  *     "reserveWarehousePercent": 8,
  *     "maxDistance": 0,
- *     "prioritizeLowPoints": true
+ *     "prioritizeLowPoints": true,
+ *     "enableRelayReplenishment": true,
+ *     "relaySafetyBufferMinutes": 30,
+ *     "enableOverflowRotation": true,
+ *     "overflowRotationSourcePercent": 88,
+ *     "overflowRotationTargetLimitPercent": 88,
+ *     "debugConsole": false
  *   }
  * }
  */
@@ -60,19 +75,19 @@
 (function () {
   "use strict";
 
-  if (window.twacticsResourcePlannerLoaded) {
-    console.log("Twactics Resource Planner already loaded");
+  if (window.twacticsResourceBalancerLoaded) {
+    console.log("Twactics Resource Balancer already loaded");
     return;
   }
 
-  window.twacticsResourcePlannerLoaded = true;
+  window.twacticsResourceBalancerLoaded = true;
 
-  const SCRIPT_NAME = "Twactics Resource Planner";
-  const SCRIPT_VERSION = "1.7.20";
-  const BOX_ID = "twactics-resource-planner";
-  const STYLE_ID = "twactics-resource-planner-style";
+  const SCRIPT_NAME = "Twactics Resource Balancer";
+  const SCRIPT_VERSION = "1.1.0";
+  const BOX_ID = "twactics-resource-balancer";
+  const STYLE_ID = "twactics-resource-balancer-style";
   const DATA_VERSION = 1;
-  const SETTINGS_STORAGE_KEY = "twacticsResourcePlannerSettings";
+  const SETTINGS_STORAGE_KEY = "twacticsResourceBalancerSettings";
 
   const DEFAULTS = {
     useAmTemplates: true,
@@ -106,7 +121,14 @@
     fetchRetryDelayMs: 1200,
     fetchMaxRetries: 2,
     targetQueueCoverageBuildings: 4,
-    queueSoonRefillBuildingCount: 1
+    queueSoonRefillBuildingCount: 1,
+    enableRelayReplenishment: true,
+    relaySafetyBufferMinutes: 30,
+    enableOverflowRotation: true,
+    overflowRotationSourcePercent: 88,
+    overflowRotationTargetLimitPercent: 88,
+    overflowRotationMaxSources: 80,
+    debugConsole: false
   };
 
   const BUILDING_NAMES = {
@@ -147,7 +169,7 @@
 
   const ui = {};
 
-  window.twacticsResourcePlanner = {
+  window.twacticsResourceBalancer = {
     close: closeDialog,
     state: state,
     exportSettings: exportUserData,
@@ -209,7 +231,13 @@
       reserveMerchants: Math.max(0, parseInt(source.reserveMerchants, 10) || DEFAULTS.reserveMerchants),
       reserveWarehousePercent: Math.max(0, Math.min(80, parseFloatSafe(source.reserveWarehousePercent, DEFAULTS.reserveWarehousePercent))),
       maxDistance: Math.max(0, parseFloatSafe(source.maxDistance, DEFAULTS.maxDistance)),
-      prioritizeLowPoints: source.prioritizeLowPoints !== false
+      prioritizeLowPoints: source.prioritizeLowPoints !== false,
+      enableRelayReplenishment: source.enableRelayReplenishment !== false,
+      relaySafetyBufferMinutes: Math.max(0, Math.min(360, parseFloatSafe(source.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes))),
+      enableOverflowRotation: source.enableOverflowRotation !== false,
+      overflowRotationSourcePercent: Math.max(50, Math.min(99, parseFloatSafe(source.overflowRotationSourcePercent, DEFAULTS.overflowRotationSourcePercent))),
+      overflowRotationTargetLimitPercent: Math.max(50, Math.min(99, parseFloatSafe(source.overflowRotationTargetLimitPercent, DEFAULTS.overflowRotationTargetLimitPercent))),
+      debugConsole: source.debugConsole === true
     };
   }
 
@@ -267,7 +295,9 @@
       ui.reserveMerchants,
       ui.reserveWarehousePercent,
       ui.maxDistance,
-      ui.prioritizeLowPoints
+      ui.prioritizeLowPoints,
+      ui.enableRelayReplenishment,
+      ui.enableOverflowRotation
     ].forEach(input => {
       if (!input || input.__twacticsSettingsAutoSave) return;
       input.__twacticsSettingsAutoSave = true;
@@ -566,6 +596,205 @@
     };
   }
 
+  function getTransportResourceKeyFromNode(node) {
+    if (!node || node.nodeType !== 1) return "";
+
+    const element = node;
+    let classText = "";
+    if (typeof element.className === "string") {
+      classText = element.className;
+    } else if (element.className && typeof element.className.baseVal === "string") {
+      classText = element.className.baseVal;
+    }
+
+    const markerText = cleanText([
+      classText,
+      element.getAttribute && element.getAttribute("src"),
+      element.getAttribute && element.getAttribute("alt"),
+      element.getAttribute && element.getAttribute("title"),
+      element.getAttribute && element.getAttribute("data-title")
+    ].filter(Boolean).join(" ")).toLowerCase();
+
+    if (/(^|[\s_-])(wood|res-wood|resource-wood)([\s_-]|$)|timber|lumber|holz|bois|madera|legno|drewno/.test(markerText)) return "wood";
+    if (/(^|[\s_-])(stone|clay|res-stone|resource-stone|resource-clay)([\s_-]|$)|loam|lehm|argile|arcilla|argilla|glina/.test(markerText)) return "stone";
+    if (/(^|[\s_-])(iron|res-iron|resource-iron)([\s_-]|$)|eisen|fer|hierro|ferro|zelazo|żelazo/.test(markerText)) return "iron";
+
+    return "";
+  }
+
+  function hasTransportResourceMarker(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (getTransportResourceKeyFromNode(node)) return true;
+    return Boolean(node.querySelector && Array.from(node.querySelectorAll("*"))
+      .some(child => Boolean(getTransportResourceKeyFromNode(child))));
+  }
+
+  function dedupeResourceMarkerKeys(keys) {
+    const result = [];
+    (keys || []).forEach(key => {
+      if (!key) return;
+      if (result[result.length - 1] === key) return;
+      result.push(key);
+    });
+    return result;
+  }
+
+  function getResourceMarkerKeysFromCell(cell) {
+    const keys = [];
+
+    function walk(node) {
+      if (!node || node.nodeType !== 1) return;
+
+      const key = getTransportResourceKeyFromNode(node);
+      if (key) {
+        keys.push(key);
+      }
+
+      Array.from(node.childNodes || []).forEach(walk);
+    }
+
+    walk(cell);
+    return dedupeResourceMarkerKeys(keys);
+  }
+
+  function extractNumericTokens(text) {
+    return (cleanText(text).match(/\d[\d.,]*/g) || [])
+      .map(token => ({ token: token, value: parseNumber(token) }))
+      .filter(item => item.value > 0);
+  }
+
+  function parseResourceCellByMarkers(cell) {
+    const resources = emptyResources();
+    const amounts = extractNumericTokens(cell ? cell.textContent : "").map(item => item.value);
+    const markerKeys = getResourceMarkerKeysFromCell(cell);
+
+    if (!amounts.length || !markerKeys.length) {
+      return resources;
+    }
+
+    // Prefer mapping by visual marker order. The previous DOM-walk parser could split
+    // thousands-formatted text like "12.153" into smaller fragments on some TW pages.
+    // We now parse full visible numeric tokens from the whole resource cell and only use
+    // icons/classes to decide which resource each full token belongs to.
+    let keysForAmounts = [];
+
+    if (markerKeys.length >= amounts.length) {
+      keysForAmounts = markerKeys.slice(0, amounts.length);
+    } else if (amounts.length === 3) {
+      keysForAmounts = ["wood", "stone", "iron"];
+    } else if (markerKeys.length === 1 && amounts.length === 1) {
+      keysForAmounts = markerKeys.slice();
+    }
+
+    for (let i = 0; i < amounts.length; i++) {
+      const key = keysForAmounts[i] || "";
+      if (key && resources[key] !== undefined) {
+        resources[key] += amounts[i];
+      }
+    }
+
+    return resources;
+  }
+
+  function parsePlainResourceCell(cell) {
+    const resources = emptyResources();
+    const fallbackOrder = ["wood", "stone", "iron"];
+    const tokens = extractNumericTokens(cell ? cell.textContent : "");
+
+    tokens.slice(0, 3).forEach((item, index) => {
+      const key = fallbackOrder[index];
+      if (key) resources[key] += item.value;
+    });
+
+    return resources;
+  }
+
+  function getLikelyTransportResourceCell(row) {
+    const cells = Array.from(row.children || []).filter(cell => !/^th$/i.test(cell.tagName || ""));
+    if (!cells.length) return null;
+
+    // Standard incoming trader table:
+    // checkbox, icon, sender, origin, target/village, arrival, arrives in, merchants, resources.
+    // The resources cell is normally the last cell. Prefer that cell so the "Arrives in"
+    // timer is never interpreted as a resource amount.
+    if (cells.length >= 8) {
+      return cells[cells.length - 1];
+    }
+
+    const markedCells = cells.filter(cell => hasTransportResourceMarker(cell) && extractNumericTokens(cell.textContent || "").length > 0);
+    if (markedCells.length) return markedCells[markedCells.length - 1];
+
+    const numericCells = cells.filter(cell => extractNumericTokens(cell.textContent || "").length > 0);
+    if (numericCells.length) return numericCells[numericCells.length - 1];
+
+    return cells[cells.length - 1] || null;
+  }
+
+  function isIncomingHeaderOrControlRow(row) {
+    if (!row) return true;
+    if (row.querySelector && row.querySelector("th")) return true;
+
+    const text = cleanText(row.textContent || "");
+    if (!text) return true;
+    if (/^select all$/i.test(text)) return true;
+    if (/sender/i.test(text) && /origin/i.test(text) && /resources/i.test(text)) return true;
+    if (/recipient/i.test(text) && /arrival/i.test(text) && /resources/i.test(text)) return true;
+
+    return false;
+  }
+
+  function extractTransportResourcesFromRow(row) {
+    const resourceCell = getLikelyTransportResourceCell(row);
+    const cellText = cleanText(resourceCell ? resourceCell.textContent : "").slice(0, 160);
+
+    if (!resourceCell) {
+      return {
+        resources: emptyResources(),
+        method: "no-resource-cell",
+        resourceCellText: ""
+      };
+    }
+
+    const markerResources = parseResourceCellByMarkers(resourceCell);
+    if (totalResources(markerResources) > 0) {
+      return {
+        resources: markerResources,
+        method: "resource-cell-markers",
+        resourceCellText: cellText
+      };
+    }
+
+    const plainResources = parsePlainResourceCell(resourceCell);
+    if (totalResources(plainResources) > 0) {
+      return {
+        resources: plainResources,
+        method: "plain-resource-cell-fallback",
+        resourceCellText: cellText
+      };
+    }
+
+    const classResources = extractResourcesFromRow(row);
+    if (totalResources(classResources) > 0) {
+      return {
+        resources: classResources,
+        method: "class-resource-columns-fallback",
+        resourceCellText: cellText
+      };
+    }
+
+    return {
+      resources: emptyResources(),
+      method: "resource-cell-empty",
+      resourceCellText: cellText
+    };
+  }
+
+  function rowTextLooksLikeTransportWithResources(text) {
+    const normalized = cleanText(text);
+    // Typical trader rows end with merchants and one to three resource amounts, e.g. "35 7.777 27.223".
+    return /\b\d+\s+\d[\d.]{2,}(?:\s+\d[\d.]{2,}){0,2}\b/.test(normalized);
+  }
+
   function parseMerchants(row) {
     const marketLink = row.querySelector('a[href*="market"]');
     const text = cleanText(marketLink ? marketLink.textContent : row.textContent);
@@ -584,24 +813,78 @@
     };
   }
 
-  function parseCapacity(row) {
+  function getSinglePositiveNumberFromCell(cell) {
+    const numbers = extractNumericTokens(cell ? cell.textContent : "");
+    return numbers.length === 1 ? numbers[0].value : 0;
+  }
+
+  function cellLooksLikeVillageNameOrCoord(cell) {
+    const text = cleanText(cell ? cell.textContent : "");
+    return /\d{1,3}\|\d{1,3}/.test(text);
+  }
+
+  function cellLooksLikeFarmUsage(cell) {
+    const text = cleanText(cell ? cell.textContent : "");
+    return /\d[\d.]*\s*\/\s*\d[\d.]*/.test(text);
+  }
+
+  function cellLooksLikeResourceCell(cell) {
+    return Boolean(cell && cell.querySelector && cell.querySelector(".wood, .stone, .iron"));
+  }
+
+  function cellLooksLikeMerchantCell(cell) {
+    return Boolean(cell && cell.querySelector && cell.querySelector('a[href*="market"], a[href*="screen=market"]'));
+  }
+
+  function isLikelyWarehouseCapacityCell(cell, value, resources) {
+    if (!value || value < 1000 || value > 1000000) return false;
+    if (cellLooksLikeVillageNameOrCoord(cell)) return false;
+    if (cellLooksLikeFarmUsage(cell)) return false;
+    if (cellLooksLikeResourceCell(cell)) return false;
+    if (cellLooksLikeMerchantCell(cell)) return false;
+
+    const maxCurrentResource = Math.max(
+      resources && resources.wood || 0,
+      resources && resources.stone || 0,
+      resources && resources.iron || 0
+    );
+
+    // A village cannot currently hold more of a resource than its warehouse capacity.
+    // If a parsed value is below the current stored resource amount, it is almost always
+    // the points column or another metadata column, not warehouse capacity.
+    if (maxCurrentResource > 0 && value < maxCurrentResource) return false;
+
+    return true;
+  }
+
+  function parseCapacity(row, resources) {
     const cells = Array.from(row.children);
+    const resourceIndexes = [];
 
-    for (let i = 0; i < cells.length; i++) {
-      const text = cleanText(cells[i].textContent);
-      const numbers = text.match(/\d[\d.]{2,}/g);
+    cells.forEach((cell, index) => {
+      if (cellLooksLikeResourceCell(cell)) {
+        resourceIndexes.push(index);
+      }
+    });
 
-      if (numbers && numbers.length === 1) {
-        const value = parseNumber(numbers[0]);
+    const lastResourceIndex = resourceIndexes.length ? Math.max.apply(null, resourceIndexes) : -1;
 
-        if (value >= 1000 && value <= 1000000) {
-          const hasResourceIcon = cells[i].querySelector(".wood, .stone, .iron");
-          const hasMarketLink = cells[i].querySelector('a[href*="market"]');
-
-          if (!hasResourceIcon && !hasMarketLink) {
-            return value;
-          }
+    // First preference: the first sane single-number cell after the resource columns.
+    // This avoids accidentally reading the village points column as warehouse capacity.
+    if (lastResourceIndex >= 0) {
+      for (let i = lastResourceIndex + 1; i < cells.length; i++) {
+        const value = getSinglePositiveNumberFromCell(cells[i]);
+        if (isLikelyWarehouseCapacityCell(cells[i], value, resources)) {
+          return value;
         }
+      }
+    }
+
+    // Fallback: search the entire row, but still reject values below current resources.
+    for (let i = 0; i < cells.length; i++) {
+      const value = getSinglePositiveNumberFromCell(cells[i]);
+      if (isLikelyWarehouseCapacityCell(cells[i], value, resources)) {
+        return value;
       }
     }
 
@@ -675,7 +958,7 @@
         iron: resources.iron,
         merchants: merchants.available,
         merchantsTotal: merchants.total,
-        capacity: parseCapacity(row),
+        capacity: parseCapacity(row, resources),
         points: parsePoints(row),
         farmUsed: farm.used,
         farmMax: farm.max,
@@ -903,14 +1186,37 @@
     };
 
     rows.forEach((row, rowIndex) => {
-      const resources = extractResourcesFromRow(row);
-      const total = totalResources(resources);
       const rowText = cleanText(row.textContent).slice(0, 240);
+
+      if (isIncomingHeaderOrControlRow(row)) {
+        if (diagnostics.skippedSamples.length < 8) {
+          diagnostics.skippedSamples.push({
+            rowIndex: rowIndex,
+            reason: "header/control row",
+            parserMethod: "row-skipped-before-resource-parse",
+            resourceCellText: "",
+            looksLikeTransportResources: false,
+            text: rowText
+          });
+        }
+        return;
+      }
+
+      const resourceParse = extractTransportResourcesFromRow(row);
+      const resources = resourceParse.resources;
+      const total = totalResources(resources);
 
       if (total <= 0) {
         diagnostics.rowsSkippedNoResources += 1;
         if (diagnostics.skippedSamples.length < 8) {
-          diagnostics.skippedSamples.push({ rowIndex: rowIndex, reason: "no resources", text: rowText });
+          diagnostics.skippedSamples.push({
+            rowIndex: rowIndex,
+            reason: "no resources",
+            parserMethod: resourceParse.method,
+            resourceCellText: resourceParse.resourceCellText,
+            looksLikeTransportResources: rowTextLooksLikeTransportWithResources(rowText),
+            text: rowText
+          });
         }
         return;
       }
@@ -932,6 +1238,8 @@
         diagnostics.parsedSamples.push({
           rowIndex: rowIndex,
           method: detected.method,
+          resourceParserMethod: resourceParse.method,
+          resourceCellText: resourceParse.resourceCellText,
           selectedCoord: coord,
           resources: cloneResources(resources),
           text: rowText
@@ -942,6 +1250,8 @@
         diagnostics.ambiguousRows.push({
           rowIndex: rowIndex,
           method: detected.method,
+          resourceParserMethod: resourceParse.method,
+          resourceCellText: resourceParse.resourceCellText,
           selectedCoord: coord,
           resources: cloneResources(resources),
           text: rowText
@@ -959,6 +1269,15 @@
       incoming: incoming,
       diagnostics: diagnostics
     };
+  }
+
+  function hasSuspiciousUnparsedIncomingRows(diagnostics) {
+    if (!diagnostics || diagnostics.rowsParsed > 0) return false;
+    if ((diagnostics.rowsSeen || 0) <= 3) return false;
+
+    return (diagnostics.skippedSamples || []).some(sample => {
+      return Boolean(sample && (sample.looksLikeTransportResources || rowTextLooksLikeTransportWithResources(sample.text || "")));
+    });
   }
 
   async function loadIncomingData(villages) {
@@ -1047,6 +1366,27 @@
       };
     }
 
+    if (hasSuspiciousUnparsedIncomingRows(selected.diagnostics)) {
+      if (!state.debug) state.debug = {};
+      state.debug.incomingTransportLoad = {
+        selectedUrl: selected.diagnostics.url || "",
+        selectedLabel: selected.diagnostics.label || "",
+        attempts: attempts,
+        selected: selected.diagnostics,
+        stoppedPlanning: true,
+        stopReason: "Incoming transport rows were visible but no resource amounts could be parsed."
+      };
+
+        if (state.lastSettings && state.lastSettings.debugConsole) {
+        console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION + " - stopped planning");
+        console.log("Selected incoming parser result", selected.diagnostics);
+        console.log("Incoming parser attempts", attempts);
+        console.groupEnd();
+      }
+
+      throw new Error("Incoming transports are visible but could not be parsed safely. Planning stopped to avoid duplicate requests and warehouse overfill. Update the script or copy diagnostics.");
+    }
+
     if (!state.debug) state.debug = {};
     state.debug.incomingTransportLoad = {
       selectedUrl: selected.diagnostics.url || "",
@@ -1055,11 +1395,13 @@
       selected: selected.diagnostics
     };
 
-    console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION);
-    console.log("Selected incoming parser result", selected.diagnostics);
-    console.log("Incoming parser attempts", attempts);
-    console.log("Incoming by target coord", selected.diagnostics.byCoord || []);
-    console.groupEnd();
+    if (state.lastSettings && state.lastSettings.debugConsole) {
+      console.groupCollapsed(SCRIPT_NAME + " incoming transport diagnostics " + SCRIPT_VERSION);
+      console.log("Selected incoming parser result", selected.diagnostics);
+      console.log("Incoming parser attempts", attempts);
+      console.log("Incoming by target coord", selected.diagnostics.byCoord || []);
+      console.groupEnd();
+    }
 
     return selected.incoming;
   }
@@ -1607,6 +1949,13 @@
     const reserveWarehousePercent = Math.max(0, Math.min(80, parseFloatSafe(ui.reserveWarehousePercent.value, DEFAULTS.reserveWarehousePercent)));
     const arrivalBalanceWindowMinutes = DEFAULTS.arrivalBalanceWindowMinutes;
     const prioritizeLowPoints = ui.prioritizeLowPoints.checked;
+    const savedSettings = state.savedSettings || {};
+    const enableRelayReplenishment = ui.enableRelayReplenishment ? ui.enableRelayReplenishment.checked : (savedSettings.enableRelayReplenishment !== undefined ? savedSettings.enableRelayReplenishment !== false : DEFAULTS.enableRelayReplenishment);
+    const relaySafetyBufferMinutes = savedSettings.relaySafetyBufferMinutes !== undefined ? Math.max(0, Math.min(360, parseFloatSafe(savedSettings.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes))) : DEFAULTS.relaySafetyBufferMinutes;
+    const enableOverflowRotation = ui.enableOverflowRotation ? ui.enableOverflowRotation.checked : (savedSettings.enableOverflowRotation !== undefined ? savedSettings.enableOverflowRotation !== false : DEFAULTS.enableOverflowRotation);
+    const overflowRotationSourcePercent = savedSettings.overflowRotationSourcePercent !== undefined ? Math.max(50, Math.min(99, parseFloatSafe(savedSettings.overflowRotationSourcePercent, DEFAULTS.overflowRotationSourcePercent))) : DEFAULTS.overflowRotationSourcePercent;
+    const overflowRotationTargetLimitPercent = savedSettings.overflowRotationTargetLimitPercent !== undefined ? Math.max(50, Math.min(99, parseFloatSafe(savedSettings.overflowRotationTargetLimitPercent, DEFAULTS.overflowRotationTargetLimitPercent))) : DEFAULTS.overflowRotationTargetLimitPercent;
+    const debugConsole = savedSettings.debugConsole === true;
 
     return {
       useAmTemplates: useAmTemplates,
@@ -1628,7 +1977,7 @@
       emptyQueueBoost: DEFAULTS.emptyQueueBoost,
       lowPointsBoost: prioritizeLowPoints ? DEFAULTS.lowPointsBoost : 0,
       priorityMode: "construction_first",
-      donorPreference: DEFAULTS.donorPreference,
+      donorPreference: useAmTemplates ? "distance_optimized" : DEFAULTS.donorPreference,
       donorDistancePenalty: DEFAULTS.donorDistancePenalty,
       noTemplateDonorBonus: DEFAULTS.noTemplateDonorBonus,
       farmBlockedDonorBonus: DEFAULTS.farmBlockedDonorBonus,
@@ -1639,14 +1988,20 @@
       protectDonorConstruction: useAmTemplates,
       includeAverageBalance: false,
       prioritizeNoTemplateDonors: useAmTemplates,
-      prioritizeLowPoints: prioritizeLowPoints
+      prioritizeLowPoints: prioritizeLowPoints,
+      enableRelayReplenishment: enableRelayReplenishment,
+      relaySafetyBufferMinutes: relaySafetyBufferMinutes,
+      enableOverflowRotation: enableOverflowRotation,
+      overflowRotationSourcePercent: overflowRotationSourcePercent,
+      overflowRotationTargetLimitPercent: overflowRotationTargetLimitPercent,
+      overflowRotationMaxSources: DEFAULTS.overflowRotationMaxSources,
+      debugConsole: debugConsole
     };
   }
 
   async function loadAndPlan() {
     try {
       ui.planButton.disabled = true;
-      ui.copyButton.disabled = true;
       if (ui.results) ui.results.innerHTML = "";
 
       const settings = getSettings();
@@ -1702,7 +2057,6 @@
 
       logPlanDiagnostics(planResult, settings);
       renderResults(planResult);
-      ui.copyButton.disabled = !state.plan.length;
 
       setStatus(
         "Loaded " + state.villages.length + " village(s). Planned " +
@@ -1726,7 +2080,14 @@
       amTemplateLoad: previousDebug.amTemplateLoad || null,
       cappedTargets: [],
       skippedSmallShipments: [],
-      rejectedTinyResourceFragments: []
+      rejectedTinyResourceFragments: [],
+      relayCandidates: [],
+      relayAccepted: [],
+      relayRejected: [],
+      overflowRotationCandidates: [],
+      overflowRotationAccepted: [],
+      overflowRotationRejected: [],
+      targetExclusions: []
     };
 
     const villages = state.villages.slice();
@@ -1736,7 +2097,15 @@
       target.planningOrder = index + 1;
     });
     const donors = buildDonors(villages, stats, settings);
-    const launches = matchDonorsToTargets(targets, donors, settings);
+    const directLaunches = matchDonorsToTargets(targets, donors, settings);
+    const relayLaunches = settings.enableRelayReplenishment
+      ? buildRelayReplenishmentLaunches(directLaunches, targets, donors, settings, directLaunches.length + 1)
+      : [];
+    const preRotationLaunches = directLaunches.concat(relayLaunches);
+    const overflowRotationLaunches = settings.enableOverflowRotation
+      ? buildOverflowRotationLaunches(preRotationLaunches, targets, donors, settings, preRotationLaunches.length + 1)
+      : [];
+    const launches = preRotationLaunches.concat(overflowRotationLaunches);
     const targetPlans = groupLaunchesByTarget(launches, settings);
     const donorAudit = buildDonorAudit(donors, targets, launches, settings);
 
@@ -1985,6 +2354,31 @@
     return b.totalNeed - a.totalNeed;
   }
 
+  function determineTargetNoNeedReason(hasTemplateData, queueCoverage, needBeforeWarehouseCap, needAfterWarehouseCap, warehouseCap) {
+    if (!hasTemplateData) {
+      return "AM template assigned but template definition was not loaded or matched";
+    }
+
+    if (!queueCoverage || !(queueCoverage.plannedBuilds > 0)) {
+      return "queue coverage already satisfied, or no next template building found within coverage horizon";
+    }
+
+    if (totalResources(needBeforeWarehouseCap || emptyResources()) <= 0) {
+      return "current + incoming resources already cover the simulated template need";
+    }
+
+    if (warehouseCap && totalResources(needBeforeWarehouseCap || emptyResources()) > 0 && totalResources(needAfterWarehouseCap || emptyResources()) <= 0) {
+      return "90% target warehouse cap removed all remaining need";
+    }
+
+    return "no positive requestable need after current resources, incoming resources and warehouse cap";
+  }
+
+  function pushTargetExclusionDiagnostic(data) {
+    if (!state.debug || !state.debug.targetExclusions) return;
+    state.debug.targetExclusions.push(data);
+  }
+
   function buildTargets(villages, stats, settings) {
     return villages.map(village => {
       const current = getCurrentResourcesWithIncoming(village);
@@ -2025,6 +2419,7 @@
         };
       }
 
+      const needBeforeWarehouseCap = cloneResources(need);
       const warehouseCap = capNeedToTargetWarehouse(village, need, settings);
       need = warehouseCap.need;
 
@@ -2071,6 +2466,39 @@
       }
 
       const totalNeed = totalResources(need);
+
+      if (settings.useAmTemplates && hasTemplate && totalNeed <= 0) {
+        pushTargetExclusionDiagnostic({
+          coord: village.coord,
+          id: village.id,
+          name: village.name,
+          points: village.points || 0,
+          amTemplateName: village.amTemplateName || "",
+          hasTemplateData: hasTemplateData,
+          queueCount: village.queueCount || 0,
+          queueHours: queueHours,
+          queueCoverage: formatQueueCoverage(queueCoverage),
+          plannedBuilds: queueCoverage ? queueCoverage.plannedBuilds : 0,
+          current: getCurrentResourcesOnly(village),
+          incoming: cloneResources(village.incoming || emptyResources()),
+          currentPlusIncoming: getCurrentResourcesWithIncoming(village),
+          constructionNeed: cloneResources(constructionNeed || emptyResources()),
+          needBeforeWarehouseCap: cloneResources(needBeforeWarehouseCap || emptyResources()),
+          needAfterWarehouseCap: cloneResources(need || emptyResources()),
+          warehouseSpace: warehouseCap ? cloneResources(warehouseCap.space || emptyResources()) : null,
+          warehouseReduced: warehouseCap ? cloneResources(warehouseCap.reduced || emptyResources()) : emptyResources(),
+          currentOverLimit: warehouseCap ? warehouseCap.currentOverLimit : null,
+          reason: determineTargetNoNeedReason(hasTemplateData, queueCoverage, needBeforeWarehouseCap, need, warehouseCap),
+          nextBuilds: (queueCoverage && queueCoverage.details ? queueCoverage.details : []).slice(0, 5).map(detail => ({
+            building: detail.building,
+            level: detail.level,
+            reason: detail.reason,
+            seconds: detail.seconds,
+            resources: cloneResources(detail.resources || emptyResources())
+          }))
+        });
+      }
+
       const targetDraft = {
         village: village,
         need: need,
@@ -2551,11 +2979,566 @@
     return launches;
   }
 
+
+  function buildRelayReplenishmentLaunches(directLaunches, targets, donors, settings, startId) {
+    const relayLaunches = [];
+    let launchId = Math.max(1, startId || 1);
+
+    const activeTargetIds = new Set((targets || [])
+      .filter(target => totalResources(target.need || emptyResources()) > 0)
+      .map(target => String(target.village.id)));
+
+    const outgoingByOrigin = new Map();
+    (directLaunches || []).forEach(launch => {
+      if (!launch || launch.isRelay || !launch.origin || !launch.resources) return;
+      const key = String(launch.origin.id);
+      const current = outgoingByOrigin.get(key) || {
+        village: launch.origin,
+        resources: emptyResources(),
+        total: 0,
+        launches: 0,
+        targetNames: [],
+        minDirectTravelMinutes: Infinity,
+        maxDirectTravelMinutes: 0
+      };
+
+      addResources(current.resources, launch.resources);
+      current.total += totalResources(launch.resources || emptyResources());
+      current.launches += 1;
+      if (launch.target && launch.target.name) current.targetNames.push(launch.target.name);
+      if (launch.travelMinutes !== undefined) {
+        current.minDirectTravelMinutes = Math.min(current.minDirectTravelMinutes, launch.travelMinutes || 0);
+        current.maxDirectTravelMinutes = Math.max(current.maxDirectTravelMinutes, launch.travelMinutes || 0);
+      }
+      outgoingByOrigin.set(key, current);
+    });
+
+    const middlemanIds = new Set(Array.from(outgoingByOrigin.keys()));
+    const directOriginIds = new Set(Array.from(outgoingByOrigin.keys()));
+    const donorById = new Map((donors || []).map(donor => [String(donor.village.id), donor]));
+    const relaySafetyBufferMinutes = Math.max(0, settings.relaySafetyBufferMinutes !== undefined ? settings.relaySafetyBufferMinutes : DEFAULTS.relaySafetyBufferMinutes);
+
+    outgoingByOrigin.forEach(outgoing => {
+      const middleman = outgoing.village;
+      const middlemanId = String(middleman.id);
+      const queueSeconds = Math.max(0, middleman.queueEndSeconds || 0);
+      const queueHours = queueSeconds / 3600;
+      const middlemanHasTemplate = Boolean(middleman.amTemplateName);
+      const middlemanQueueEmpty = queueSeconds <= 0;
+      const candidateBase = {
+        middleman: middleman.coord,
+        middlemanId: middleman.id,
+        name: middleman.name,
+        outgoing: cloneResources(outgoing.resources),
+        outgoingTotal: outgoing.total,
+        queueHours: queueHours,
+        hasAmTemplate: middlemanHasTemplate,
+        amTemplateName: middleman.amTemplateName || "",
+        targets: outgoing.targetNames.slice(0, 5)
+      };
+
+      if (state.debug && state.debug.relayCandidates) {
+        state.debug.relayCandidates.push(Object.assign({}, candidateBase));
+      }
+
+      if (outgoing.total < settings.minShipment || !hasResourceAtLeast(outgoing.resources, settings.minResourcePerOrigin)) {
+        pushRelayRejected(candidateBase, "outgoing below relay minimum");
+        return;
+      }
+
+      if (activeTargetIds.has(middlemanId)) {
+        pushRelayRejected(candidateBase, "middleman is an active resource target");
+        return;
+      }
+
+      if (middlemanHasTemplate && middlemanQueueEmpty) {
+        pushRelayRejected(candidateBase, "middleman has active AM template but no construction queue");
+        return;
+      }
+
+      const relaySpace = getRelayWarehouseSpaceAfterOutgoing(middleman, outgoing.resources, settings);
+      let relayNeed = capResourcesToSpace(outgoing.resources, relaySpace);
+      relayNeed = cleanSmallResourceAmounts(relayNeed, settings.minResourcePerOrigin).resources;
+
+      if (totalResources(relayNeed) < settings.minShipment || !hasResourceAtLeast(relayNeed, settings.minResourcePerOrigin)) {
+        pushRelayRejected(Object.assign({}, candidateBase, { relaySpace: cloneResources(relaySpace), relayNeed: cloneResources(relayNeed) }), "no safe relay space after outgoing resources");
+        return;
+      }
+
+      const relayTarget = {
+        village: middleman,
+        initialNeed: cloneResources(relayNeed),
+        arrivalBuckets: new Map()
+      };
+
+      let safety = 0;
+      while (totalResources(relayNeed) >= settings.minShipment && safety < 80) {
+        safety += 1;
+
+        const matches = (donors || [])
+          .filter(donor => {
+            if (!donor || !donor.village) return false;
+            const donorId = String(donor.village.id);
+            if (donorId === middlemanId) return false;
+            if (middlemanIds.has(donorId)) return false;
+            if (activeTargetIds.has(donorId)) return false;
+            if (donor.merchantsAvailable <= 0) return false;
+            if (totalResources(donor.available || emptyResources()) < settings.minShipment) return false;
+
+            const matching = getMatchingResources(donor.available || emptyResources(), relayNeed);
+            if (!hasResourceAtLeast(matching, settings.minResourcePerOrigin)) return false;
+
+            const distance = getDistance(donor.village.coord, middleman.coord);
+            if (settings.maxDistance > 0 && distance > settings.maxDistance) return false;
+
+            const travelMinutes = getTravelMinutes(distance, settings);
+            if (middlemanHasTemplate && queueSeconds < ((travelMinutes + relaySafetyBufferMinutes) * 60)) return false;
+
+            return true;
+          })
+          .map(donor => {
+            const distance = getDistance(donor.village.coord, middleman.coord);
+            const travelMinutes = getTravelMinutes(distance, settings);
+            const arrivalBucket = getArrivalBucketIndex(travelMinutes, settings);
+            const matching = getMatchingResources(donor.available || emptyResources(), relayNeed);
+            const directOriginPenalty = directOriginIds.has(String(donor.village.id)) ? 500 : 0;
+            return {
+              donor: donor,
+              distance: distance,
+              travelMinutes: travelMinutes,
+              arrivalBucket: arrivalBucket,
+              matching: matching,
+              score: donor.baseScore - distance * settings.donorDistancePenalty - directOriginPenalty + Math.min(totalResources(matching), settings.merchantCapacity * 10) / 1000
+            };
+          })
+          .sort((a, b) => sortDonorMatches(a, b, settings));
+
+        if (!matches.length) {
+          pushRelayRejected(Object.assign({}, candidateBase, { relayNeedRemaining: cloneResources(relayNeed), relaySpace: cloneResources(relaySpace) }), "no eligible relay refill donor with enough queue buffer");
+          break;
+        }
+
+        const match = matches[0];
+        const donor = match.donor;
+        const shipment = createShipment(donor, relayTarget, relayNeed, settings, match);
+
+        if (totalResources(shipment.resources) < settings.minShipment || !hasResourceAtLeast(shipment.resources, settings.minResourcePerOrigin)) {
+          if (!donor.blockedTargetIds) donor.blockedTargetIds = new Set();
+          donor.blockedTargetIds.add("relay:" + middlemanId);
+          pushRelayRejected(Object.assign({}, candidateBase, {
+            donor: donor.village.coord,
+            attempted: cloneResources(shipment.attemptedResources || emptyResources()),
+            kept: cloneResources(shipment.resources || emptyResources())
+          }), "relay shipment below minimum after small-fragment filter");
+          continue;
+        }
+
+        subtractResources(donor.available, shipment.resources);
+        subtractResources(relayNeed, shipment.resources);
+        addResourcesToArrivalBucket(relayTarget, match.arrivalBucket, shipment.resources);
+        donor.merchantsAvailable = Math.max(0, donor.merchantsAvailable - shipment.merchantsUsed);
+        donor.totalAvailable = Math.min(totalResources(donor.available), donor.merchantsAvailable * settings.merchantCapacity);
+        donor.usedTotal += totalResources(shipment.resources);
+        donor.usedTransfers += 1;
+
+        const relayReason = middlemanHasTemplate
+          ? "Relay refill after this village sent resources onward; queue buffer " + formatTravelMinutes(queueSeconds / 60) + ", refill arrives in ~" + formatTravelMinutes(match.travelMinutes) + " + " + relaySafetyBufferMinutes + "m safety"
+          : "Relay refill after this village sent resources onward; middleman has no active AM template, so no queue buffer is required";
+
+        const relayLaunch = {
+          id: launchId++,
+          origin: donor.village,
+          target: middleman,
+          resources: shipment.resources,
+          total: totalResources(shipment.resources),
+          merchantsUsed: shipment.merchantsUsed,
+          distance: match.distance,
+          travelMinutes: match.travelMinutes,
+          arrivalBucket: match.arrivalBucket,
+          targetScore: 0,
+          targetOrder: 100000 + relayLaunches.length,
+          targetPriorityTier: 90,
+          targetQueueCoverage: null,
+          donorScore: match.score,
+          targetReason: relayReason,
+          donorReason: donor.reason,
+          isRelay: true,
+          relayMiddleman: middleman.coord,
+          relayOutgoingOffset: cloneResources(outgoing.resources),
+          relayOriginalTargets: outgoing.targetNames.slice(0, 8)
+        };
+
+        relayLaunches.push(relayLaunch);
+
+        if (state.debug && state.debug.relayAccepted) {
+          state.debug.relayAccepted.push({
+            middleman: middleman.coord,
+            middlemanId: middleman.id,
+            origin: donor.village.coord,
+            originId: donor.village.id,
+            resources: cloneResources(shipment.resources),
+            total: relayLaunch.total,
+            travelMinutes: Math.round(match.travelMinutes),
+            queueHours: Math.round(queueHours * 10) / 10,
+            hasAmTemplate: middlemanHasTemplate,
+            amTemplateName: middleman.amTemplateName || "",
+            safetyBufferMinutes: middlemanHasTemplate ? relaySafetyBufferMinutes : 0,
+            remainingRelayNeed: cloneResources(relayNeed)
+          });
+        }
+      }
+    });
+
+    return relayLaunches;
+  }
+
+
+  function buildProjectedResourcesByCoord(villages, launches) {
+    const projected = new Map();
+
+    (villages || []).forEach(village => {
+      if (!village || !village.coord) return;
+      projected.set(village.coord, getCurrentResourcesWithIncoming(village));
+    });
+
+    (launches || []).forEach(launch => {
+      if (!launch || !launch.resources) return;
+
+      if (launch.origin && launch.origin.coord) {
+        const originProjected = projected.get(launch.origin.coord) || getCurrentResourcesWithIncoming(launch.origin);
+        subtractResources(originProjected, launch.resources);
+        originProjected.wood = Math.max(0, originProjected.wood || 0);
+        originProjected.stone = Math.max(0, originProjected.stone || 0);
+        originProjected.iron = Math.max(0, originProjected.iron || 0);
+        projected.set(launch.origin.coord, originProjected);
+      }
+
+      if (launch.target && launch.target.coord) {
+        const targetProjected = projected.get(launch.target.coord) || getCurrentResourcesWithIncoming(launch.target);
+        addResources(targetProjected, launch.resources);
+        projected.set(launch.target.coord, targetProjected);
+      }
+    });
+
+    return projected;
+  }
+
+  function getOverflowRotationTargetLimit(village, settings) {
+    const capacity = Math.max(0, village && village.capacity || 0);
+    if (capacity <= 0) return null;
+
+    const defaultSafe = settings.targetWarehouseLimitPercent !== undefined ? settings.targetWarehouseLimitPercent : DEFAULTS.targetWarehouseLimitPercent;
+    const rotationLimit = settings.overflowRotationTargetLimitPercent !== undefined ? settings.overflowRotationTargetLimitPercent : DEFAULTS.overflowRotationTargetLimitPercent;
+    const limitPercent = Math.max(0, Math.min(100, Math.min(defaultSafe, rotationLimit)));
+
+    return Math.floor(capacity * (limitPercent / 100));
+  }
+
+  function getOverflowRotationSpace(village, projectedResources, settings) {
+    const limit = getOverflowRotationTargetLimit(village, settings);
+    if (limit === null) return emptyResources();
+
+    const current = projectedResources || getCurrentResourcesWithIncoming(village);
+
+    return {
+      wood: Math.max(0, limit - (current.wood || 0)),
+      stone: Math.max(0, limit - (current.stone || 0)),
+      iron: Math.max(0, limit - (current.iron || 0))
+    };
+  }
+
+  function getOverflowRotationSourceResources(donor, settings) {
+    const village = donor && donor.village ? donor.village : null;
+    const available = donor && donor.available ? donor.available : emptyResources();
+    const current = village ? getCurrentResourcesOnly(village) : emptyResources();
+    const capacity = Math.max(0, village && village.capacity || 0);
+    const sourcePercent = settings.overflowRotationSourcePercent !== undefined ? settings.overflowRotationSourcePercent : DEFAULTS.overflowRotationSourcePercent;
+    const sourceLimit = capacity > 0 ? Math.floor(capacity * Math.max(0, Math.min(100, sourcePercent)) / 100) : 0;
+    const farmBlockedNoTemplate = Boolean(donor && donor.farmBlocked && !donor.hasTemplate);
+
+    const resources = emptyResources();
+
+    ["wood", "stone", "iron"].forEach(key => {
+      if (farmBlockedNoTemplate) {
+        resources[key] = Math.max(0, available[key] || 0);
+      } else {
+        const aboveSourceLimit = sourceLimit > 0 ? Math.max(0, (current[key] || 0) - sourceLimit) : 0;
+        resources[key] = Math.max(0, Math.min(available[key] || 0, aboveSourceLimit));
+      }
+    });
+
+    return cleanSmallResourceAmounts(resources, settings.minResourcePerOrigin).resources;
+  }
+
+  function getNearestTargetDistance(coord, targets) {
+    if (!coord || !targets || !targets.length) return 0;
+    let min = 9999;
+
+    targets.forEach(target => {
+      if (!target || !target.village || !target.village.coord) return;
+      const distance = getDistance(coord, target.village.coord);
+      if (distance < min) min = distance;
+    });
+
+    return min === 9999 ? 0 : min;
+  }
+
+  function getOverflowRotationTargetScore(sourceDonor, targetVillage, space, distance, activeTargets, projected, settings) {
+    const current = projected || getCurrentResourcesWithIncoming(targetVillage);
+    const capacity = Math.max(1, targetVillage.capacity || 1);
+    const targetFillRatio = Math.max(current.wood || 0, current.stone || 0, current.iron || 0) / capacity;
+    const sourceDistanceToNeed = getNearestTargetDistance(sourceDonor.village.coord, activeTargets);
+    const targetDistanceToNeed = getNearestTargetDistance(targetVillage.coord, activeTargets);
+    const closerToNeedBonus = activeTargets && activeTargets.length ? Math.max(-30, Math.min(60, (sourceDistanceToNeed - targetDistanceToNeed) * 4)) : 0;
+    const targetHasTemplate = Boolean(targetVillage.amTemplateName);
+    const targetQueueEmpty = (targetVillage.queueCount || 0) === 0 && (targetVillage.queueEndSeconds || 0) === 0;
+    const targetFarmBlocked = isFarmBlockedDonor(targetVillage, settings);
+
+    let score = totalResources(space) / 1000;
+    score -= distance * Math.max(0.35, settings.donorDistancePenalty * 0.55);
+    score += closerToNeedBonus;
+
+    if (targetHasTemplate) score += targetQueueEmpty ? 18 : 32;
+    if (!targetHasTemplate && !targetFarmBlocked) score += 14;
+    if (targetFarmBlocked) score -= 200;
+    score += Math.max(0, 1 - targetFillRatio) * 25;
+
+    return score;
+  }
+
+  function buildOverflowRotationLaunches(existingLaunches, targets, donors, settings, startId) {
+    const launches = [];
+    const activeTargets = (targets || []).filter(target => totalResources(target.need || emptyResources()) >= settings.minShipment);
+    const projected = buildProjectedResourcesByCoord(state.villages, existingLaunches || []);
+    const activeTargetIds = new Set(activeTargets.map(target => String(target.village.id)));
+    let launchId = Math.max(1, startId || 1);
+    let sourceCount = 0;
+
+    const sourceDonors = (donors || [])
+      .filter(donor => donor && donor.village && donor.merchantsAvailable > 0)
+      .map(donor => {
+        const rotationResources = getOverflowRotationSourceResources(donor, settings);
+        const total = Math.min(totalResources(rotationResources), donor.merchantsAvailable * settings.merchantCapacity);
+        const farmBlockedNoTemplate = Boolean(donor.farmBlocked && !donor.hasTemplate);
+        const current = getCurrentResourcesOnly(donor.village);
+        const capacity = Math.max(1, donor.village.capacity || 1);
+        const maxFillRatio = Math.max(current.wood || 0, current.stone || 0, current.iron || 0) / capacity;
+        return {
+          donor: donor,
+          resources: rotationResources,
+          total: total,
+          priority: (farmBlockedNoTemplate ? 100000 : 0) + maxFillRatio * 1000 + total / 1000
+        };
+      })
+      .filter(item => item.total >= settings.minShipment && hasResourceAtLeast(item.resources, settings.minResourcePerOrigin))
+      .sort((a, b) => b.priority - a.priority);
+
+    sourceDonors.forEach(source => {
+      if (sourceCount >= (settings.overflowRotationMaxSources || DEFAULTS.overflowRotationMaxSources)) return;
+      sourceCount += 1;
+
+      const donor = source.donor;
+      const donorId = String(donor.village.id);
+      const sourceResources = cloneResources(source.resources);
+      const candidateBase = {
+        origin: donor.village.coord,
+        originId: donor.village.id,
+        name: donor.village.name,
+        hasAmTemplate: donor.hasTemplate,
+        farmBlocked: donor.farmBlocked,
+        deadVillage: donor.deadVillage,
+        merchantsAvailable: donor.merchantsAvailable,
+        sourceResources: cloneResources(sourceResources),
+        reason: donor.deadVillage ? "farm capped + no AM template" : (donor.farmBlocked ? "farm capped / low free farm" : "resource above rotation source threshold")
+      };
+
+      if (state.debug && state.debug.overflowRotationCandidates) {
+        state.debug.overflowRotationCandidates.push(Object.assign({}, candidateBase));
+      }
+
+      let safety = 0;
+      while (totalResources(sourceResources) >= settings.minShipment && donor.merchantsAvailable > 0 && safety < 80) {
+        safety += 1;
+
+        const matches = (state.villages || [])
+          .filter(village => {
+            if (!village || !village.coord) return false;
+            if (String(village.id) === donorId) return false;
+            if (!village.has_rally_point && village.has_rally_point !== undefined) return false;
+            if (isFarmBlockedDonor(village, settings) && !village.amTemplateName) return false;
+
+            const distance = getDistance(donor.village.coord, village.coord);
+            if (settings.maxDistance > 0 && distance > settings.maxDistance) return false;
+
+            const space = getOverflowRotationSpace(village, projected.get(village.coord), settings);
+            const matching = getMatchingResources(space, sourceResources);
+            return totalResources(matching) >= settings.minShipment && hasResourceAtLeast(matching, settings.minResourcePerOrigin);
+          })
+          .map(village => {
+            const distance = getDistance(donor.village.coord, village.coord);
+            const travelMinutes = getTravelMinutes(distance, settings);
+            const arrivalBucket = getArrivalBucketIndex(travelMinutes, settings);
+            const space = getOverflowRotationSpace(village, projected.get(village.coord), settings);
+            const matching = getMatchingResources(space, sourceResources);
+            return {
+              village: village,
+              distance: distance,
+              travelMinutes: travelMinutes,
+              arrivalBucket: arrivalBucket,
+              space: space,
+              matching: matching,
+              score: getOverflowRotationTargetScore(donor, village, matching, distance, activeTargets, projected.get(village.coord), settings) + (activeTargetIds.has(String(village.id)) ? 10 : 0)
+            };
+          })
+          .sort((a, b) => {
+            if (Math.abs(b.score - a.score) > settings.scoreDistanceTieThreshold) return b.score - a.score;
+            if (a.distance !== b.distance) return a.distance - b.distance;
+            return b.score - a.score;
+          });
+
+        if (!matches.length) {
+          if (state.debug && state.debug.overflowRotationRejected) {
+            state.debug.overflowRotationRejected.push(Object.assign({}, candidateBase, {
+              remainingSourceResources: cloneResources(sourceResources),
+              reason: "no safe rotation target with warehouse space"
+            }));
+          }
+          break;
+        }
+
+        const match = matches[0];
+        const rotationNeed = getMatchingResources(match.matching, sourceResources);
+        const rotationTarget = {
+          village: match.village,
+          initialNeed: cloneResources(rotationNeed),
+          arrivalBuckets: new Map()
+        };
+        const shipment = createShipment(donor, rotationTarget, rotationNeed, settings, match);
+
+        if (totalResources(shipment.resources) < settings.minShipment || !hasResourceAtLeast(shipment.resources, settings.minResourcePerOrigin)) {
+          if (state.debug && state.debug.overflowRotationRejected) {
+            state.debug.overflowRotationRejected.push(Object.assign({}, candidateBase, {
+              target: match.village.coord,
+              targetId: match.village.id,
+              attempted: cloneResources(shipment.attemptedResources || emptyResources()),
+              kept: cloneResources(shipment.resources || emptyResources()),
+              reason: "rotation shipment below minimum after small-fragment filter"
+            }));
+          }
+          break;
+        }
+
+        subtractResources(donor.available, shipment.resources);
+        subtractResources(sourceResources, shipment.resources);
+        donor.merchantsAvailable = Math.max(0, donor.merchantsAvailable - shipment.merchantsUsed);
+        donor.totalAvailable = Math.min(totalResources(donor.available), donor.merchantsAvailable * settings.merchantCapacity);
+        donor.usedTotal += totalResources(shipment.resources);
+        donor.usedTransfers += 1;
+
+        const originProjected = projected.get(donor.village.coord) || getCurrentResourcesWithIncoming(donor.village);
+        subtractResources(originProjected, shipment.resources);
+        projected.set(donor.village.coord, originProjected);
+
+        const targetProjected = projected.get(match.village.coord) || getCurrentResourcesWithIncoming(match.village);
+        addResources(targetProjected, shipment.resources);
+        projected.set(match.village.coord, targetProjected);
+
+        const rotationReason = "Overflow rotation: moving surplus from " + (donor.deadVillage ? "farm-capped no-template village" : donor.farmBlocked ? "farm-capped village" : "near-full warehouse") + " into safe warehouse space";
+
+        const launch = {
+          id: launchId++,
+          origin: donor.village,
+          target: match.village,
+          resources: shipment.resources,
+          total: totalResources(shipment.resources),
+          merchantsUsed: shipment.merchantsUsed,
+          distance: match.distance,
+          travelMinutes: match.travelMinutes,
+          arrivalBucket: match.arrivalBucket,
+          targetScore: 0,
+          targetOrder: 200000 + launches.length,
+          targetPriorityTier: 95,
+          targetQueueCoverage: null,
+          donorScore: match.score,
+          targetReason: rotationReason,
+          donorReason: donor.reason,
+          isOverflowRotation: true,
+          planType: "rotation",
+          rotationSourceReason: candidateBase.reason,
+          rotationTargetSpaceBefore: cloneResources(match.space)
+        };
+
+        launches.push(launch);
+
+        if (state.debug && state.debug.overflowRotationAccepted) {
+          state.debug.overflowRotationAccepted.push({
+            origin: donor.village.coord,
+            originId: donor.village.id,
+            target: match.village.coord,
+            targetId: match.village.id,
+            resources: cloneResources(shipment.resources),
+            total: launch.total,
+            travelMinutes: Math.round(match.travelMinutes),
+            score: Math.round(match.score * 10) / 10,
+            sourceReason: candidateBase.reason,
+            targetSpaceBefore: cloneResources(match.space),
+            sourceRemaining: cloneResources(sourceResources)
+          });
+        }
+      }
+    });
+
+    return launches;
+  }
+
+  function pushRelayRejected(candidate, reason) {
+    if (!state.debug || !state.debug.relayRejected) return;
+    state.debug.relayRejected.push(Object.assign({}, candidate || {}, { reason: reason }));
+  }
+
+  function getMatchingResources(available, need) {
+    return {
+      wood: Math.min(Math.max(0, available && available.wood || 0), Math.max(0, need && need.wood || 0)),
+      stone: Math.min(Math.max(0, available && available.stone || 0), Math.max(0, need && need.stone || 0)),
+      iron: Math.min(Math.max(0, available && available.iron || 0), Math.max(0, need && need.iron || 0))
+    };
+  }
+
+  function capResourcesToSpace(resources, space) {
+    const src = resources || emptyResources();
+    const targetSpace = space || emptyResources();
+    return {
+      wood: Math.max(0, Math.min(src.wood || 0, targetSpace.wood || 0)),
+      stone: Math.max(0, Math.min(src.stone || 0, targetSpace.stone || 0)),
+      iron: Math.max(0, Math.min(src.iron || 0, targetSpace.iron || 0))
+    };
+  }
+
+  function getRelayWarehouseSpaceAfterOutgoing(village, outgoingResources, settings) {
+    const limit = getTargetWarehouseLimit(village, settings);
+    if (limit === null) {
+      return {
+        wood: Number.MAX_SAFE_INTEGER,
+        stone: Number.MAX_SAFE_INTEGER,
+        iron: Number.MAX_SAFE_INTEGER
+      };
+    }
+
+    const current = getCurrentResourcesWithIncoming(village);
+    const outgoing = outgoingResources || emptyResources();
+    return {
+      wood: Math.max(0, limit - Math.max(0, current.wood - (outgoing.wood || 0))),
+      stone: Math.max(0, limit - Math.max(0, current.stone - (outgoing.stone || 0))),
+      iron: Math.max(0, limit - Math.max(0, current.iron - (outgoing.iron || 0)))
+    };
+  }
+
   function groupLaunchesByTarget(launches, settings) {
     const map = new Map();
 
     launches.forEach(launch => {
-      const key = String(launch.target.id);
+      const planType = launch.planType || (launch.isRelay ? "relay" : (launch.isOverflowRotation ? "rotation" : "direct"));
+      const key = planType + ":" + String(launch.target.id);
 
       if (!map.has(key)) {
         map.set(key, {
@@ -2569,11 +3552,30 @@
           targetReason: launch.targetReason,
           targetOrder: launch.targetOrder || 999999,
           targetPriorityTier: launch.targetPriorityTier,
-          targetQueueCoverage: launch.targetQueueCoverage || null
+          targetQueueCoverage: launch.targetQueueCoverage || null,
+          isRelay: Boolean(launch.isRelay),
+          isOverflowRotation: Boolean(launch.isOverflowRotation),
+          planType: planType,
+          relayOutgoingOffset: launch.relayOutgoingOffset ? cloneResources(launch.relayOutgoingOffset) : emptyResources(),
+          relayOriginalTargets: launch.relayOriginalTargets ? launch.relayOriginalTargets.slice() : []
         });
       }
 
       const plan = map.get(key);
+      if (launch.isRelay) {
+        plan.isRelay = true;
+        plan.planType = "relay";
+        if (launch.relayOutgoingOffset && totalResources(plan.relayOutgoingOffset || emptyResources()) <= 0) {
+          plan.relayOutgoingOffset = cloneResources(launch.relayOutgoingOffset);
+        }
+        if (launch.relayOriginalTargets && launch.relayOriginalTargets.length && (!plan.relayOriginalTargets || !plan.relayOriginalTargets.length)) {
+          plan.relayOriginalTargets = launch.relayOriginalTargets.slice();
+        }
+      }
+      if (launch.isOverflowRotation) {
+        plan.isOverflowRotation = true;
+        plan.planType = "rotation";
+      }
       plan.launches.push(launch);
       plan.resources.wood += launch.resources.wood;
       plan.resources.stone += launch.resources.stone;
@@ -2588,7 +3590,13 @@
       plan.arrivalBalance = createArrivalBalanceSummary(plan, settings || DEFAULTS);
     });
 
-    return plans.sort((a, b) => (a.targetOrder || 999999) - (b.targetOrder || 999999));
+    const planTypeOrder = { direct: 0, relay: 1, rotation: 2 };
+    return plans.sort((a, b) => {
+      const aOrder = planTypeOrder[a.planType || (a.isRelay ? "relay" : "direct")] || 0;
+      const bOrder = planTypeOrder[b.planType || (b.isRelay ? "relay" : "direct")] || 0;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      return (a.targetOrder || 999999) - (b.targetOrder || 999999);
+    });
   }
 
   function buildDonorAudit(donors, targets, launches, settings) {
@@ -2774,11 +3782,17 @@
     return (targetPlans || []).map(plan => {
       const target = plan.target;
       const currentWithIncoming = getCurrentResourcesWithIncoming(target);
+      const relayOutgoingOffset = plan && plan.isRelay ? cloneResources(plan.relayOutgoingOffset || emptyResources()) : emptyResources();
+      const projectedBase = {
+        wood: Math.max(0, currentWithIncoming.wood - relayOutgoingOffset.wood),
+        stone: Math.max(0, currentWithIncoming.stone - relayOutgoingOffset.stone),
+        iron: Math.max(0, currentWithIncoming.iron - relayOutgoingOffset.iron)
+      };
       const safeLimit = getTargetWarehouseLimit(target, settings);
       const afterPlanned = {
-        wood: currentWithIncoming.wood + (plan.resources.wood || 0),
-        stone: currentWithIncoming.stone + (plan.resources.stone || 0),
-        iron: currentWithIncoming.iron + (plan.resources.iron || 0)
+        wood: projectedBase.wood + (plan.resources.wood || 0),
+        stone: projectedBase.stone + (plan.resources.stone || 0),
+        iron: projectedBase.iron + (plan.resources.iron || 0)
       };
 
       const planned = cloneResources(plan.resources || emptyResources());
@@ -2793,9 +3807,9 @@
         iron: planned.iron > 0 && afterPlanned.iron > safeLimit
       } : null;
       const preExistingOverSafeLimit = safeLimit !== null ? {
-        wood: currentWithIncoming.wood > safeLimit,
-        stone: currentWithIncoming.stone > safeLimit,
-        iron: currentWithIncoming.iron > safeLimit
+        wood: projectedBase.wood > safeLimit,
+        stone: projectedBase.stone > safeLimit,
+        iron: projectedBase.iron > safeLimit
       } : null;
 
       return {
@@ -2805,6 +3819,8 @@
         targetSafeLimitPercent: settings.targetWarehouseLimitPercent,
         safeLimit: safeLimit,
         currentPlusIncoming: currentWithIncoming,
+        relayOutgoingOffset: relayOutgoingOffset,
+        projectedBaseAfterOutgoing: projectedBase,
         planned: planned,
         afterPlanned: afterPlanned,
         overSafeLimit: overSafeLimit,
@@ -2993,6 +4009,11 @@
         arrivalBalanceWindowMinutes: settings.arrivalBalanceWindowMinutes,
         merchantMinutesPerField: settings.merchantMinutesPerField,
         prioritizeLowPoints: settings.prioritizeLowPoints,
+        enableRelayReplenishment: settings.enableRelayReplenishment !== false,
+        relaySafetyBufferMinutes: settings.relaySafetyBufferMinutes,
+        enableOverflowRotation: settings.enableOverflowRotation !== false,
+        overflowRotationSourcePercent: settings.overflowRotationSourcePercent,
+        overflowRotationTargetLimitPercent: settings.overflowRotationTargetLimitPercent,
         dataRequestDelayMs: DEFAULTS.dataRequestDelayMs,
         templateRequestDelayMs: DEFAULTS.templateRequestDelayMs,
         fetchRetryDelayMs: DEFAULTS.fetchRetryDelayMs,
@@ -3007,6 +4028,12 @@
         cappedTargets: debug.cappedTargets ? debug.cappedTargets.length : 0,
         skippedSmallShipments: debug.skippedSmallShipments ? debug.skippedSmallShipments.length : 0,
         rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments ? debug.rejectedTinyResourceFragments.length : 0,
+        relayCandidates: debug.relayCandidates ? debug.relayCandidates.length : 0,
+        relayAccepted: debug.relayAccepted ? debug.relayAccepted.length : 0,
+        relayRejected: debug.relayRejected ? debug.relayRejected.length : 0,
+        overflowRotationCandidates: debug.overflowRotationCandidates ? debug.overflowRotationCandidates.length : 0,
+        overflowRotationAccepted: debug.overflowRotationAccepted ? debug.overflowRotationAccepted.length : 0,
+        overflowRotationRejected: debug.overflowRotationRejected ? debug.overflowRotationRejected.length : 0,
         incomingRowsParsed: debug.incomingTransportLoad && debug.incomingTransportLoad.selected ? debug.incomingTransportLoad.selected.rowsParsed : 0,
         queueCoverageTargetHours: settings.constructionHours,
         queueCoverageTargetBuildings: settings.targetQueueCoverageBuildings,
@@ -3015,7 +4042,8 @@
         originsOverAvailableResourcesOrMerchants: overOrigins.length,
         dataLoadSteps: debug.dataLoad ? debug.dataLoad.length : 0,
         amTemplatesLoaded: debug.amTemplateLoad && debug.amTemplateLoad.loadedTemplates ? debug.amTemplateLoad.loadedTemplates.length : 0,
-        amTemplatesFailed: debug.amTemplateLoad && debug.amTemplateLoad.failedTemplates ? debug.amTemplateLoad.failedTemplates.length : 0
+        amTemplatesFailed: debug.amTemplateLoad && debug.amTemplateLoad.failedTemplates ? debug.amTemplateLoad.failedTemplates.length : 0,
+        targetExclusions: debug.targetExclusions ? debug.targetExclusions.length : 0
       },
       stats: planResult.stats,
       overWarehouse: overWarehouse,
@@ -3040,30 +4068,46 @@
         reason: target.reason
       })),
       unplannedTargets: buildUnplannedTargetDiagnostics(planResult, settings),
+      targetExclusions: debug.targetExclusions || [],
+      relayReplenishment: {
+        candidates: debug.relayCandidates || [],
+        accepted: debug.relayAccepted || [],
+        rejected: debug.relayRejected || []
+      },
+      overflowRotation: {
+        candidates: debug.overflowRotationCandidates || [],
+        accepted: debug.overflowRotationAccepted || [],
+        rejected: debug.overflowRotationRejected || []
+      },
       cappedTargets: debug.cappedTargets || [],
       skippedSmallShipments: debug.skippedSmallShipments || [],
       rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments || []
     };
 
-    console.groupCollapsed(SCRIPT_NAME + " plan diagnostics " + SCRIPT_VERSION);
-    console.log("Summary", diagnostics.counts);
-    console.log("Settings", diagnostics.settings);
-    console.log("Targets over 90% warehouse safety limit", overWarehouse);
-    console.log("Origins over available resources/merchants", overOrigins);
-    console.log("Target warehouse audit", targetWarehouseAudit);
-    console.log("Origin usage audit", originUsageAudit);
-    console.log("Incoming transport load", diagnostics.incomingTransportLoad);
-    console.log("Data load steps", diagnostics.dataLoad);
-    console.log("AM template load", diagnostics.amTemplateLoad);
-    console.log("Target planning order", diagnostics.targetPlanningOrder);
-    console.log("Unplanned targets", diagnostics.unplannedTargets);
-    console.log("Capped targets", diagnostics.cappedTargets);
-    console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
-    console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
-    console.log("Full diagnostics", diagnostics);
-    console.groupEnd();
-
     state.lastDiagnostics = diagnostics;
+
+    if (settings.debugConsole) {
+      console.groupCollapsed(SCRIPT_NAME + " plan diagnostics " + SCRIPT_VERSION);
+      console.log("Summary", diagnostics.counts);
+      console.log("Settings", diagnostics.settings);
+      console.log("Targets over 90% warehouse safety limit", overWarehouse);
+      console.log("Origins over available resources/merchants", overOrigins);
+      console.log("Target warehouse audit", targetWarehouseAudit);
+      console.log("Origin usage audit", originUsageAudit);
+      console.log("Incoming transport load", diagnostics.incomingTransportLoad);
+      console.log("Data load steps", diagnostics.dataLoad);
+      console.log("AM template load", diagnostics.amTemplateLoad);
+      console.log("Target planning order", diagnostics.targetPlanningOrder);
+      console.log("Unplanned targets", diagnostics.unplannedTargets);
+      console.log("Target exclusions / no-need AM villages", diagnostics.targetExclusions);
+      console.log("Relay replenishment", diagnostics.relayReplenishment);
+      console.log("Overflow rotation", diagnostics.overflowRotation);
+      console.log("Capped targets", diagnostics.cappedTargets);
+      console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
+      console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
+      console.log("Full diagnostics", diagnostics);
+      console.groupEnd();
+    }
   }
 
   function getFirstEnabledSendButton() {
@@ -3206,7 +4250,7 @@
 
     const debugPayload = Object.assign({}, data);
 
-    console.log(SCRIPT_NAME + " grouped request", {
+    if (state.lastSettings && state.lastSettings.debugConsole) console.log(SCRIPT_NAME + " grouped request", {
       target: targetPlan.target.coord,
       targetId: targetPlan.target.id,
       origins: targetPlan.launches.map(launch => ({
@@ -3229,7 +4273,7 @@
     try {
       const response = await postMarketAction(options, data);
 
-      console.log(SCRIPT_NAME + " grouped request response", {
+      if (state.lastSettings && state.lastSettings.debugConsole) console.log(SCRIPT_NAME + " grouped request response", {
         target: targetPlan.target.coord,
         targetId: targetPlan.target.id,
         success: !responseHasError(response),
@@ -3276,6 +4320,13 @@
     renderDiagnostics(planResult);
   }
 
+  function getTargetPlanLabelPrefix(targetPlan) {
+    if (!targetPlan) return "";
+    if (targetPlan.isRelay || targetPlan.planType === "relay") return "Relay refill: ";
+    if (targetPlan.isOverflowRotation || targetPlan.planType === "rotation") return "Resource rotation: ";
+    return "";
+  }
+
   function renderTargetTable(targetPlans) {
     const title = document.createElement("div");
     title.className = "twrp-section-title";
@@ -3306,7 +4357,7 @@
       const row = document.createElement("tr");
 
       appendCell(row, String(targetPlan.id));
-      appendCell(row, targetPlan.target.name, "twrp-left twrp-target-name");
+      appendCell(row, getTargetPlanLabelPrefix(targetPlan) + targetPlan.target.name, "twrp-left twrp-target-name");
       const targetAudit = createTargetPlanStorageAudit(targetPlan, state.lastSettings || getSettings());
       const incomingLine = totalResources(targetAudit.incoming) > 0 ? "\nIncoming: " + formatResources(targetAudit.incoming) : "\nIncoming: -";
       const safeLine = targetAudit.safeLimit === null ? "" : "\nAfter: " + formatResources(targetAudit.afterPlanned) + " / safe " + formatNumber(targetAudit.safeLimit);
@@ -3328,7 +4379,7 @@
         line.className = "twrp-origin-line";
         line.innerHTML =
           "<strong>" + escapeHtml(launch.origin.name) + "</strong><br>" +
-          "<span>" + escapeHtml(formatResources(launch.resources)) + " | " +
+          "<span>" + escapeHtml((launch.isRelay ? "Relay refill: " : (launch.isOverflowRotation ? "Resource rotation: " : "")) + formatResources(launch.resources)) + " | " +
           escapeHtml(launch.distance.toFixed(1)) + " fields" +
           (launch.travelMinutes !== undefined ? " | ~" + formatTravelMinutes(launch.travelMinutes) : "") +
           "</span>";
@@ -3411,6 +4462,82 @@
         target.reason
       ])
     ));
+
+    const relayData = state.lastDiagnostics && state.lastDiagnostics.relayReplenishment ? state.lastDiagnostics.relayReplenishment : null;
+    const relayAccepted = relayData && relayData.accepted ? relayData.accepted : [];
+    const relayRejected = relayData && relayData.rejected ? relayData.rejected : [];
+    const relayRows = [];
+
+    relayAccepted.slice(0, 8).forEach(row => {
+      relayRows.push([
+        "Accepted",
+        row.middleman || row.name || "",
+        row.origin || "",
+        formatResources(row.resources || emptyResources()),
+        (row.queueHours || 0).toFixed ? row.queueHours.toFixed(1) + "h" : String(row.queueHours || ""),
+        "refill arrives in ~" + formatTravelMinutes(row.travelMinutes || 0)
+      ]);
+    });
+
+    relayRejected.slice(0, Math.max(0, 12 - relayRows.length)).forEach(row => {
+      relayRows.push([
+        "Rejected",
+        row.middleman || row.name || "",
+        "-",
+        formatResources(row.outgoing || emptyResources()),
+        (row.queueHours || 0).toFixed ? row.queueHours.toFixed(1) + "h" : String(row.queueHours || ""),
+        row.reason || "not eligible"
+      ]);
+    });
+
+    if (relayRows.length) {
+      const relayTitle = document.createElement("div");
+      relayTitle.className = "twrp-section-title";
+      relayTitle.textContent = "Relay replenishment audit";
+      details.appendChild(relayTitle);
+      details.appendChild(createMiniTable(
+        ["Status", "Middleman", "Refill origin", "Resources/outgoing", "Queue", "Reason"],
+        relayRows
+      ));
+    }
+
+    const rotationData = state.lastDiagnostics && state.lastDiagnostics.overflowRotation ? state.lastDiagnostics.overflowRotation : null;
+    const rotationAccepted = rotationData && rotationData.accepted ? rotationData.accepted : [];
+    const rotationRejected = rotationData && rotationData.rejected ? rotationData.rejected : [];
+    const rotationRows = [];
+
+    rotationAccepted.slice(0, 8).forEach(row => {
+      rotationRows.push([
+        "Accepted",
+        row.origin || "",
+        row.target || "",
+        formatResources(row.resources || emptyResources()),
+        "~" + formatTravelMinutes(row.travelMinutes || 0),
+        row.sourceReason || "overflow rotation"
+      ]);
+    });
+
+    rotationRejected.slice(0, Math.max(0, 12 - rotationRows.length)).forEach(row => {
+      rotationRows.push([
+        "Rejected",
+        row.origin || row.name || "",
+        row.target || "-",
+        formatResources(row.remainingSourceResources || row.sourceResources || emptyResources()),
+        "-",
+        row.reason || "not eligible"
+      ]);
+    });
+
+    if (rotationRows.length) {
+      const rotationTitle = document.createElement("div");
+      rotationTitle.className = "twrp-section-title";
+      rotationTitle.textContent = "Overflow rotation audit";
+      details.appendChild(rotationTitle);
+      details.appendChild(createMiniTable(
+        ["Status", "Origin", "Staging target", "Resources", "Travel", "Reason"],
+        rotationRows
+      ));
+    }
 
     const donorTitle = document.createElement("div");
     donorTitle.className = "twrp-section-title";
@@ -3527,12 +4654,18 @@
     const current = getCurrentResourcesOnly(target);
     const incoming = cloneResources(target.incoming || emptyResources());
     const currentPlusIncoming = getCurrentResourcesWithIncoming(target);
+    const relayOutgoingOffset = targetPlan && targetPlan.isRelay ? cloneResources(targetPlan.relayOutgoingOffset || emptyResources()) : emptyResources();
+    const projectedBaseAfterOutgoing = {
+      wood: Math.max(0, currentPlusIncoming.wood - relayOutgoingOffset.wood),
+      stone: Math.max(0, currentPlusIncoming.stone - relayOutgoingOffset.stone),
+      iron: Math.max(0, currentPlusIncoming.iron - relayOutgoingOffset.iron)
+    };
     const planned = cloneResources(targetPlan && targetPlan.resources ? targetPlan.resources : emptyResources());
     const safeLimit = getTargetWarehouseLimit(target, settings || DEFAULTS);
     const afterPlanned = {
-      wood: currentPlusIncoming.wood + (planned.wood || 0),
-      stone: currentPlusIncoming.stone + (planned.stone || 0),
-      iron: currentPlusIncoming.iron + (planned.iron || 0)
+      wood: projectedBaseAfterOutgoing.wood + (planned.wood || 0),
+      stone: projectedBaseAfterOutgoing.stone + (planned.stone || 0),
+      iron: projectedBaseAfterOutgoing.iron + (planned.iron || 0)
     };
 
     const overSafeLimit = safeLimit !== null ? {
@@ -3546,9 +4679,9 @@
       iron: planned.iron > 0 && afterPlanned.iron > safeLimit
     } : null;
     const preExistingOverSafeLimit = safeLimit !== null ? {
-      wood: currentPlusIncoming.wood > safeLimit,
-      stone: currentPlusIncoming.stone > safeLimit,
-      iron: currentPlusIncoming.iron > safeLimit
+      wood: projectedBaseAfterOutgoing.wood > safeLimit,
+      stone: projectedBaseAfterOutgoing.stone > safeLimit,
+      iron: projectedBaseAfterOutgoing.iron > safeLimit
     } : null;
 
     return {
@@ -3560,119 +4693,14 @@
       current: current,
       incoming: incoming,
       currentPlusIncoming: currentPlusIncoming,
+      relayOutgoingOffset: relayOutgoingOffset,
+      projectedBaseAfterOutgoing: projectedBaseAfterOutgoing,
       planned: planned,
       afterPlanned: afterPlanned,
       overSafeLimit: overSafeLimit,
       plannedOverSafeLimit: plannedOverSafeLimit,
       preExistingOverSafeLimit: preExistingOverSafeLimit
     };
-  }
-
-  function getIncomingLoadSummaryText() {
-    const load = state.lastDiagnostics && state.lastDiagnostics.incomingTransportLoad;
-    const selected = load && load.selected ? load.selected : null;
-
-    if (!selected) {
-      return "Incoming parsed: not available";
-    }
-
-    return "Incoming parsed: " +
-      (selected.rowsParsed || 0) + " row(s), " +
-      ((selected.byCoord && selected.byCoord.length) || 0) + " target(s), total " +
-      formatResources(selected.totals || emptyResources()) +
-      (load.selectedLabel ? " | source: " + load.selectedLabel : "");
-  }
-
-  function formatStorageAuditLine(targetPlan, settings) {
-    const audit = createTargetPlanStorageAudit(targetPlan, settings);
-    const safeText = audit.safeLimit === null ? "unknown" : formatNumber(audit.safeLimit);
-    const capacityText = audit.capacity ? formatNumber(audit.capacity) : "unknown";
-    let overText = "";
-    if (audit.plannedOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.plannedOverSafeLimit)) {
-      overText = " | OVER SAFE LIMIT";
-    } else if (audit.preExistingOverSafeLimit && hasAnyWarehouseLimitOverflow(audit.preExistingOverSafeLimit)) {
-      overText = " | existing over safe: " + formatWarehouseOverResources(audit.preExistingOverSafeLimit);
-    }
-
-    return "   Target storage audit: capacity " + capacityText +
-      " | 90% safe " + safeText +
-      " | current " + formatResources(audit.current) +
-      " | incoming " + formatResources(audit.incoming) +
-      " | current+incoming " + formatResources(audit.currentPlusIncoming) +
-      " | after planned " + formatResources(audit.afterPlanned) +
-      overText;
-  }
-
-  function copyPlan() {
-    if (!state.plan.length) {
-      setStatus("No plan to copy.", "warn");
-      return;
-    }
-
-    const lines = [];
-    const settings = state.lastSettings || getSettings();
-
-    lines.push(SCRIPT_NAME + " " + SCRIPT_VERSION);
-    lines.push("Mode: " + (settings.useAmTemplates ? "AM construction" : "Warehouse balance"));
-    if (settings.useAmTemplates) {
-      lines.push("Build coverage target: " + settings.constructionHours + "h queue time");
-    }
-    lines.push("Origin reserve: " + settings.reserveWarehousePercent + "% of warehouse");
-    lines.push(getIncomingLoadSummaryText());
-    lines.push("");
-
-    state.plan.forEach(targetPlan => {
-      lines.push(
-        targetPlan.id + ". " +
-        "Target: " + targetPlan.target.name +
-        " | " + formatResources(targetPlan.resources) +
-        " | origins: " + targetPlan.launches.length +
-        " | merchants: " + targetPlan.merchantsUsed +
-        " | max distance: " + targetPlan.maxDistance.toFixed(1) +
-        " | arrival: " + (targetPlan.arrivalBalance || "n/a")
-      );
-      lines.push("   Reason: " + targetPlan.targetReason);
-      lines.push(formatStorageAuditLine(targetPlan, settings));
-
-      targetPlan.launches.forEach(launch => {
-        lines.push(
-          "   - " + launch.origin.name +
-          " -> " + formatResources(launch.resources) +
-          " | distance: " + launch.distance.toFixed(1) +
-          (launch.travelMinutes !== undefined ? " | approx arrival: " + formatTravelMinutes(launch.travelMinutes) : "")
-        );
-      });
-
-      lines.push("");
-    });
-
-    const text = lines.join("\n");
-
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text)
-        .then(() => setStatus("Plan copied.", "success"))
-        .catch(() => fallbackCopy(text));
-      return;
-    }
-
-    fallbackCopy(text);
-  }
-
-  function fallbackCopy(text) {
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.style.position = "fixed";
-    textarea.style.left = "-9999px";
-    textarea.style.top = "-9999px";
-
-    document.body.appendChild(textarea);
-    textarea.focus();
-    textarea.select();
-
-    const copied = document.execCommand("copy");
-    textarea.remove();
-
-    setStatus(copied ? "Plan copied." : "Could not copy plan.", copied ? "success" : "error");
   }
 
   function setStatus(message, type) {
@@ -3781,7 +4809,7 @@
 
       .twrp-grid {
         display: grid;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-template-columns: repeat(5, minmax(0, 1fr));
         gap: 8px;
         align-items: end;
       }
@@ -3791,6 +4819,7 @@
         font-weight: bold;
         margin-bottom: 4px;
         color: #3b2a18;
+        white-space: nowrap;
       }
 
       .twrp-hint {
@@ -3798,6 +4827,78 @@
         opacity: 0.72;
         margin-top: 3px;
         min-height: 13px;
+      }
+
+      .twrp-label-row {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        margin-bottom: 4px;
+      }
+
+      .twrp-label-row .twrp-label {
+        margin-bottom: 0;
+      }
+
+      .twrp-info-button {
+        width: 16px;
+        height: 16px;
+        border: 1px solid #b99351;
+        border-radius: 50%;
+        background: #fffdf7;
+        color: #6d4b18;
+        cursor: pointer;
+        font-size: 10px;
+        line-height: 14px;
+        padding: 0;
+        font-weight: bold;
+      }
+
+      .twrp-info-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1000000;
+        background: rgba(0,0,0,0.22);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+      }
+
+      .twrp-info-dialog {
+        width: min(460px, 94vw);
+        background: #fff7e5;
+        border: 1px solid #8f6a2f;
+        border-radius: 8px;
+        box-shadow: 0 12px 35px rgba(0,0,0,0.35);
+        color: #2e2112;
+      }
+
+      .twrp-info-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 9px 10px;
+        background: linear-gradient(180deg, #d8b776, #bd8f43);
+        border-bottom: 1px solid #8f6a2f;
+        font-weight: bold;
+      }
+
+      .twrp-info-content {
+        padding: 11px;
+        line-height: 1.45;
+        white-space: pre-line;
+      }
+
+      .twrp-info-close {
+        width: 24px;
+        height: 24px;
+        border: 1px solid #7d510f;
+        background: #fff4d5;
+        color: #2f1b00;
+        border-radius: 5px;
+        cursor: pointer;
+        font-weight: bold;
       }
 
       .twrp-select,
@@ -3826,6 +4927,39 @@
         border: 1px solid #b99351;
         border-radius: 5px;
         background: #fffdf7;
+      }
+
+      .twrp-toggle-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: flex-start;
+        margin-top: 8px;
+      }
+
+      .twrp-toggle-row > div {
+        width: 216px;
+        max-width: 100%;
+      }
+
+      .twrp-scriptdata-note {
+        margin-top: 8px;
+        padding: 7px 8px;
+        border: 1px solid #d0ad6a;
+        border-radius: 6px;
+        background: #fffaf0;
+        font-size: 10px;
+        line-height: 1.35;
+        color: #4b3318;
+      }
+
+      .twrp-scriptdata-note code {
+        font-family: monospace;
+        font-size: 10px;
+        background: rgba(255,255,255,0.75);
+        border: 1px solid #ead8b3;
+        border-radius: 3px;
+        padding: 1px 3px;
       }
 
       .twrp-buttons {
@@ -4066,10 +5200,81 @@
     const style = document.getElementById(STYLE_ID);
     if (style) style.remove();
 
-    window.twacticsResourcePlannerLoaded = false;
-    delete window.twacticsResourcePlanner;
+    window.twacticsResourceBalancerLoaded = false;
+    delete window.twacticsResourceBalancer;
 
-    console.log(SCRIPT_NAME + " closed");
+    if (state.lastSettings && state.lastSettings.debugConsole) console.log(SCRIPT_NAME + " closed");
+  }
+
+  function showInfoDialog(title, body) {
+    const old = document.querySelector(".twrp-info-overlay");
+    if (old) old.remove();
+
+    const overlay = document.createElement("div");
+    overlay.className = "twrp-info-overlay";
+
+    const dialog = document.createElement("div");
+    dialog.className = "twrp-info-dialog";
+
+    const head = document.createElement("div");
+    head.className = "twrp-info-head";
+
+    const titleNode = document.createElement("div");
+    titleNode.textContent = title;
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "twrp-info-close";
+    close.textContent = "x";
+
+    const content = document.createElement("div");
+    content.className = "twrp-info-content";
+    content.textContent = body;
+
+    function removeDialog() {
+      overlay.remove();
+    }
+
+    close.addEventListener("click", removeDialog);
+    overlay.addEventListener("click", function (event) {
+      if (event.target === overlay) removeDialog();
+    });
+
+    head.appendChild(titleNode);
+    head.appendChild(close);
+    dialog.appendChild(head);
+    dialog.appendChild(content);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  }
+
+  function addInfoButton(wrap, title, body) {
+    const label = wrap.querySelector(".twrp-label");
+    if (!label) return;
+
+    let labelRow = label.parentNode && label.parentNode.classList && label.parentNode.classList.contains("twrp-label-row")
+      ? label.parentNode
+      : null;
+
+    if (!labelRow) {
+      labelRow = document.createElement("div");
+      labelRow.className = "twrp-label-row";
+      wrap.insertBefore(labelRow, label);
+      labelRow.appendChild(label);
+    }
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "twrp-info-button";
+    button.textContent = "?";
+    button.setAttribute("aria-label", title + " help");
+    button.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      showInfoDialog(title, body);
+    });
+
+    labelRow.appendChild(button);
   }
 
   function addHint(wrap, text) {
@@ -4205,24 +5410,54 @@
     const reserveWarehousePercent = createInput("Origin reserve", initialSettings.reserveWarehousePercent);
     const maxDistance = createInput("Max distance", initialSettings.maxDistance);
     const prioritizeLowPoints = createCheckbox("Low-point priority", initialSettings.prioritizeLowPoints);
+    const enableRelayReplenishment = createCheckbox("Relay replenishment", initialSettings.enableRelayReplenishment !== false);
+    const enableOverflowRotation = createCheckbox("Overflow rotation", initialSettings.enableOverflowRotation !== false);
 
     addHint(planMode.wrap, "AM template or WH %");
     addHint(constructionHours.wrap, "hours");
     addHint(reserveMerchants.wrap, "kept home");
     addHint(reserveWarehousePercent.wrap, "% warehouse");
     addHint(maxDistance.wrap, "0 = any");
-    addHint(prioritizeLowPoints.wrap, "boost smaller villages");
+    addHint(prioritizeLowPoints.wrap, "lowest points first");
+    addHint(enableRelayReplenishment.wrap, "refill used origins");
+    addHint(enableOverflowRotation.wrap, "move idle surplus");
+
+    addInfoButton(
+      prioritizeLowPoints.wrap,
+      "Low-point priority",
+      "Prioritizes lower-point target villages within the same queue urgency.\n\nExample: if one 800-point village and one 6,000-point village both need resources to reach the 8h build coverage target, the 800-point village is planned first.\n\nIt does not mean higher-point villages are ignored. If resources and donors are still available, the planner continues upward."
+    );
+
+    addInfoButton(
+      enableRelayReplenishment.wrap,
+      "Relay replenishment",
+      "After normal target requests, the planner can refill origin villages that just sent resources onward.\n\nExample: Village A sends resources to a target. Village B can send a refill to Village A, so Village A is not drained after helping.\n\nIf Village A has an active AM construction template, it must also have an active queue and the refill must arrive before the queue risks stopping.\n\nIf Village A has no active AM construction template, it may be used as a finished/idle middleman even without a queue. Relay still respects the 90% warehouse cap per resource."
+    );
+
+    addInfoButton(
+      enableOverflowRotation.wrap,
+      "Overflow rotation",
+      "Creates extra manual requests that move surplus away from idle villages, especially villages with no AM construction template and farm level 30 / low free farm.\n\nThe target village is chosen for safe warehouse space, distance, and whether it places resources closer to future construction targets. It still respects the warehouse safety cap and merchant limits.\n\nThis is not an automatic send. It only adds additional recommended request rows that you can review before clicking."
+    );
 
     [
       planMode.wrap,
       constructionHours.wrap,
       reserveMerchants.wrap,
       reserveWarehousePercent.wrap,
-      maxDistance.wrap,
-      prioritizeLowPoints.wrap
+      maxDistance.wrap
     ].forEach(node => grid.appendChild(node));
 
+    const toggleRow = document.createElement("div");
+    toggleRow.className = "twrp-toggle-row";
+    [
+      prioritizeLowPoints.wrap,
+      enableRelayReplenishment.wrap,
+      enableOverflowRotation.wrap
+    ].forEach(node => toggleRow.appendChild(node));
+
     panel.appendChild(grid);
+    panel.appendChild(toggleRow);
 
     function updateModeControls() {
       const amMode = planMode.select.value === "am";
@@ -4242,16 +5477,13 @@
     planButton.textContent = "Create plan";
     planButton.addEventListener("click", loadAndPlan);
 
-    const copyButton = document.createElement("button");
-    copyButton.type = "button";
-    copyButton.className = "btn";
-    copyButton.textContent = "Copy plan";
-    copyButton.disabled = true;
-    copyButton.addEventListener("click", copyPlan);
-
     buttons.appendChild(planButton);
-    buttons.appendChild(copyButton);
     panel.appendChild(buttons);
+
+    const scriptDataNote = document.createElement("div");
+    scriptDataNote.className = "twrp-scriptdata-note";
+    scriptDataNote.innerHTML = "<strong>User data:</strong> Supports <code>TribalWars.scriptData</code>. When enabled in the Script Library, personal settings are loaded as JSON before the script runs. Expected format and options are documented in the script description.";
+    panel.appendChild(scriptDataNote);
 
     const status = document.createElement("div");
     status.className = "twrp-status";
@@ -4261,7 +5493,7 @@
 
     const footer = document.createElement("div");
     footer.className = "twrp-footer";
-    footer.textContent = "Created by Twactics";
+    footer.textContent = "Created by Twactics (zidrox)";
 
     body.appendChild(panel);
     body.appendChild(status);
@@ -4278,8 +5510,9 @@
     ui.reserveWarehousePercent = reserveWarehousePercent.input;
     ui.maxDistance = maxDistance.input;
     ui.prioritizeLowPoints = prioritizeLowPoints.input;
+    ui.enableRelayReplenishment = enableRelayReplenishment.input;
+    ui.enableOverflowRotation = enableOverflowRotation.input;
     ui.planButton = planButton;
-    ui.copyButton = copyButton;
     ui.status = status;
     ui.results = results;
 
