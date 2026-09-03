@@ -13,6 +13,14 @@
  * - Reads relic data from Treasury -> Inventory
  * - Reads placed relics from Treasury -> Overview
  * - Calculates suggested relic placements after a manual user click
+ * - Can focus Offensive strength scoring on one village group while still placing relics on any owned village
+ * - Can optionally read Account Manager troop targets/current counts for recruitment-demand scoring
+ * - Uses diminishing-return scoring for Offense/Recruitment so balanced useful bonuses are preferred over one-stat stacking
+ *
+ * v1.2.0 notes:
+ * - Placement universe is always all owned villages (group=0). Focus Group changes scoring targets, not placement eligibility.
+ * - Optional AM demand mode reads screen=am_troops and /interface.php?func=get_unit_info only when enabled.
+ * - AM remaining time is a workload estimate from target-current unit counts and world unit build times; it does not write to AM.
  *
  * This script does NOT:
  * - Send attacks, support, or troops
@@ -45,10 +53,25 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.1.2";
+  const SCRIPT_VERSION = "v1.2.0";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
+  const BALANCE_POWER = 0.65;
+
+  const AM_TROOP_UNITS = ["spear", "sword", "axe", "archer", "spy", "light", "marcher", "heavy", "ram", "catapult"];
+  const AM_UNIT_BUILDING = {
+    spear: "barracks",
+    sword: "barracks",
+    axe: "barracks",
+    archer: "barracks",
+    spy: "stable",
+    light: "stable",
+    marcher: "stable",
+    heavy: "stable",
+    ram: "workshop",
+    catapult: "workshop"
+  };
 
   const QUALITY_RANGE_LABELS = {
     2: "Shoddy / Sturdy",
@@ -74,12 +97,12 @@
   };
 
   const RECRUITMENT_WEIGHTS = {
-    barracks_speed: 1.0,
-    stable_speed: 1.0,
-    barracks_cost: 0.45,
-    stable_cost: 0.45,
-    workshop_speed: 0.35,
-    workshop_cost: 0.25,
+    barracks_speed: 1.10,
+    stable_speed: 1.00,
+    barracks_cost: 0.38,
+    stable_cost: 0.35,
+    workshop_speed: 0.40,
+    workshop_cost: 0.24,
     academy_speed: 0.10
   };
 
@@ -318,6 +341,18 @@
       detectedRanges: []
     },
     targetCoords: new Set(),
+    focusGroups: [],
+    focusGroupId: "0",
+    focusGroupName: "All villages",
+    focusCoords: new Set(),
+    lastGoal: "",
+    recruitmentDemandRequested: false,
+    recruitmentDemandActive: false,
+    amTemplates: [],
+    amRecruitmentDemandByCoord: new Map(),
+    amRecruitmentDemandMax: 0,
+    amRecruitmentMeta: { rows: 0, timedRows: 0, timingSource: "none", note: "" },
+    unitBuildTimes: {},
 		logs: []
 	};
 
@@ -421,6 +456,7 @@
 		return buildGameUrl({
 		  screen: "overview_villages",
 		  mode: "combined",
+        group: 0,
 		  page: -1
 		});
 	  }
@@ -429,6 +465,7 @@
       return buildGameUrl({
         screen: "overview_villages",
         mode: "buildings",
+        group: 0,
         page: -1
       });
     }
@@ -436,9 +473,19 @@
 	  return buildGameUrl({
 		screen: "overview_villages",
 		mode: "prod",
+      group: 0,
 		page: -1
 	  });
 	}
+
+  function getFocusGroupVillageUrl(groupId) {
+    return buildGameUrl({
+      screen: "overview_villages",
+      mode: "combined",
+      group: String(groupId || "0"),
+      page: -1
+    });
+  }
 
   function getRelicOffsets(range) {
     const radius = Math.max(0, parseInt(range || 0, 10));
@@ -487,6 +534,126 @@
 
   function parseHtml(html) {
     return new DOMParser().parseFromString(html, "text/html");
+  }
+
+  function uniqueBy(items, getKey) {
+    const seen = new Set();
+    return (items || []).filter(item => {
+      const key = String(getKey(item));
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function extractGroupMenuCandidates(payload) {
+    if (!payload) return [];
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload.result)) return payload.result;
+    if (Array.isArray(payload.groups)) return payload.groups;
+    if (payload.result && Array.isArray(payload.result.groups)) return payload.result.groups;
+    return [];
+  }
+
+  function normalizeGroupMenuItems(items) {
+    return uniqueBy((items || []).map(item => {
+      const id = item && (item.group_id !== undefined ? item.group_id : item.id);
+      const name = cleanText(item && (item.name || item.label || item.title));
+      if (id === undefined || id === null || !name) return null;
+      return { id: String(id), name: name };
+    }).filter(Boolean), item => item.id);
+  }
+
+  function extractGroupsFromHtml(html) {
+    const doc = parseHtml(html);
+    const groups = [];
+    const options = doc.querySelectorAll(
+      '#group_select option, select[name="group"] option, select[id*="group"] option, select[class*="group"] option'
+    );
+
+    Array.from(options).forEach(option => {
+      const value = cleanText(option.value);
+      const name = cleanText(option.textContent);
+      if (!/^\d+$/.test(value) || !name) return;
+      groups.push({ id: value, name: name });
+    });
+
+    Array.from(doc.querySelectorAll('a[href*="group="]')).forEach(link => {
+      const href = link.getAttribute("href") || "";
+      const groupId = getParam("group", href);
+      const name = cleanText(link.textContent);
+      if (!groupId || !/^\d+$/.test(groupId) || !name) return;
+      groups.push({ id: groupId, name: name });
+    });
+
+    return uniqueBy(groups, item => item.id);
+  }
+
+  async function fetchFocusGroups() {
+    const menuUrl = buildGameUrl({ screen: "groups", mode: "overview", ajax: "load_group_menu" });
+
+    try {
+      const response = await fetch(menuUrl, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { "Accept": "application/json, text/html, */*; q=0.01" }
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const text = await response.text();
+      let groups = [];
+
+      try {
+        const payload = JSON.parse(text);
+        groups = normalizeGroupMenuItems(extractGroupMenuCandidates(payload));
+      } catch (err) {
+        groups = extractGroupsFromHtml(text);
+      }
+
+      if (groups.length) return groups.filter(group => group.id !== "0");
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " group menu endpoint failed; using overview fallback:", err);
+    }
+
+    const fallbackHtml = await fetchHtml(buildGameUrl({
+      screen: "overview_villages",
+      mode: "combined",
+      group: 0,
+      page: 0
+    }));
+    return extractGroupsFromHtml(fallbackHtml).filter(group => group.id !== "0");
+  }
+
+  async function populateFocusGroupSelect() {
+    if (!ui.focusGroupSelect) return;
+    ui.focusGroupSelect.disabled = true;
+
+    try {
+      const groups = await fetchFocusGroups();
+      state.focusGroups = groups;
+      const currentValue = ui.focusGroupSelect.value || "0";
+      ui.focusGroupSelect.innerHTML = "";
+
+      const allOption = document.createElement("option");
+      allOption.value = "0";
+      allOption.textContent = "All villages";
+      ui.focusGroupSelect.appendChild(allOption);
+
+      groups.forEach(group => {
+        const option = document.createElement("option");
+        option.value = group.id;
+        option.textContent = group.name;
+        ui.focusGroupSelect.appendChild(option);
+      });
+
+      if (Array.from(ui.focusGroupSelect.options).some(option => option.value === currentValue)) {
+        ui.focusGroupSelect.value = currentValue;
+      }
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not load groups:", err);
+      state.focusGroups = [];
+    } finally {
+      ui.focusGroupSelect.disabled = false;
+    }
   }
 
   function extractBalancedValue(source, startIndex) {
@@ -1140,6 +1307,9 @@
       const clayLevel = getBuildingLevelFromRow(row, "stone");
       const ironLevel = getBuildingLevelFromRow(row, "iron");
       const academyLevel = getBuildingLevelFromRow(row, "snob");
+      const barracksLevel = getBuildingLevelFromRow(row, "barracks");
+      const stableLevel = getBuildingLevelFromRow(row, "stable");
+      const workshopLevel = getBuildingLevelFromRow(row, "garage");
 
       villages.push({
         id: String(villageId),
@@ -1157,11 +1327,279 @@
         clayLevel: clayLevel,
         ironLevel: ironLevel,
         academyLevel: academyLevel,
+        barracksLevel: barracksLevel,
+        stableLevel: stableLevel,
+        workshopLevel: workshopLevel,
         pitsTotal: woodLevel + clayLevel + ironLevel
       });
     });
 
     return villages;
+  }
+
+  function extractAmTemplatesFromHtml(html) {
+    const templates = [];
+    const doc = parseHtml(html);
+    const scripts = Array.from(doc.querySelectorAll("script"));
+
+    scripts.forEach(script => {
+      const source = script.textContent || "";
+      const marker = "Accountmanager.initTroopManagement";
+      const markerIndex = source.indexOf(marker);
+      if (markerIndex < 0) return;
+      const callStart = source.indexOf("(", markerIndex);
+      const arrayStart = source.indexOf("[", callStart);
+      if (arrayStart < 0) return;
+
+      try {
+        const parsed = JSON.parse(extractBalancedValue(source, arrayStart));
+        if (Array.isArray(parsed)) parsed.forEach(template => templates.push(template));
+      } catch (err) {
+        console.warn(SCRIPT_NAME + " could not parse AM template JSON:", err);
+      }
+    });
+
+    if (!templates.length) {
+      Array.from(doc.querySelectorAll("#template_selection option[data-json]")).forEach(option => {
+        try {
+          templates.push(JSON.parse(option.getAttribute("data-json")));
+        } catch (err) {}
+      });
+    }
+
+    return uniqueBy(templates.filter(Boolean), template => template.id || template.template);
+  }
+
+  function getAmRowVillageId(row) {
+    const anchor = row.querySelector(".village_anchor[data-id]");
+    const edit = row.querySelector(".am_troops_edit[value]");
+    return cleanText((anchor && anchor.getAttribute("data-id")) || (edit && edit.value) || "");
+  }
+
+  function getAmCurrentCount(targetElement) {
+    const cell = targetElement && targetElement.closest ? targetElement.closest("td") : null;
+    if (!cell) return 0;
+
+    const candidates = Array.from(cell.querySelectorAll("span"))
+      .filter(span => span !== targetElement && !span.hasAttribute("data-field"))
+      .filter(span => /\d/.test(cleanText(span.textContent)));
+
+    if (!candidates.length) {
+      const firstLine = cleanText(cell.textContent).split(/\s+/)[0];
+      return parseNumber(firstLine);
+    }
+
+    return parseNumber(candidates[0].textContent);
+  }
+
+  function getTemplateNameForTargets(targets, templates) {
+    let best = null;
+    let bestDiff = Infinity;
+
+    (templates || []).forEach(template => {
+      let diff = 0;
+      AM_TROOP_UNITS.forEach(unit => {
+        diff += Math.abs((parseNumber(template[unit]) || 0) - (targets[unit] || 0));
+      });
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = template;
+      }
+    });
+
+    if (!best || bestDiff !== 0) return "";
+    return cleanText(best.template || best.name || ("Template " + best.id));
+  }
+
+  function extractAmTroopRowsFromHtml(html, templates) {
+    const doc = parseHtml(html);
+    const rows = [];
+
+    Array.from(doc.querySelectorAll("tr")).forEach(row => {
+      const villageId = getAmRowVillageId(row);
+      if (!villageId) return;
+
+      const anchor = row.querySelector(".village_anchor");
+      const coordData = parseCoord(anchor ? anchor.textContent : "");
+      const targetElements = Array.from(row.querySelectorAll("[data-field]"))
+        .filter(element => AM_TROOP_UNITS.indexOf(element.getAttribute("data-field")) >= 0);
+
+      if (!targetElements.length) return;
+
+      const targets = {};
+      const current = {};
+      AM_TROOP_UNITS.forEach(unit => {
+        targets[unit] = 0;
+        current[unit] = 0;
+      });
+
+      targetElements.forEach(element => {
+        const unit = element.getAttribute("data-field");
+        targets[unit] = parseNumber(element.textContent);
+        current[unit] = getAmCurrentCount(element);
+      });
+
+      const village = state.villagesById.get(String(villageId));
+      rows.push({
+        villageId: String(villageId),
+        coord: coordData ? coordData.coord : (village ? village.coord : ""),
+        targets: targets,
+        current: current,
+        templateName: getTemplateNameForTargets(targets, templates)
+      });
+    });
+
+    return uniqueBy(rows.filter(row => row.coord), row => row.villageId || row.coord);
+  }
+
+  async function fetchUnitBuildTimes() {
+    const response = await fetch("/interface.php?func=get_unit_info", {
+      method: "GET",
+      credentials: "same-origin",
+      headers: { "Accept": "application/xml, text/xml, */*; q=0.01" }
+    });
+
+    if (!response.ok) throw new Error("HTTP " + response.status + " while loading unit info");
+    const text = await response.text();
+    const doc = new DOMParser().parseFromString(text, "application/xml");
+    const result = {};
+
+    AM_TROOP_UNITS.forEach(unit => {
+      const node = doc.querySelector(unit + " > build_time");
+      const value = node ? parseFloat(cleanText(node.textContent).replace(",", ".")) : NaN;
+      if (!isNaN(value) && value > 0) result[unit] = value;
+    });
+
+    return result;
+  }
+
+  function buildAmRecruitmentDemand(rows, templates, unitBuildTimes) {
+    const demandMap = new Map();
+    let maxTotal = 0;
+    let timedRows = 0;
+    const hasTiming = Object.keys(unitBuildTimes || {}).length > 0;
+
+    (rows || []).forEach(row => {
+      const remaining = {};
+      const byBuilding = { barracks: 0, stable: 0, workshop: 0 };
+      let total = 0;
+      let remainingUnits = 0;
+
+      AM_TROOP_UNITS.forEach(unit => {
+        const target = Math.max(0, row.targets[unit] || 0);
+        const current = Math.max(0, row.current[unit] || 0);
+        const missing = Math.max(0, target - current);
+        const buildTime = Number((unitBuildTimes || {})[unit] || 1);
+        const work = missing * buildTime;
+        const building = AM_UNIT_BUILDING[unit];
+
+        remaining[unit] = missing;
+        remainingUnits += missing;
+        total += work;
+        if (building) byBuilding[building] += work;
+      });
+
+      if (total > 0 && hasTiming) timedRows += 1;
+      maxTotal = Math.max(maxTotal, total);
+
+      demandMap.set(row.coord, {
+        coord: row.coord,
+        villageId: row.villageId,
+        templateName: row.templateName,
+        targets: row.targets,
+        current: row.current,
+        remaining: remaining,
+        remainingUnits: remainingUnits,
+        byBuilding: byBuilding,
+        total: total,
+        baseHours: hasTiming ? total / 3600 : null
+      });
+    });
+
+    return {
+      map: demandMap,
+      maxTotal: maxTotal,
+      meta: {
+        rows: demandMap.size,
+        timedRows: timedRows,
+        timingSource: hasTiming ? "unit_info" : "unit_counts",
+        note: hasTiming
+          ? "Workload uses target minus current units multiplied by world unit build times. Queued units are not separately subtracted."
+          : "Unit build times were unavailable; demand falls back to remaining unit counts."
+      }
+    };
+  }
+
+  function extractAmPaginationUrls(html) {
+    const doc = parseHtml(html);
+    const urls = new Set();
+
+    Array.from(doc.querySelectorAll('a[href*="screen=am_troops"][href*="page="]')).forEach(link => {
+      const href = link.getAttribute("href");
+      if (!href) return;
+      try {
+        const url = new URL(href, window.location.origin);
+        url.searchParams.set("group", "0");
+        urls.add(url.pathname + url.search);
+      } catch (err) {}
+    });
+
+    return Array.from(urls);
+  }
+
+  async function loadAllAmTroopPages() {
+    const amUrl = buildGameUrl({ screen: "am_troops", group: 0, page: -1 });
+    const firstHtml = await fetchHtml(amUrl);
+    const expectedVillages = state.villages.length || (typeof game_data !== "undefined" && game_data.player ? parseInt(game_data.player.villages || 0, 10) : 0);
+    const templates = extractAmTemplatesFromHtml(firstHtml);
+    let rows = extractAmTroopRowsFromHtml(firstHtml, templates);
+    const pages = [firstHtml];
+
+    if (expectedVillages > 0 && rows.length < expectedVillages) {
+      const pageUrls = extractAmPaginationUrls(firstHtml)
+        .filter(url => getParam("page", url) !== "-1")
+        .slice(0, 50);
+
+      for (let i = 0; i < pageUrls.length; i++) {
+        try {
+          const html = await fetchHtml(pageUrls[i]);
+          pages.push(html);
+        } catch (err) {
+          console.warn(SCRIPT_NAME + " could not load AM page " + pageUrls[i] + ":", err);
+        }
+      }
+
+      rows = uniqueBy(
+        pages.flatMap(html => extractAmTroopRowsFromHtml(html, templates)),
+        row => row.villageId || row.coord
+      );
+    }
+
+    return { amUrl: amUrl, templates: templates, rows: rows, pageCount: pages.length };
+  }
+
+  async function loadAmRecruitmentDemand() {
+    const results = await Promise.allSettled([loadAllAmTroopPages(), fetchUnitBuildTimes()]);
+
+    if (results[0].status !== "fulfilled") {
+      throw results[0].reason || new Error("Could not load Account Manager troop data.");
+    }
+
+    const amData = results[0].value;
+    const templates = amData.templates;
+    const rows = amData.rows;
+    const unitBuildTimes = results[1].status === "fulfilled" ? results[1].value : {};
+    const demand = buildAmRecruitmentDemand(rows, templates, unitBuildTimes);
+    demand.meta.pageCount = amData.pageCount;
+
+    state.amTemplates = templates;
+    state.unitBuildTimes = unitBuildTimes;
+    state.amRecruitmentDemandByCoord = demand.map;
+    state.amRecruitmentDemandMax = demand.maxTotal;
+    state.amRecruitmentMeta = demand.meta;
+    state.recruitmentDemandActive = demand.map.size > 0 && demand.maxTotal > 0;
+
+    return { amUrl: amData.amUrl, templates: templates, rows: rows, demand: demand };
   }
 
   function extractRangeFromElement(root) {
@@ -1547,12 +1985,109 @@
     return getVillageWeight(village, weighting);
   }
 
+  function getRecruitmentDemandForVillage(village) {
+    return state.amRecruitmentDemandByCoord && state.amRecruitmentDemandByCoord.get(village.coord);
+  }
+
   function getScoringVillageWeight(village, goal, weighting, optimizationContext) {
     if (goal === "noble" && state.targetCoords && state.targetCoords.size) {
       return state.targetCoords.has(village.coord) ? 1 : 0;
     }
 
-    return getCachedVillageWeight(village, weighting, optimizationContext);
+    if (goal === "offense" && state.focusGroupId !== "0") {
+      if (!state.focusCoords || !state.focusCoords.has(village.coord)) return 0;
+    }
+
+    let weight = getCachedVillageWeight(village, weighting, optimizationContext);
+
+    if (goal === "recruitment" && state.recruitmentDemandActive) {
+      const demand = getRecruitmentDemandForVillage(village);
+      if (!demand || demand.total <= 0 || state.amRecruitmentDemandMax <= 0) return 0;
+      const urgency = Math.sqrt(Math.min(1, demand.total / state.amRecruitmentDemandMax));
+      weight *= 0.35 + 0.65 * urgency;
+    }
+
+    return weight;
+  }
+
+  function getScoringBucketKey(goal, statKey) {
+    const key = String(statKey || "");
+
+    if (goal === "offense") {
+      const offenseUnits = ["axe", "light", "marcher", "heavy", "ram", "catapult"];
+      for (let i = 0; i < offenseUnits.length; i++) {
+        if (key.indexOf(offenseUnits[i] + "_") === 0) return "offense:" + offenseUnits[i];
+      }
+    }
+
+    if (goal === "recruitment") {
+      if (key.indexOf("barracks_") === 0) return "recruitment:barracks";
+      if (key.indexOf("stable_") === 0) return "recruitment:stable";
+      if (key.indexOf("workshop_") === 0) return "recruitment:workshop";
+      if (key.indexOf("academy_") === 0) return "recruitment:academy";
+    }
+
+    return key;
+  }
+
+  function getRecruitmentBuildingForStat(statKey) {
+    const key = String(statKey || "");
+    if (key.indexOf("barracks_") === 0) return "barracks";
+    if (key.indexOf("stable_") === 0) return "stable";
+    if (key.indexOf("workshop_") === 0) return "workshop";
+    if (key.indexOf("academy_") === 0) return "academy";
+    return "";
+  }
+
+  function getDynamicStatWeight(village, goal, statKey, baseWeight) {
+    if (goal !== "recruitment" || !state.recruitmentDemandActive) return baseWeight;
+
+    const building = getRecruitmentBuildingForStat(statKey);
+    if (!building || building === "academy") return 0;
+
+    const demand = getRecruitmentDemandForVillage(village);
+    if (!demand || demand.total <= 0) return 0;
+
+    const buildingWork = Number(demand.byBuilding[building] || 0);
+    if (buildingWork <= 0) return 0;
+
+    const share = Math.min(1, buildingWork / demand.total);
+    const demandMultiplier = 0.40 + 1.20 * share;
+    return baseWeight * demandMultiplier;
+  }
+
+  function buildScoringBucketTotals(bonuses, goal, weights) {
+    const totals = {};
+    Object.keys(weights || {}).forEach(key => {
+      const value = Math.max(0, Number((bonuses || {})[key] || 0));
+      if (!value) return;
+      const bucket = getScoringBucketKey(goal, key);
+      totals[bucket] = (totals[bucket] || 0) + value;
+    });
+    return totals;
+  }
+
+  function getBalancedUtility(value, benefitCap) {
+    const cap = Math.max(1, Number(benefitCap || DEFAULT_BENEFIT_CAP));
+    const normalized = Math.max(0, Number(value || 0)) / cap;
+    return cap * Math.pow(normalized, BALANCE_POWER);
+  }
+
+  function getBalancedMarginalGain(currentBucket, effectiveGain, benefitCap, goal) {
+    if (goal !== "offense" && goal !== "recruitment") return effectiveGain;
+    if (effectiveGain <= 0) return 0;
+    return Math.max(0, getBalancedUtility(currentBucket + effectiveGain, benefitCap) - getBalancedUtility(currentBucket, benefitCap));
+  }
+
+  function isVillageIncludedInGoalImpact(village, goal) {
+    if (!village) return false;
+    if (goal === "noble" && state.targetCoords && state.targetCoords.size) return state.targetCoords.has(village.coord);
+    if (goal === "offense" && state.focusGroupId !== "0") return state.focusCoords && state.focusCoords.has(village.coord);
+    if (goal === "recruitment" && state.recruitmentDemandActive) {
+      const demand = getRecruitmentDemandForVillage(village);
+      return !!(demand && demand.total > 0);
+    }
+    return true;
   }
 
   function applyRelicToBonuses(relic, center, bonusMap, goalAgnostic, optimizationContext) {
@@ -1608,6 +2143,7 @@
     let score = 0;
     let rawScore = 0;
     let wastedScore = 0;
+    let scoredCoverageCount = 0;
     const scoreByStat = {};
 
     if (!relevantStats.length || !covered.length) {
@@ -1616,6 +2152,7 @@
         rawScore: 0,
         wastedScore: 0,
         covered: covered,
+        scoredCoverageCount: 0,
         relevantStats: relevantStats,
         scoreByStat: scoreByStat
       };
@@ -1623,26 +2160,33 @@
 
     covered.forEach(village => {
       const villageWeight = getScoringVillageWeight(village, goal, weighting, optimizationContext);
+      if (villageWeight <= 0) return;
+
+      scoredCoverageCount += 1;
       const bonuses = bonusMap.get(village.coord) || {};
+      const bucketTotals = buildScoringBucketTotals(bonuses, goal, weights);
 
       relevantStats.forEach(stat => {
-        const statWeight = weights[stat.key] || 0;
-
+        const baseWeight = weights[stat.key] || 0;
+        const statWeight = getDynamicStatWeight(village, goal, stat.key, baseWeight);
         if (!statWeight) return;
 
         const current = bonuses[stat.key] || 0;
         const capped = Math.min(benefitCap, current + stat.value);
         const effectiveGain = Math.max(0, capped - current);
         const wastedGain = Math.max(0, stat.value - effectiveGain);
+        const bucketKey = getScoringBucketKey(goal, stat.key);
+        const bucketCurrent = bucketTotals[bucketKey] || 0;
+        const marginalGain = getBalancedMarginalGain(bucketCurrent, effectiveGain, benefitCap, goal);
 
-        const statScore = effectiveGain * statWeight * villageWeight;
+        const statScore = marginalGain * statWeight * villageWeight;
         const statRawScore = stat.value * statWeight * villageWeight;
         const statWastedScore = wastedGain * statWeight * villageWeight;
 
         score += statScore;
         rawScore += statRawScore;
         wastedScore += statWastedScore;
-
+        bucketTotals[bucketKey] = bucketCurrent + effectiveGain;
         scoreByStat[stat.key] = (scoreByStat[stat.key] || 0) + statScore;
       });
     });
@@ -1652,6 +2196,7 @@
       rawScore: rawScore,
       wastedScore: wastedScore,
       covered: covered,
+      scoredCoverageCount: scoredCoverageCount,
       relevantStats: relevantStats,
       scoreByStat: scoreByStat
     };
@@ -1739,6 +2284,10 @@
     if (candidate.wastedScore < best.wastedScore - EPSILON) return true;
     if (candidate.wastedScore > best.wastedScore + EPSILON) return false;
 
+    if ((candidate.scoredCoverageCount || 0) !== (best.scoredCoverageCount || 0)) {
+      return (candidate.scoredCoverageCount || 0) > (best.scoredCoverageCount || 0);
+    }
+
     return candidate.covered.length > best.covered.length;
   }
 
@@ -1751,6 +2300,7 @@
       rawScore: scored.rawScore,
       wastedScore: scored.wastedScore,
       covered: scored.covered,
+      scoredCoverageCount: scored.scoredCoverageCount || 0,
       relevantStats: scored.relevantStats,
       scoreByStat: scored.scoreByStat
     };
@@ -1898,6 +2448,44 @@
     return improvePlanWithLocalSearch(plan, availableRelics, baseBonuses, goal, weighting, optimizationContext);
   }
 
+  async function loadFocusGroupForScoring(goal) {
+    state.focusCoords = new Set();
+    state.focusGroupId = "0";
+    state.focusGroupName = "All villages";
+
+    if (goal !== "offense" || !ui.focusGroupSelect) return null;
+
+    const groupId = String(ui.focusGroupSelect.value || "0");
+    state.focusGroupId = groupId;
+    const selectedOption = ui.focusGroupSelect.options[ui.focusGroupSelect.selectedIndex];
+    state.focusGroupName = cleanText(selectedOption ? selectedOption.textContent : "All villages") || "All villages";
+
+    if (groupId === "0") {
+      state.villages.forEach(village => state.focusCoords.add(village.coord));
+      return null;
+    }
+
+    const url = getFocusGroupVillageUrl(groupId);
+    const html = await fetchHtml(url);
+    const focusVillages = extractVillagesFromProductionHtml(html);
+    focusVillages.forEach(village => state.focusCoords.add(village.coord));
+
+    if (!state.focusCoords.size) {
+      throw new Error("Focus Group '" + state.focusGroupName + "' loaded 0 villages. Try reloading the group list or selecting All villages.");
+    }
+
+    return url;
+  }
+
+  function resetRecruitmentDemandState() {
+    state.recruitmentDemandActive = false;
+    state.amTemplates = [];
+    state.amRecruitmentDemandByCoord = new Map();
+    state.amRecruitmentDemandMax = 0;
+    state.amRecruitmentMeta = { rows: 0, timedRows: 0, timingSource: "none", note: "" };
+    state.unitBuildTimes = {};
+  }
+
   async function loadAllData(goal) {
 	  const villageUrl = getVillageDataUrl(goal);
 
@@ -1916,12 +2504,17 @@
       mode: "help"
     });
 
+    state.recruitmentDemandRequested = goal === "recruitment" && !!(ui.recruitmentDemandCheckbox && ui.recruitmentDemandCheckbox.checked);
+    resetRecruitmentDemandState();
+
 	  if (goal === "offense") {
-		setStatus("Loading village coordinates, inventory and overview data...", "warn");
+		setStatus("Loading ALL villages for placement, relic data and selected Focus Group...", "warn");
 	  } else if (goal === "production") {
-    setStatus("Loading building levels, inventory and overview data...", "warn");
-	  } else {
-		setStatus("Loading production, inventory and overview data...", "warn");
+      setStatus("Loading all village building levels, inventory and overview data...", "warn");
+	  } else if (state.recruitmentDemandRequested) {
+      setStatus("Loading all villages, relic data and Account Manager troop demand...", "warn");
+    } else {
+		setStatus("Loading all villages, inventory and overview data...", "warn");
 	  }
 
 	  const responses = await Promise.all([
@@ -1935,10 +2528,10 @@
 	  rebuildVillageIndexes();
 
 	  state.inventoryRelics = extractInventoryRelicsFromHtml(responses[1]);
-      state.placedRelics = getPlacedRelicsFromBestSource(
-        state.inventoryRelics,
-        extractPlacedRelicsFromOverviewHtml(responses[2])
-      );
+    state.placedRelics = getPlacedRelicsFromBestSource(
+      state.inventoryRelics,
+      extractPlacedRelicsFromOverviewHtml(responses[2])
+    );
 		state.unlockedRelicSlots = countUnlockedRelicSlotsFromOverviewHtml(responses[2]);
     applyWorldRelicSettings(detectWorldRelicSettings({
       inventoryRelics: state.inventoryRelics,
@@ -1948,17 +2541,36 @@
     syncBenefitCapInputFromState();
     applyBenefitCapInputToState();
 
-	  console.log(SCRIPT_NAME + " villages:", state.villages);
+    const focusGroupUrl = await loadFocusGroupForScoring(goal);
+    let amData = null;
+
+    if (state.recruitmentDemandRequested) {
+      try {
+        amData = await loadAmRecruitmentDemand();
+        if (!state.recruitmentDemandActive) {
+          state.amRecruitmentMeta.note = "AM demand was requested, but no remaining template workload could be parsed. Balanced recruitment scoring is used instead.";
+        }
+      } catch (err) {
+        console.warn(SCRIPT_NAME + " could not load AM recruitment demand:", err);
+        resetRecruitmentDemandState();
+        state.amRecruitmentMeta.note = "AM demand could not be loaded; balanced recruitment scoring is used instead. " + (err.message || String(err));
+      }
+    }
+
+	  console.log(SCRIPT_NAME + " villages (placement universe):", state.villages);
+    console.log(SCRIPT_NAME + " focus group:", { id: state.focusGroupId, name: state.focusGroupName, coords: Array.from(state.focusCoords) });
 	  console.log(SCRIPT_NAME + " inventory relics:", state.inventoryRelics);
 	  console.log(SCRIPT_NAME + " placed relics:", state.placedRelics);
-      console.log(SCRIPT_NAME + " placed overview relic ids:", Array.from(getPlacedOverviewRelicIds()));
+    console.log(SCRIPT_NAME + " AM recruitment demand:", { active: state.recruitmentDemandActive, meta: state.amRecruitmentMeta, data: Array.from(state.amRecruitmentDemandByCoord.entries()) });
     console.log(SCRIPT_NAME + " world relic settings:", state.worldRelicSettings);
 
 	  return {
 		villageUrl: villageUrl,
 		inventoryUrl: inventoryUrl,
 		overviewUrl: overviewUrl,
-        helpUrl: helpUrl
+      helpUrl: helpUrl,
+      focusGroupUrl: focusGroupUrl,
+      amUrl: amData && amData.amUrl
 	  };
 	}
 
@@ -1974,6 +2586,7 @@
       const goal = ui.goalSelect.value;
 			const mode = ui.modeSelect.value;
 			const weighting = ui.weightSelect.value;
+      state.lastGoal = goal;
 
       state.targetCoords = new Set(parseTargetCoordsInput(ui.nobleTargetInput ? ui.nobleTargetInput.value : ""));
       if (goal === "noble" && state.targetCoords.size < 1) {
@@ -1995,6 +2608,15 @@
         urls: urls
       });
 
+      const focusStatus = goal === "offense"
+        ? " Focus: " + state.focusGroupName + " (" + (state.focusGroupId === "0" ? state.villages.length : state.focusCoords.size) + " scoring villages; placement can use all villages)."
+        : "";
+      const amStatus = goal === "recruitment" && state.recruitmentDemandRequested
+        ? (state.recruitmentDemandActive
+            ? " AM demand: active for " + state.amRecruitmentMeta.rows + " village(s)."
+            : " AM demand: unavailable/empty; balanced fallback used.")
+        : "";
+
       setStatus(
         "Loaded " +
           state.villages.length +
@@ -2008,7 +2630,7 @@
           formatSettingNumber(getBenefitCap()) +
           "% (" +
           getBenefitCapSourceLabel() +
-          ").",
+          ")." + focusStatus + amStatus,
         "success"
       );
     } catch (err) {
@@ -2336,6 +2958,8 @@ function buildVillageImpactSummary(plan) {
 
   (plan || []).forEach(item => {
     item.covered.forEach(village => {
+      if (!isVillageIncludedInGoalImpact(village, state.lastGoal)) return;
+
       if (!impactMap.has(village.coord)) {
         impactMap.set(village.coord, {
           village: village,
@@ -2488,6 +3112,22 @@ function buildVillageImpactSummary(plan) {
     contextBar.appendChild(createUiElement("span", "twrp-context-pill", getWeightingLabel(context.weighting)));
     contextBar.appendChild(createUiElement("span", "twrp-context-pill", getBenefitCapPillText()));
 
+    if (context.goal === "offense") {
+      contextBar.appendChild(createUiElement(
+        "span",
+        "twrp-context-pill",
+        "Focus: " + state.focusGroupName + " (" + (state.focusGroupId === "0" ? state.villages.length : state.focusCoords.size) + ")"
+      ));
+    }
+
+    if (context.goal === "recruitment" && state.recruitmentDemandRequested) {
+      contextBar.appendChild(createUiElement(
+        "span",
+        "twrp-context-pill",
+        state.recruitmentDemandActive ? ("AM demand: " + state.amRecruitmentMeta.rows + " villages") : "AM demand: fallback"
+      ));
+    }
+
     ui.results.appendChild(summary);
     ui.results.appendChild(contextBar);
   }
@@ -2512,7 +3152,10 @@ function buildVillageImpactSummary(plan) {
     details.className = "twrp-coverage-details";
 
     const summary = document.createElement("summary");
-    summary.textContent = item.covered.length + " covered village(s)";
+    summary.textContent = item.covered.length + " covered village(s)" +
+      (item.scoredCoverageCount !== undefined && item.scoredCoverageCount !== item.covered.length
+        ? " / " + item.scoredCoverageCount + " scoring"
+        : "");
     details.appendChild(summary);
 
     const list = createUiElement("div", "twrp-covered-list");
@@ -2555,7 +3198,11 @@ function buildVillageImpactSummary(plan) {
 
       const scoreRow = createUiElement("div", "twrp-score-row");
       scoreRow.appendChild(createMetricCard("Score", formatScore(item.score), "value"));
-      scoreRow.appendChild(createMetricCard("Coverage", item.covered.length, "villages"));
+      if (state.lastGoal === "offense" && state.focusGroupId !== "0") {
+        scoreRow.appendChild(createMetricCard("Focus", item.scoredCoverageCount || 0, "of " + item.covered.length + " covered"));
+      } else {
+        scoreRow.appendChild(createMetricCard("Coverage", item.covered.length, "villages"));
+      }
       scoreRow.appendChild(createMetricCard("Waste", formatScore(item.wastedScore), "lost value"));
       card.appendChild(scoreRow);
 
@@ -2658,9 +3305,75 @@ function buildVillageImpactSummary(plan) {
     details.appendChild(summary);
 
     const body = createUiElement("div", "twrp-muted-block");
-    body.textContent = "Score estimates the marginal value of a placement after the " + formatSettingNumber(getBenefitCap()) + "% cap per village/stat. Waste estimates value lost because covered villages are already capped or near capped.";
+    const scoringParts = [
+      "Score estimates marginal value after the " + formatSettingNumber(getBenefitCap()) + "% cap per village/stat.",
+      "Offense and Recruitment use diminishing returns by unit/building family, so balanced useful bonuses can beat stacking one family to the cap.",
+      "Waste estimates value lost because scoring villages are already capped or near capped."
+    ];
+
+    if (state.lastGoal === "offense" && state.focusGroupId !== "0") {
+      scoringParts.push("Only villages in Focus Group '" + state.focusGroupName + "' contribute score. Relics may still be placed on any owned village.");
+    }
+
+    if (state.lastGoal === "recruitment" && state.recruitmentDemandRequested) {
+      scoringParts.push(state.recruitmentDemandActive
+        ? "AM demand mode weights Barracks/Stable/Workshop stats by remaining target-current training workload. " + state.amRecruitmentMeta.note
+        : "AM demand mode was requested but could not provide usable demand data, so normal balanced recruitment scoring was used.");
+    }
+
+    body.textContent = scoringParts.join(" ");
     details.appendChild(body);
 
+    ui.results.appendChild(details);
+  }
+
+  function formatBaseWorkloadHours(hours) {
+    if (hours === null || hours === undefined || isNaN(hours)) return "n/a";
+    if (hours < 24) return formatPercentCompact(hours) + "h";
+    return formatPercentCompact(hours / 24) + "d";
+  }
+
+  function renderRecruitmentDemandPreview() {
+    if (state.lastGoal !== "recruitment" || !state.recruitmentDemandRequested || !state.recruitmentDemandActive) return;
+
+    const rows = Array.from(state.amRecruitmentDemandByCoord.values())
+      .filter(item => item.total > 0)
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 12);
+
+    const details = document.createElement("details");
+    details.className = "twrp-details twrp-scoring-info";
+    const summary = document.createElement("summary");
+    summary.textContent = "AM recruitment demand preview (top " + rows.length + ")";
+    details.appendChild(summary);
+
+    const tableWrap = createUiElement("div", "twrp-table-wrap");
+    const table = createUiElement("table", "twrp-table twrp-compact-table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    ["Village", "Template", "Remaining", "Barracks", "Stable", "Workshop"].forEach(label => {
+      const th = document.createElement("th");
+      th.textContent = label;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    rows.forEach(item => {
+      const row = document.createElement("tr");
+      appendTableCell(row, item.coord);
+      appendTableCell(row, item.templateName || "-");
+      appendTableCell(row, item.baseHours !== null ? formatBaseWorkloadHours(item.baseHours) : (item.remainingUnits + " units"));
+      const total = item.total || 1;
+      appendTableCell(row, Math.round((item.byBuilding.barracks || 0) / total * 100) + "%");
+      appendTableCell(row, Math.round((item.byBuilding.stable || 0) / total * 100) + "%");
+      appendTableCell(row, Math.round((item.byBuilding.workshop || 0) / total * 100) + "%");
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+    details.appendChild(tableWrap);
     ui.results.appendChild(details);
   }
 
@@ -2679,6 +3392,7 @@ function buildVillageImpactSummary(plan) {
 
     renderPlacementCards();
     renderVillageImpactSummary();
+    renderRecruitmentDemandPreview();
     renderScoringInfo();
   }
 
@@ -2873,6 +3587,32 @@ function buildVillageImpactSummary(plan) {
         margin-bottom: 8px;
       }
 
+      .twrp-wide-option {
+        grid-column: span 2;
+        padding: 6px;
+        border: 1px solid #bd9c5a;
+        border-radius: 4px;
+        background: rgba(255, 250, 240, 0.55);
+      }
+
+      .twrp-checkline {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+        line-height: 1.35;
+      }
+
+      .twrp-checkline input {
+        margin-top: 2px;
+      }
+
+      .twrp-muted {
+        display: block;
+        margin-top: 4px;
+        opacity: 0.78;
+        line-height: 1.35;
+      }
+
       .twrp-label {
         display: block;
         font-weight: bold;
@@ -3009,6 +3749,10 @@ function buildVillageImpactSummary(plan) {
 
         .twrp-grid {
           grid-template-columns: 1fr;
+        }
+
+        .twrp-wide-option {
+          grid-column: span 1;
         }
       }
 
@@ -3526,6 +4270,12 @@ function buildVillageImpactSummary(plan) {
       if (ui.nobleTargetWrap) {
         ui.nobleTargetWrap.style.display = goalSelect.value === "noble" ? "block" : "none";
       }
+      if (ui.focusGroupWrap) {
+        ui.focusGroupWrap.style.display = goalSelect.value === "offense" ? "block" : "none";
+      }
+      if (ui.recruitmentDemandWrap) {
+        ui.recruitmentDemandWrap.style.display = goalSelect.value === "recruitment" ? "block" : "none";
+      }
     }
 
 		goalSelect.addEventListener("change", syncGoalDefaults);
@@ -3594,12 +4344,44 @@ function buildVillageImpactSummary(plan) {
     nobleTargetWrap.appendChild(nobleTargetInput);
     nobleTargetWrap.appendChild(nobleTargetHelp);
 
+    const focusGroupWrap = document.createElement("div");
+    focusGroupWrap.className = "twrp-wide-option";
+    focusGroupWrap.style.display = "none";
+    const focusGroupLabel = document.createElement("label");
+    focusGroupLabel.className = "twrp-label";
+    focusGroupLabel.textContent = "Focus Group";
+    const focusGroupSelect = document.createElement("select");
+    focusGroupSelect.className = "twrp-select";
+    const focusAll = document.createElement("option");
+    focusAll.value = "0";
+    focusAll.textContent = "All villages";
+    focusGroupSelect.appendChild(focusAll);
+    const focusGroupHelp = createUiElement("small", "twrp-muted", "Only villages in this group contribute Offensive-strength score. Relics can still be placed on ANY owned village if their range reaches the focus group.");
+    focusGroupWrap.appendChild(focusGroupLabel);
+    focusGroupWrap.appendChild(focusGroupSelect);
+    focusGroupWrap.appendChild(focusGroupHelp);
+
+    const recruitmentDemandWrap = document.createElement("div");
+    recruitmentDemandWrap.className = "twrp-wide-option";
+    recruitmentDemandWrap.style.display = "none";
+    const demandLine = document.createElement("label");
+    demandLine.className = "twrp-checkline";
+    const recruitmentDemandCheckbox = document.createElement("input");
+    recruitmentDemandCheckbox.type = "checkbox";
+    const demandText = document.createElement("span");
+    demandText.innerHTML = "<strong>Use Account Manager troop demand</strong><br><span class='twrp-muted'>Compare AM troop targets with current units and weight Barracks/Stable/Workshop relics by remaining training workload. Optional; no game actions are performed.</span>";
+    demandLine.appendChild(recruitmentDemandCheckbox);
+    demandLine.appendChild(demandText);
+    recruitmentDemandWrap.appendChild(demandLine);
+
     grid.appendChild(goalWrap);
     grid.appendChild(modeWrap);
     grid.appendChild(weightWrap);
     grid.appendChild(countWrap);
     grid.appendChild(capWrap);
     grid.appendChild(nobleTargetWrap);
+    grid.appendChild(focusGroupWrap);
+    grid.appendChild(recruitmentDemandWrap);
 
     const buttons = document.createElement("div");
     buttons.className = "twrp-buttons";
@@ -3648,6 +4430,10 @@ function buildVillageImpactSummary(plan) {
     ui.capInputWasEdited = false;
     ui.nobleTargetWrap = nobleTargetWrap;
     ui.nobleTargetInput = nobleTargetInput;
+    ui.focusGroupWrap = focusGroupWrap;
+    ui.focusGroupSelect = focusGroupSelect;
+    ui.recruitmentDemandWrap = recruitmentDemandWrap;
+    ui.recruitmentDemandCheckbox = recruitmentDemandCheckbox;
 		ui.loadButton = loadButton;
 		ui.copyButton = copyButton;
 		ui.status = status;
@@ -3658,6 +4444,7 @@ function buildVillageImpactSummary(plan) {
 		});
 
     syncGoalDefaults();
+    populateFocusGroupSelect();
 		makeDraggable(box, header);
   }
 
