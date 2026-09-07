@@ -73,11 +73,24 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Balancer";
-  const SCRIPT_VERSION = "1.0.4";
+  const SCRIPT_VERSION = "1.0.5";
   const BOX_ID = "twactics-resource-balancer";
   const STYLE_ID = "twactics-resource-balancer-style";
   const DATA_VERSION = 1;
   const SETTINGS_STORAGE_KEY = "twacticsResourceBalancerSettings";
+  const REQUESTER_STARTUP_GUARD_KEY = "__twacticsResourceRequesterStartupGuardUntil";
+
+  const requesterGuardUntil = Number(window[REQUESTER_STARTUP_GUARD_KEY] || 0);
+  if (requesterGuardUntil > Date.now() && document.getElementById("twactics-resource-requester")) {
+    console.warn("[Twactics Balancer Debug] launch suppressed because Resource Requester is in its startup guard", {
+      remainingMs: requesterGuardUntil - Date.now()
+    });
+    return;
+  }
+
+  if (requesterGuardUntil && requesterGuardUntil <= Date.now()) {
+    try { delete window[REQUESTER_STARTUP_GUARD_KEY]; } catch (err) {}
+  }
 
   // Only close the specifically known companion Twactics tool. No global window scan,
   // no shared activation event, and nothing here can launch another script.
