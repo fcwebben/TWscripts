@@ -77,11 +77,14 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.6";
+  const SCRIPT_VERSION = "v1.0.7";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
   const DATA_VERSION = 1;
+  const REQUESTER_STARTUP_GUARD_KEY = "__twacticsResourceRequesterStartupGuardUntil";
+  const REQUESTER_STARTUP_GUARD_MS = 2000;
+  const DEBUG_PREFIX = "[Twactics Requester Debug]";
 
   const DEFAULT_SETTINGS = {
     reserveMerchants: 0,
@@ -115,21 +118,44 @@
   const ui = {};
   let lastRequestEnterAt = 0;
 
-  // Only close the specifically known companion Twactics tool. No global window scan,
-  // no shared activation event, and nothing here can launch another script.
-  if (window.twacticsResourceBalancer && typeof window.twacticsResourceBalancer.close === "function") {
-    try {
-      window.twacticsResourceBalancer.close();
-    } catch (err) {
-      console.warn(SCRIPT_NAME + " could not close Resource Balancer:", err);
+  // Short startup guard: if the Script Library/browser accidentally fires the Balancer
+  // immediately after Requester, the paired Balancer build will suppress that duplicate launch.
+  window[REQUESTER_STARTUP_GUARD_KEY] = Date.now() + REQUESTER_STARTUP_GUARD_MS;
+
+  function closeBalancerCompanion(reason) {
+    let found = false;
+
+    if (window.twacticsResourceBalancer && typeof window.twacticsResourceBalancer.close === "function") {
+      found = true;
+      try {
+        window.twacticsResourceBalancer.close();
+      } catch (err) {
+        console.warn(DEBUG_PREFIX, "could not close Resource Balancer", err);
+      }
     }
-  } else {
+
     const staleBalancerBox = document.getElementById("twactics-resource-balancer");
-    if (staleBalancerBox) staleBalancerBox.remove();
+    if (staleBalancerBox) {
+      found = true;
+      staleBalancerBox.remove();
+    }
+
     const staleBalancerStyle = document.getElementById("twactics-resource-balancer-style");
     if (staleBalancerStyle) staleBalancerStyle.remove();
-    if (window.twacticsResourceBalancerLoaded) window.twacticsResourceBalancerLoaded = false;
+
+    if (window.twacticsResourceBalancerLoaded) {
+      found = true;
+      window.twacticsResourceBalancerLoaded = false;
+    }
+
+    if (found) {
+      console.warn(DEBUG_PREFIX, "closed/suppressed Resource Balancer", { reason: reason || "requester-start" });
+    } else {
+      console.log(DEBUG_PREFIX, "no Resource Balancer instance found", { reason: reason || "requester-start" });
+    }
   }
+
+  closeBalancerCompanion("requester-start");
 
   if (window.twacticsResourceRequester && typeof window.twacticsResourceRequester.close === "function") {
     window.twacticsResourceRequester.close();
@@ -149,6 +175,14 @@
       .replace(/\r/g, "")
       .replace(/\s+/g, " ")
       .trim();
+  }
+
+  function debugLog(label, payload) {
+    if (payload === undefined) {
+      console.log(DEBUG_PREFIX, label);
+      return;
+    }
+    console.log(DEBUG_PREFIX, label, payload);
   }
 
   function escapeHtml(value) {
@@ -663,6 +697,22 @@
       });
     });
 
+    const productionRowsForDebug = Array.from(map.values()).map(village => ({
+      coord: village.coord,
+      id: village.id,
+      wood: village.wood,
+      clay: village.clay,
+      iron: village.iron,
+      merchants: village.merchants,
+      merchantsTotal: village.merchantsTotal,
+      warehouse: village.warehouse
+    }));
+
+    debugLog("production data loaded", { count: map.size, merchantCapacity: getMerchantCapacity() });
+    if (productionRowsForDebug.length) {
+      console.table(productionRowsForDebug.slice(0, 100));
+    }
+
     return map;
   }
 
@@ -804,7 +854,7 @@
       const reserveAmount = Math.floor((origin.warehouse || 0) * (state.settings.reserveWarehousePercent / 100));
       const merchantsAvailable = Math.max(0, (origin.merchants || 0) - state.settings.reserveMerchants);
 
-      originState.set(originCoord, {
+      const availability = {
         coord: origin.coord,
         id: origin.id,
         name: origin.name,
@@ -812,6 +862,17 @@
         clay: Math.max(0, origin.clay - reserveAmount),
         iron: Math.max(0, origin.iron - reserveAmount),
         merchantCapacityLeft: merchantsAvailable * getMerchantCapacity()
+      };
+
+      originState.set(originCoord, availability);
+      debugLog("origin availability", {
+        coord: originCoord,
+        parsed: { wood: origin.wood, clay: origin.clay, iron: origin.iron, merchants: origin.merchants, merchantsTotal: origin.merchantsTotal, warehouse: origin.warehouse },
+        reserveWarehousePercent: state.settings.reserveWarehousePercent,
+        reserveAmount: reserveAmount,
+        reserveMerchants: state.settings.reserveMerchants,
+        merchantCapacity: getMerchantCapacity(),
+        availableAfterReserve: availability
       });
     }
 
@@ -855,20 +916,43 @@
     const originState = new Map();
     const plan = [];
 
+    debugLog("plan input", {
+      requestedOrigins: coords.origins,
+      ownedOrigins: originCoords,
+      requestedTargets: coords.targets,
+      ownedTargets: targetCoords,
+      settings: Object.assign({}, state.settings),
+      maxDistanceMeaning: state.settings.maxDistance <= 0 ? "unlimited" : state.settings.maxDistance
+    });
+
     targetCoords.forEach(targetCoord => {
       const target = state.production.get(targetCoord);
       const need = getDesiredNeedForTarget(tab, targetCoord, plannedByTarget);
       const originalNeed = Object.assign({}, need);
       const requests = [];
 
-      const origins = originCoords
+      const originCandidates = originCoords
         .filter(originCoord => originCoord !== targetCoord)
         .map(originCoord => ({
           coord: originCoord,
           distance: calcDistance(originCoord, targetCoord)
-        }))
-        .filter(item => item.distance <= state.settings.maxDistance)
+        }));
+
+      // 0 means unlimited, matching Resource Balancer semantics.
+      const origins = originCandidates
+        .filter(item => state.settings.maxDistance <= 0 || item.distance <= state.settings.maxDistance)
         .sort((a, b) => a.distance - b.distance);
+
+      debugLog("origin distance filter", {
+        target: targetCoord,
+        maxDistance: state.settings.maxDistance,
+        maxDistanceMeaning: state.settings.maxDistance <= 0 ? "unlimited" : state.settings.maxDistance,
+        candidates: originCandidates.slice(0, 100).map(item => ({
+          coord: item.coord,
+          distance: Math.round(item.distance * 100) / 100,
+          accepted: state.settings.maxDistance <= 0 || item.distance <= state.settings.maxDistance
+        }))
+      });
 
       origins.forEach(originItem => {
         if (totalAmounts(need) <= 0) return;
@@ -911,7 +995,7 @@
 
       plannedByTarget.set(targetCoord, planned);
 
-      plan.push({
+      const planRow = {
         targetCoord: targetCoord,
         targetId: target.id,
         targetName: target.name,
@@ -922,7 +1006,10 @@
         requestCount: requests.length,
         maxDistance: requests.length ? Math.max.apply(null, requests.map(item => item.distance)) : 0,
         total: totalAmounts(planned)
-      });
+      };
+
+      plan.push(planRow);
+      debugLog("target plan result", planRow);
     });
 
     return {
@@ -1106,16 +1193,22 @@
     style.id = STYLE_ID;
     style.textContent = `
       #${BOX_ID} {
-        position: relative;
-        display: block;
-        width: 100%;
+        position: fixed;
+        top: 72px;
+        right: 28px;
+        width: 920px;
+        max-width: 96vw;
+        max-height: 88vh;
+        z-index: 999999;
         box-sizing: border-box;
-        margin: 10px 0 15px;
         border: 1px solid #603000;
+        border-radius: 8px;
         background: #f4e4bc;
+        box-shadow: 0 16px 40px rgba(0,0,0,0.38);
         color: #2f1b00;
         font-family: Verdana, Arial, sans-serif;
         font-size: 12px;
+        overflow: hidden;
       }
       #${BOX_ID} * { box-sizing: border-box; }
       .twrr-header {
@@ -1126,6 +1219,7 @@
         background-color: #c1a264;
         background-image: url(/graphic/screen/tableheader_bg3.png);
         background-repeat: repeat-x;
+        cursor: move;
       }
       .twrr-header h3 { margin: 0; padding: 0; font-size: 14px; line-height: 1; }
       .twrr-header-actions { display: flex; align-items: center; gap: 4px; }
@@ -1141,7 +1235,7 @@
         line-height: 1;
       }
       .twrr-icon-button:hover { background: #fff4d5; }
-      .twrr-body { padding: 10px; }
+      .twrr-body { padding: 10px; max-height: calc(88vh - 45px); overflow-y: auto; }
       .twrr-help { margin: 0 0 8px; line-height: 1.35; }
       .twrr-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
       .twrr-tab-wrap {
@@ -1316,9 +1410,50 @@
         opacity: 0.8;
         text-align: right;
       }
+      @media (max-width: 800px) {
+        #${BOX_ID} {
+          top: 50px;
+          left: 5px;
+          right: 5px;
+          width: auto;
+        }
+        .twrr-resource-grid, .twrr-coords-grid { grid-template-columns: 1fr; }
+      }
     `;
 
     document.head.appendChild(style);
+  }
+
+  function makeDraggable(box, handle) {
+    let isDragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    handle.addEventListener("mousedown", function (event) {
+      if (event.target.closest && event.target.closest("button")) return;
+
+      isDragging = true;
+      const rect = box.getBoundingClientRect();
+      offsetX = event.clientX - rect.left;
+      offsetY = event.clientY - rect.top;
+
+      box.style.left = rect.left + "px";
+      box.style.top = rect.top + "px";
+      box.style.right = "auto";
+      document.body.style.userSelect = "none";
+    });
+
+    document.addEventListener("mousemove", function (event) {
+      if (!isDragging) return;
+      box.style.left = Math.max(0, event.clientX - offsetX) + "px";
+      box.style.top = Math.max(0, event.clientY - offsetY) + "px";
+    });
+
+    document.addEventListener("mouseup", function () {
+      if (!isDragging) return;
+      isDragging = false;
+      document.body.style.userSelect = "";
+    });
   }
 
   function closeWidget() {
@@ -1352,7 +1487,7 @@
       "<div class='twrr-grid'>" +
         "<div class='twrr-field'><label>Reserve merchants</label><input class='twrr-reserve-merchants' type='number' min='0' step='1'></div>" +
         "<div class='twrr-field'><label>Reserve warehouse (%)</label><input class='twrr-reserve-warehouse' type='number' min='0' max='100' step='0.25'></div>" +
-        "<div class='twrr-field'><label>Max distance</label><input class='twrr-max-distance' type='number' min='0' step='0.1'></div>" +
+        "<div class='twrr-field'><label>Max distance <span class='twrr-tooltip' title='0 = unlimited distance'>?</span></label><input class='twrr-max-distance' type='number' min='0' step='0.1'></div>" +
         "<div class='twrr-field'><label class='twrr-checkbox-label'><input class='twrr-overflow-protection' type='checkbox'> <span>Overflow protection</span> <span class='twrr-tooltip' title='When enabled, the plan will not request resources that would push a target village above 95% warehouse capacity after current resources, incoming transports and planned requests.'>?</span></label></div>" +
       "</div>" +
       "<div class='twrr-actions'>" +
@@ -1564,8 +1699,8 @@
     box.appendChild(header);
     box.appendChild(body);
 
-    const target = document.querySelector("#contentContainer") || document.querySelector("#mobileContent") || document.querySelector("#content_value") || document.body;
-    target.prepend(box);
+    document.body.appendChild(box);
+    makeDraggable(box, header);
 
     ui.tabs = tabs;
     ui.panelWrap = panelWrap;
@@ -1599,6 +1734,12 @@
       setStatus("Loading incoming transports...", "warn");
       state.incoming = await loadIncomingData();
 
+      debugLog("base data ready", {
+        villages: state.production.size,
+        groups: state.groups.length,
+        incomingTargets: state.incoming.size,
+        settings: Object.assign({}, state.settings)
+      });
       setStatus("Ready. Loaded " + state.production.size + " own villages and " + state.groups.length + " groups.", "success");
     } catch (err) {
       console.error(SCRIPT_NAME + " failed to load base data:", err);
@@ -1734,7 +1875,7 @@
     summary.innerHTML =
       "<strong>Origins:</strong> " + coords.origins.length + " · " +
       "<strong>Targets:</strong> " + coords.targets.length + " · " +
-      "<strong>Max distance:</strong> " + state.settings.maxDistance + " · " +
+      "<strong>Max distance:</strong> " + (state.settings.maxDistance <= 0 ? "unlimited" : state.settings.maxDistance) + " · " +
       "<strong>Overflow protection:</strong> " + (state.settings.overflowProtection ? "on" : "off");
     ui.results.appendChild(summary);
 
@@ -1801,6 +1942,16 @@
   }
 
   createWidget();
+
+  // Catch a companion Balancer that is accidentally launched a fraction later by stale/duplicate launcher state.
+  [150, 500, 1200, 1900].forEach(delay => {
+    window.setTimeout(function () {
+      if (document.getElementById(BOX_ID)) {
+        closeBalancerCompanion("startup-guard-" + delay + "ms");
+      }
+    }, delay);
+  });
+
   loadBaseDataAndRender();
-  console.log(SCRIPT_NAME + " " + SCRIPT_VERSION + " loaded", { supportsScriptData: true });
+  console.log(SCRIPT_NAME + " " + SCRIPT_VERSION + " loaded", { supportsScriptData: true, popup: true, maxDistanceZeroMeansUnlimited: true });
 })();
