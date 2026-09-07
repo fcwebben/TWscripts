@@ -13,8 +13,8 @@
  * - Reads visible/loaded village resource, merchant and warehouse data from Overview -> Production
  * - Reads incoming resource transports from Overview -> Transports -> Incoming
  * - Reads static village groups from Overview -> Groups
- * - Builds a manual request plan based on the player's resource inputs
- * - Can request exact amounts per target or fill targets up to desired amounts including current/incoming resources
+ * - Builds a manual request plan based on the player's exact resource inputs per target
+ * - Can optionally cap planned requests with overflow protection using current resources and incoming transports
  * - Uses TribalWars.scriptData as supported user-data input when enabled in the Script Library
  * - Saves in-UI changes locally in the browser as a convenience fallback
  *
@@ -33,11 +33,10 @@
  * Expected TribalWars.scriptData format:
  * {
  *   "settings": {
- *     "resourceMode": "exact",
  *     "reserveMerchants": 0,
  *     "reserveWarehousePercent": 5,
  *     "maxDistance": 50,
- *     "overflowProtection": true
+ *     "overflowProtection": false
  *   },
  *   "tabs": [
  *     {
@@ -54,19 +53,12 @@
  * }
  *
  * Options:
- * - settings.resourceMode: "exact" or "fill"
- *   - exact: request exactly the entered resource amounts for each target, ignoring current and incoming resources
- *   - fill: request only what each target is missing after current resources and incoming transports
  * - settings.reserveMerchants: number of merchants to keep unused in every origin village
  * - settings.reserveWarehousePercent: percent of each origin village's warehouse to keep as local reserve
  * - settings.maxDistance: maximum allowed field distance between origin and target
- * - settings.overflowProtection: true/false. When enabled, planned requests cannot push targets above 95% warehouse capacity.
+ * - settings.overflowProtection: true/false. Default is false. When enabled, planned requests cannot push targets above 95% warehouse capacity.
  * - tabs[].originCoords / tabs[].targetCoords: pasted coordinates. Selecting a group fills these fields automatically.
  * - tabs[].originGroupId / tabs[].targetGroupId: selected group IDs, saved together with the visible coordinates.
- *
- * v1.0.3:
- * - Fixes tab/settings icon encoding without changing request logic.
- * - Uses a lightweight Twactics activation event so Resource Requester and Resource Balancer do not stay open together.
  */
 
 /*
@@ -84,53 +76,18 @@
 (function () {
   "use strict";
 
-  // Twactics tool lifecycle: newer Twactics tools announce activation through a
-  // shared browser event. This avoids persistent global manager state and lets
-  // each tool close itself cleanly when another Twactics tool starts.
-  const TWACTICS_TOOL_ID = "resource-requester";
-  const TWACTICS_ACTIVATE_EVENT = "twactics:activate";
-
-  function handleTwacticsActivate(event) {
-    const nextId = event && event.detail && event.detail.id;
-    if (!nextId || nextId === TWACTICS_TOOL_ID) return;
-    closeWidget();
-  }
-
-  window.addEventListener(TWACTICS_ACTIVATE_EVENT, handleTwacticsActivate);
-
-  // Backward-compatible fallback for Resource Balancer versions that predate
-  // the shared activation event. Only close the known tool; do not scan window.
-  if (window.twacticsResourceBalancer && typeof window.twacticsResourceBalancer.close === "function") {
-    try {
-      window.twacticsResourceBalancer.close();
-    } catch (err) {
-      console.warn("Twactics Resource Requester could not close Resource Balancer:", err);
-    }
-  } else {
-    const staleBalancerBox = document.getElementById("twactics-resource-balancer");
-    if (staleBalancerBox) staleBalancerBox.remove();
-    const staleBalancerStyle = document.getElementById("twactics-resource-balancer-style");
-    if (staleBalancerStyle) staleBalancerStyle.remove();
-    if (window.twacticsResourceBalancerLoaded) window.twacticsResourceBalancerLoaded = false;
-  }
-
-  window.dispatchEvent(new CustomEvent(TWACTICS_ACTIVATE_EVENT, {
-    detail: { id: TWACTICS_TOOL_ID }
-  }));
-
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.3";
+  const SCRIPT_VERSION = "v1.0.6";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
   const DATA_VERSION = 1;
 
   const DEFAULT_SETTINGS = {
-    resourceMode: "exact",
     reserveMerchants: 0,
     reserveWarehousePercent: 5,
     maxDistance: 50,
-    overflowProtection: true
+    overflowProtection: false
   };
 
   const DEFAULT_TAB = {
@@ -156,6 +113,23 @@
   };
 
   const ui = {};
+  let lastRequestEnterAt = 0;
+
+  // Only close the specifically known companion Twactics tool. No global window scan,
+  // no shared activation event, and nothing here can launch another script.
+  if (window.twacticsResourceBalancer && typeof window.twacticsResourceBalancer.close === "function") {
+    try {
+      window.twacticsResourceBalancer.close();
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not close Resource Balancer:", err);
+    }
+  } else {
+    const staleBalancerBox = document.getElementById("twactics-resource-balancer");
+    if (staleBalancerBox) staleBalancerBox.remove();
+    const staleBalancerStyle = document.getElementById("twactics-resource-balancer-style");
+    if (staleBalancerStyle) staleBalancerStyle.remove();
+    if (window.twacticsResourceBalancerLoaded) window.twacticsResourceBalancerLoaded = false;
+  }
 
   if (window.twacticsResourceRequester && typeof window.twacticsResourceRequester.close === "function") {
     window.twacticsResourceRequester.close();
@@ -343,10 +317,6 @@
     // TribalWars.scriptData is the official imported configuration. Local storage is a convenience for UI saves.
     const merged = Object.assign({}, defaults, localData || {}, scriptData || {});
 
-    // Backward compatibility with early versions where resourceMode was stored per tab.
-    if ((!merged.settings || !merged.settings.resourceMode) && merged.tabs && merged.tabs[0] && merged.tabs[0].resourceMode) {
-      merged.settings = Object.assign({}, merged.settings || {}, { resourceMode: merged.tabs[0].resourceMode });
-    }
 
     return normalizeUserData(merged);
   }
@@ -355,11 +325,10 @@
     const source = Object.assign({}, DEFAULT_SETTINGS, input || {});
 
     return {
-      resourceMode: source.resourceMode === "fill" ? "fill" : "exact",
       reserveMerchants: Math.max(0, parseNumber(source.reserveMerchants, DEFAULT_SETTINGS.reserveMerchants)),
       reserveWarehousePercent: clampNumber(source.reserveWarehousePercent, 0, 100, DEFAULT_SETTINGS.reserveWarehousePercent),
       maxDistance: clampNumber(source.maxDistance, 0, 1000, DEFAULT_SETTINGS.maxDistance),
-      overflowProtection: source.overflowProtection !== false
+      overflowProtection: source.overflowProtection === true
     };
   }
 
@@ -532,6 +501,17 @@
     const merchants = parseMerchants(row);
     const warehouse = parseWarehouse(row);
 
+    if (warehouse && (wood > warehouse * 2 || clay > warehouse * 2 || iron > warehouse * 2)) {
+      console.warn(SCRIPT_NAME + " production parse looks suspicious", {
+        coord: coord,
+        wood: wood,
+        clay: clay,
+        iron: iron,
+        warehouse: warehouse,
+        rowText: cleanText(row.textContent).slice(0, 500)
+      });
+    }
+
     return {
       coord: coord,
       id: villageId,
@@ -545,11 +525,87 @@
     };
   }
 
+  function parseFirstNumber(value, fallback) {
+    const match = String(value === undefined || value === null ? "" : value).match(/-?\d[\d.,]*/);
+    if (!match) return fallback || 0;
+    return parseNumber(match[0], fallback || 0);
+  }
+
+  function hasAnyClass(element, classNames) {
+    if (!element || !element.classList) return false;
+    return classNames.some(className => element.classList.contains(className));
+  }
+
+  const RESOURCE_MARKER_CLASSES = ["wood", "stone", "clay", "iron"];
+
+  function getResourceMarkersInCell(cell) {
+    if (!cell || !cell.querySelectorAll) return [];
+    return Array.from(cell.querySelectorAll(".wood, .stone, .clay, .iron"))
+      .filter(element => hasAnyClass(element, RESOURCE_MARKER_CLASSES));
+  }
+
+  function getTextBetweenElements(container, startElement, endElement) {
+    try {
+      const doc = container.ownerDocument || document;
+      const range = doc.createRange();
+      range.setStartAfter(startElement);
+
+      if (endElement) {
+        range.setEndBefore(endElement);
+      } else {
+        range.setEnd(container, container.childNodes.length);
+      }
+
+      return cleanText(range.toString());
+    } catch (err) {
+      return "";
+    }
+  }
+
   function parseResourceFromRow(row, resourceClass) {
-    const el = row.querySelector("." + resourceClass);
-    if (!el) return 0;
-    const cell = el.closest("td") || el;
-    return parseNumber(cell.textContent, 0);
+    const markers = Array.from(row.querySelectorAll("." + resourceClass));
+
+    for (let i = 0; i < markers.length; i++) {
+      const marker = markers[i];
+      const markerText = cleanText(marker.textContent);
+      const markerDirectValue = parseFirstNumber(markerText, 0);
+
+      if (markerDirectValue > 0 && markerText.replace(/[\d.,\s-]/g, "") === "") {
+        return markerDirectValue;
+      }
+
+      const cell = marker.closest("td") || marker.parentElement;
+      if (!cell) continue;
+
+      if (cell !== marker) {
+        const resourceMarkers = getResourceMarkersInCell(cell);
+        const index = resourceMarkers.indexOf(marker);
+
+        if (index >= 0) {
+          const nextMarker = resourceMarkers[index + 1] || null;
+          const segmentText = getTextBetweenElements(cell, marker, nextMarker);
+          const segmentValue = parseFirstNumber(segmentText, 0);
+
+          if (segmentValue > 0) {
+            return segmentValue;
+          }
+
+          const cellNumbers = cleanText(cell.textContent).match(/-?\d[\d.,]*/g) || [];
+          if (cellNumbers[index]) {
+            return parseNumber(cellNumbers[index], 0);
+          }
+        }
+      }
+
+      const cellText = cleanText(cell.textContent);
+      const cellNumbers = cellText.match(/-?\d[\d.,]*/g) || [];
+
+      if (cellNumbers.length === 1 && !/\d{1,3}\|\d{1,3}/.test(cellText)) {
+        return parseNumber(cellNumbers[0], 0);
+      }
+    }
+
+    return 0;
   }
 
   function parseMerchants(row) {
@@ -574,9 +630,16 @@
     cells.forEach(cell => {
       const text = cleanText(cell.textContent);
       if (!text) return;
+      if (/\d{1,3}\|\d{1,3}/.test(text)) return;
+      if (cell.querySelector(".quickedit-vn, .quickedit-label")) return;
       if (cell.querySelector(".wood, .stone, .clay, .iron")) return;
       if (/\d+\s*\/\s*\d+/.test(text)) return;
-      const value = parseNumber(text, 0);
+      if ((cell.querySelector("a[href*='market']") || "") && /\d/.test(text)) return;
+
+      const numbers = text.match(/\d[\d.,]*/g) || [];
+      if (numbers.length !== 1) return;
+
+      const value = parseNumber(numbers[0], 0);
       if (value >= 1000) candidates.push(value);
     });
 
@@ -716,29 +779,23 @@
     const target = state.production.get(targetCoord);
     const incoming = getIncomingForCoord(targetCoord);
     const alreadyPlanned = plannedByTarget.get(targetCoord) || { wood: 0, clay: 0, iron: 0 };
-
-    let need;
-
-    if (state.settings.resourceMode === "fill") {
-      need = {
-        wood: Math.max(0, base.wood - ((target && target.wood) || 0) - incoming.wood - alreadyPlanned.wood),
-        clay: Math.max(0, base.clay - ((target && target.clay) || 0) - incoming.clay - alreadyPlanned.clay),
-        iron: Math.max(0, base.iron - ((target && target.iron) || 0) - incoming.iron - alreadyPlanned.iron)
-      };
-    } else {
-      need = Object.assign({}, base);
-    }
+    const need = Object.assign({}, base);
 
     if (state.settings.overflowProtection && target && target.warehouse) {
       const limit = Math.floor(target.warehouse * 0.95);
-      need.wood = Math.min(need.wood, Math.max(0, limit - target.wood - incoming.wood - alreadyPlanned.wood));
-      need.clay = Math.min(need.clay, Math.max(0, limit - target.clay - incoming.clay - alreadyPlanned.clay));
-      need.iron = Math.min(need.iron, Math.max(0, limit - target.iron - incoming.iron - alreadyPlanned.iron));
+      const maxAllowed = {
+        wood: Math.max(0, limit - target.wood - incoming.wood - alreadyPlanned.wood),
+        clay: Math.max(0, limit - target.clay - incoming.clay - alreadyPlanned.clay),
+        iron: Math.max(0, limit - target.iron - incoming.iron - alreadyPlanned.iron)
+      };
+
+      need.wood = Math.min(need.wood, maxAllowed.wood);
+      need.clay = Math.min(need.clay, maxAllowed.clay);
+      need.iron = Math.min(need.iron, maxAllowed.iron);
     }
 
     return need;
   }
-
   function getOriginAvailability(originCoord, originState) {
     const origin = state.production.get(originCoord);
     if (!origin) return null;
@@ -889,40 +946,70 @@
     return data;
   }
 
+  function removeRequestedRow(button) {
+    if (!button) return;
+    const rowElement = button.closest("tr");
+    if (rowElement) rowElement.remove();
+    renumberResultRows();
+  }
+
+  function renumberResultRows() {
+    if (!ui.results) return;
+    Array.from(ui.results.querySelectorAll(".twrr-result-row")).forEach((row, index) => {
+      const indexCell = row.querySelector(".twrr-row-index");
+      if (indexCell) indexCell.textContent = String(index + 1);
+    });
+  }
+
+  function getCsrfToken() {
+    if (typeof window.csrf_token !== "undefined" && window.csrf_token) return window.csrf_token;
+    if (typeof game_data !== "undefined" && game_data.csrf) return game_data.csrf;
+    const input = document.querySelector('input[name="h"]');
+    return input ? input.value : "";
+  }
+
   function postResourceRequest(row, button) {
     if (!row || !row.targetId || !row.requests.length) return;
 
     const data = buildPostDataForRow(row);
 
-    if (button) button.disabled = true;
+    console.log(SCRIPT_NAME + " request debug", {
+      targetCoord: row.targetCoord,
+      targetId: row.targetId,
+      planned: row.planned,
+      missing: row.missing,
+      requests: row.requests,
+      postData: data
+    });
 
-    TribalWars.post("market", {
+    if (button) {
+      button.disabled = true;
+      button.value = "requesting...";
+      button.classList.add("twrr-requesting");
+    }
+
+    const postOptions = {
       village: row.targetId,
-      ajaxaction: "call",
-      h: window.csrf_token
-    }, data, function (response) {
+      ajaxaction: "call"
+    };
+    const csrf = getCsrfToken();
+    if (csrf) postOptions.h = csrf;
+
+    TribalWars.post("market", postOptions, data, function (response) {
       const message = response && (response.success || response.message) || "Request sent.";
       if (typeof UI !== "undefined" && UI.SuccessMessage) UI.SuccessMessage(message, 1500);
-      if (button) {
-        button.value = "requested";
-        button.classList.add("twrr-done");
-      }
+      console.log(SCRIPT_NAME + " request success", { targetCoord: row.targetCoord, response: response });
+      removeRequestedRow(button);
     }, function (error) {
       console.error(SCRIPT_NAME + " request failed:", error);
       if (typeof UI !== "undefined" && UI.ErrorMessage) UI.ErrorMessage("Request failed.", 2000);
-      if (button) button.disabled = false;
+      if (button) {
+        button.disabled = false;
+        button.value = "request";
+        button.classList.remove("twrr-requesting");
+        button.focus();
+      }
     });
-  }
-
-  async function requestAllRows() {
-    if (!state.lastPlan.length) return;
-    if (!window.confirm("Request resources for all visible planned target villages?")) return;
-
-    const rows = state.lastPlan.filter(row => row.total > 0 && row.requests.length > 0);
-    for (let i = 0; i < rows.length; i++) {
-      postResourceRequest(rows[i]);
-      await wait(220);
-    }
   }
 
   function getActiveTab() {
@@ -943,11 +1030,10 @@
     if (!ui.settingsPanel) return;
 
     state.settings = normalizeSettings({
-      resourceMode: ui.resourceModeInput ? ui.resourceModeInput.value : state.settings.resourceMode,
       reserveMerchants: ui.reserveMerchantsInput && ui.reserveMerchantsInput.value,
       reserveWarehousePercent: ui.reserveWarehouseInput && ui.reserveWarehouseInput.value,
       maxDistance: ui.maxDistanceInput && ui.maxDistanceInput.value,
-      overflowProtection: ui.overflowProtectionInput ? ui.overflowProtectionInput.value === "true" : state.settings.overflowProtection
+      overflowProtection: ui.overflowProtectionInput ? ui.overflowProtectionInput.checked === true : state.settings.overflowProtection
     });
   }
 
@@ -966,11 +1052,10 @@
 
   function syncSettingsToUi() {
     if (!ui.settingsPanel) return;
-    ui.resourceModeInput.value = state.settings.resourceMode;
     ui.reserveMerchantsInput.value = state.settings.reserveMerchants;
     ui.reserveWarehouseInput.value = state.settings.reserveWarehousePercent;
     ui.maxDistanceInput.value = state.settings.maxDistance;
-    ui.overflowProtectionInput.value = state.settings.overflowProtection ? "true" : "false";
+    ui.overflowProtectionInput.checked = state.settings.overflowProtection === true;
   }
 
   function getActiveTabDisplayName(index) {
@@ -1114,6 +1199,20 @@
         background: #fffaf0;
         color: #2f1b00;
       }
+      .twrr-checkbox-label {
+        display: flex !important;
+        align-items: center;
+        gap: 6px;
+        min-height: 32px;
+        margin-bottom: 0 !important;
+      }
+      .twrr-checkbox-label input[type="checkbox"] {
+        width: auto;
+        min-height: auto;
+        padding: 0;
+        border: 0;
+        background: transparent;
+      }
       .twrr-field textarea { min-height: 88px; resize: vertical; font-family: monospace; }
       .twrr-resource-grid { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
       .twrr-coords-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
@@ -1142,6 +1241,19 @@
         border-radius: 3px;
       }
       .twrr-button:hover { background: #9e7e3d; }
+      .twrr-button:focus,
+      .twrr-button:focus-visible {
+        outline: 3px solid #ffe066;
+        outline-offset: 2px;
+        box-shadow: 0 0 0 2px #603000;
+        background: #9e7e3d;
+      }
+      .twrr-row-request:focus,
+      .twrr-row-request:focus-visible {
+        outline: 3px solid #00b7ff;
+        outline-offset: 2px;
+        box-shadow: 0 0 0 2px #ffffff, 0 0 0 4px #003c5f;
+      }
       .twrr-button-secondary { background: #7d510f; }
       .twrr-button-danger { background: #8f342b; }
       .twrr-status {
@@ -1163,6 +1275,10 @@
         line-height: 1.45;
       }
       .twrr-muted { opacity: 0.75; }
+      .twrr-resource-line { white-space: nowrap; }
+      .twrr-resource-icon { display: inline-block; vertical-align: -2px; margin-right: 2px; }
+      .twrr-resource-separator { opacity: 0.55; margin: 0 3px; }
+      .twrr-missing-line { display: inline-block; margin-top: 3px; color: #8f342b; font-size: 11px; }
       .twrr-table-wrap { max-height: 520px; overflow: auto; border: 1px solid #bd9c5a; }
       .twrr-table { width: 100%; border-collapse: collapse; }
       .twrr-table th {
@@ -1212,7 +1328,8 @@
     const style = document.getElementById(STYLE_ID);
     if (style) style.remove();
 
-    window.removeEventListener(TWACTICS_ACTIVATE_EVENT, handleTwacticsActivate);
+    document.removeEventListener("keydown", handleRequestEnter, true);
+
     delete window.twacticsResourceRequester;
   }
 
@@ -1233,14 +1350,10 @@
     panel.className = "twrr-settings-panel";
     panel.innerHTML =
       "<div class='twrr-grid'>" +
-        "<div class='twrr-field'><label>Resource mode</label><select class='twrr-resource-mode'>" +
-          "<option value='exact'>Request exact amount</option>" +
-          "<option value='fill'>Fill to amount incl. current/incoming</option>" +
-        "</select></div>" +
         "<div class='twrr-field'><label>Reserve merchants</label><input class='twrr-reserve-merchants' type='number' min='0' step='1'></div>" +
         "<div class='twrr-field'><label>Reserve warehouse (%)</label><input class='twrr-reserve-warehouse' type='number' min='0' max='100' step='0.25'></div>" +
         "<div class='twrr-field'><label>Max distance</label><input class='twrr-max-distance' type='number' min='0' step='0.1'></div>" +
-        "<div class='twrr-field'><label>Overflow protection <span class='twrr-tooltip' title='When enabled, the plan will not request resources that would push a target village above 95% warehouse capacity after current resources, incoming transports and planned requests.'>?</span></label><select class='twrr-overflow-protection'><option value='true'>Enabled</option><option value='false'>Disabled</option></select></div>" +
+        "<div class='twrr-field'><label class='twrr-checkbox-label'><input class='twrr-overflow-protection' type='checkbox'> <span>Overflow protection</span> <span class='twrr-tooltip' title='When enabled, the plan will not request resources that would push a target village above 95% warehouse capacity after current resources, incoming transports and planned requests.'>?</span></label></div>" +
       "</div>" +
       "<div class='twrr-actions'>" +
         "<button type='button' class='twrr-button twrr-save-settings'>Save settings</button>" +
@@ -1249,7 +1362,6 @@
       "<div class='twrr-muted'>The script reads TribalWars.scriptData on startup. Save updates TribalWars.scriptData for the current run and stores a local browser fallback. For Script Library persistence, copy the exported JSON into the script user-data field.</div>" +
       "<textarea class='twrr-export' readonly></textarea>";
 
-    ui.resourceModeInput = panel.querySelector(".twrr-resource-mode");
     ui.reserveMerchantsInput = panel.querySelector(".twrr-reserve-merchants");
     ui.reserveWarehouseInput = panel.querySelector(".twrr-reserve-warehouse");
     ui.maxDistanceInput = panel.querySelector(".twrr-max-distance");
@@ -1296,7 +1408,7 @@
       renameButton.type = "button";
       renameButton.className = "twrr-tab-icon";
       renameButton.title = "Rename tab";
-      renameButton.textContent = "\u270E";
+      renameButton.innerHTML = "&#9998;";
       renameButton.addEventListener("click", function (event) {
         event.stopPropagation();
         renameTab(index);
@@ -1306,7 +1418,7 @@
       removeButton.type = "button";
       removeButton.className = "twrr-tab-icon twrr-tab-remove";
       removeButton.title = "Remove tab";
-      removeButton.textContent = "\uD83D\uDDD1";
+      removeButton.innerHTML = "&#128465;";
       removeButton.addEventListener("click", function (event) {
         event.stopPropagation();
         removeTab(index);
@@ -1401,7 +1513,7 @@
     settingsButton.type = "button";
     settingsButton.className = "twrr-icon-button";
     settingsButton.title = "Settings";
-    settingsButton.textContent = "\u2699";
+    settingsButton.innerHTML = "&#9881;";
     settingsButton.addEventListener("click", function () {
       if (ui.settingsPanel) ui.settingsPanel.classList.toggle("twrr-open");
     });
@@ -1422,7 +1534,7 @@
 
     const help = document.createElement("p");
     help.className = "twrr-help";
-    help.textContent = "Plan resource requests from origin villages to target villages. Use pasted coords or village groups, then request manually per target or all planned targets.";
+    help.textContent = "Plan resource requests from origin villages to target villages. Use pasted coords or village groups, then request manually per target.";
 
     const settingsPanel = createSettingsPanel();
 
@@ -1459,6 +1571,9 @@
     ui.panelWrap = panelWrap;
     ui.status = status;
     ui.results = results;
+
+    document.removeEventListener("keydown", handleRequestEnter, true);
+    document.addEventListener("keydown", handleRequestEnter, true);
 
     renderTabs();
     renderActivePanel();
@@ -1521,12 +1636,94 @@
     }
   }
 
-  function formatAmounts(amounts) {
-    return [
-      "W " + formatNumber(amounts && amounts.wood),
-      "C " + formatNumber(amounts && amounts.clay),
-      "I " + formatNumber(amounts && amounts.iron)
-    ].join(" / ");
+  function resourceIconHtml(type, title) {
+    return "<span class='icon header " + type + " twrr-resource-icon' title='" + escapeHtml(title) + "'></span>";
+  }
+
+  function formatAmountsHtml(amounts) {
+    const values = amounts || {};
+    return "<span class='twrr-resource-line'>" +
+      resourceIconHtml("wood", "Wood") + " " + formatNumber(values.wood) +
+      " <span class='twrr-resource-separator'>/</span> " +
+      resourceIconHtml("stone", "Clay") + " " + formatNumber(values.clay) +
+      " <span class='twrr-resource-separator'>/</span> " +
+      resourceIconHtml("iron", "Iron") + " " + formatNumber(values.iron) +
+    "</span>";
+  }
+
+  function formatSendResourcesHtml(row) {
+    let html = "<strong>" + formatAmountsHtml(row.planned) + "</strong>" +
+      "<br><span class='twrr-muted'>Total " + formatNumber(row.total) + "</span>";
+
+    if (totalAmounts(row.missing) > 0) {
+      html += "<br><span class='twrr-missing-line'>Missing: " + formatAmountsHtml(row.missing) + "</span>";
+    }
+
+    return html;
+  }
+
+  function getEnabledRequestButtons() {
+    if (!ui.results) return [];
+    return Array.from(ui.results.querySelectorAll(".twrr-row-request:not(:disabled)"));
+  }
+
+  function focusFirstRequestButton() {
+    window.setTimeout(function () {
+      const first = getEnabledRequestButtons()[0];
+      if (first) first.focus();
+    }, 50);
+  }
+
+  function getNextRequestButton(currentButton) {
+    if (!ui.results) return null;
+    const buttons = Array.from(ui.results.querySelectorAll(".twrr-row-request"));
+    if (!buttons.length) return null;
+
+    const index = buttons.indexOf(currentButton);
+
+    for (let i = Math.max(index + 1, 0); i < buttons.length; i++) {
+      if (!buttons[i].disabled) return buttons[i];
+    }
+
+    for (let i = 0; i < Math.max(index, 0); i++) {
+      if (!buttons[i].disabled) return buttons[i];
+    }
+
+    return null;
+  }
+
+  function focusNextRequestButton(currentButton) {
+    const next = getNextRequestButton(currentButton);
+
+    window.setTimeout(function () {
+      if (next && document.body.contains(next) && !next.disabled) {
+        next.focus();
+      } else {
+        focusFirstRequestButton();
+      }
+    }, 50);
+  }
+
+  function handleRequestEnter(event) {
+    if (!event || event.key !== "Enter") return;
+
+    if (event.repeat) {
+      event.preventDefault();
+      return;
+    }
+
+    const target = event.target;
+    if (!target || !target.classList || !target.classList.contains("twrr-row-request")) return;
+
+    event.preventDefault();
+
+    const now = Date.now();
+    if (now - lastRequestEnterAt < 50) return;
+    lastRequestEnterAt = now;
+
+    if (!target.disabled) {
+      target.click();
+    }
   }
 
   function renderResults(tab, result, coords) {
@@ -1535,7 +1732,6 @@
     const summary = document.createElement("div");
     summary.className = "twrr-summary";
     summary.innerHTML =
-      "<strong>Mode:</strong> " + (state.settings.resourceMode === "fill" ? "Fill to amount including current/incoming" : "Request exact amount") + " · " +
       "<strong>Origins:</strong> " + coords.origins.length + " · " +
       "<strong>Targets:</strong> " + coords.targets.length + " · " +
       "<strong>Max distance:</strong> " + state.settings.maxDistance + " · " +
@@ -1560,16 +1756,6 @@
       return;
     }
 
-    const actions = document.createElement("div");
-    actions.className = "twrr-actions";
-    const requestAll = document.createElement("button");
-    requestAll.type = "button";
-    requestAll.className = "twrr-button";
-    requestAll.textContent = "Request all visible";
-    requestAll.addEventListener("click", requestAllRows);
-    actions.appendChild(requestAll);
-    ui.results.appendChild(actions);
-
     const wrap = document.createElement("div");
     wrap.className = "twrr-table-wrap";
 
@@ -1579,9 +1765,7 @@
       "<thead><tr>" +
         "<th>#</th>" +
         "<th class='twrr-left'>Target</th>" +
-        "<th>Requested need</th>" +
-        "<th>Planned</th>" +
-        "<th>Missing</th>" +
+        "<th>Send resources</th>" +
         "<th>Origins</th>" +
         "<th>Max distance</th>" +
         "<th>Request</th>" +
@@ -1591,13 +1775,12 @@
 
     result.rows.forEach((row, index) => {
       const tr = document.createElement("tr");
+      tr.className = "twrr-result-row";
       const disabled = row.total <= 0 || !row.requests.length;
       tr.innerHTML =
-        "<td>" + (index + 1) + "</td>" +
+        "<td class='twrr-row-index'>" + (index + 1) + "</td>" +
         "<td class='twrr-left'><a href='" + escapeHtml(buildGameUrl({ screen: "info_village", id: row.targetId })) + "' target='_blank' rel='noreferrer noopener'>" + escapeHtml(row.targetCoord) + "</a></td>" +
-        "<td>" + escapeHtml(formatAmounts(row.requested)) + "</td>" +
-        "<td><strong>" + escapeHtml(formatAmounts(row.planned)) + "</strong><br><span class='twrr-muted'>Total " + formatNumber(row.total) + "</span></td>" +
-        "<td>" + escapeHtml(formatAmounts(row.missing)) + "</td>" +
+        "<td>" + formatSendResourcesHtml(row) + "</td>" +
         "<td>" + row.requestCount + "</td>" +
         "<td>" + (row.maxDistance ? row.maxDistance.toFixed(1) : "-") + "</td>" +
         "<td><input type='button' class='twrr-button twrr-row-request' value='request'" + (disabled ? " disabled" : "") + "></td>";
@@ -1605,6 +1788,7 @@
       const button = tr.querySelector(".twrr-row-request");
       button.addEventListener("click", function () {
         postResourceRequest(row, button);
+        focusNextRequestButton(button);
       });
 
       tbody.appendChild(tr);
@@ -1613,6 +1797,7 @@
     table.appendChild(tbody);
     wrap.appendChild(table);
     ui.results.appendChild(wrap);
+    focusFirstRequestButton();
   }
 
   createWidget();
