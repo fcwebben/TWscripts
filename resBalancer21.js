@@ -72,19 +72,44 @@
 (function () {
   "use strict";
 
-  if (window.twacticsResourceBalancerLoaded) {
-    console.log("Twactics Resource Balancer already loaded");
-    return;
-  }
-
-  window.twacticsResourceBalancerLoaded = true;
-
   const SCRIPT_NAME = "Twactics Resource Balancer";
-  const SCRIPT_VERSION = "1.0.1";
+  const SCRIPT_VERSION = "1.0.4";
   const BOX_ID = "twactics-resource-balancer";
   const STYLE_ID = "twactics-resource-balancer-style";
   const DATA_VERSION = 1;
   const SETTINGS_STORAGE_KEY = "twacticsResourceBalancerSettings";
+
+  // Only close the specifically known companion Twactics tool. No global window scan,
+  // no shared activation event, and nothing here can launch another script.
+  if (window.twacticsResourceRequester && typeof window.twacticsResourceRequester.close === "function") {
+    try {
+      window.twacticsResourceRequester.close();
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not close Resource Requester:", err);
+    }
+  } else {
+    const staleRequesterBox = document.getElementById("twactics-resource-requester");
+    if (staleRequesterBox) staleRequesterBox.remove();
+    const staleRequesterStyle = document.getElementById("twactics-resource-requester-style");
+    if (staleRequesterStyle) staleRequesterStyle.remove();
+  }
+
+  // Re-running Balancer refreshes only Balancer itself instead of leaving a stale loaded flag.
+  if (window.twacticsResourceBalancer && typeof window.twacticsResourceBalancer.close === "function") {
+    try {
+      window.twacticsResourceBalancer.close();
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not close the previous Balancer instance:", err);
+    }
+  } else if (window.twacticsResourceBalancerLoaded) {
+    const staleBox = document.getElementById(BOX_ID);
+    if (staleBox) staleBox.remove();
+    const staleStyle = document.getElementById(STYLE_ID);
+    if (staleStyle) staleStyle.remove();
+    window.twacticsResourceBalancerLoaded = false;
+  }
+
+  window.twacticsResourceBalancerLoaded = true;
   // Script Library review requirement: all script-started network traffic shares this limiter.
   // 220ms minimum spacing is intentionally stricter than the 5 requests/second maximum.
   const NETWORK_MIN_INTERVAL_MS = 220;
@@ -641,7 +666,7 @@
 
     if (/(^|[\s_-])(wood|res-wood|resource-wood)([\s_-]|$)|timber|lumber|holz|bois|madera|legno|drewno/.test(markerText)) return "wood";
     if (/(^|[\s_-])(stone|clay|res-stone|resource-stone|resource-clay)([\s_-]|$)|loam|lehm|argile|arcilla|argilla|glina/.test(markerText)) return "stone";
-    if (/(^|[\s_-])(iron|res-iron|resource-iron)([\s_-]|$)|eisen|fer|hierro|ferro|zelazo|Å¼elazo/.test(markerText)) return "iron";
+    if (/(^|[\s_-])(iron|res-iron|resource-iron)([\s_-]|$)|eisen|fer|hierro|ferro|zelazo|żelazo/.test(markerText)) return "iron";
 
     return "";
   }
@@ -1034,13 +1059,13 @@
       /to village/i,
       /target village/i,
       /mottag/i,
-      /mÃ¥l/i,
+      /mål/i,
       /ziel/i,
       /destin/i,
       /cible/i,
       /destino/i
     ];
-    const originPatterns = [/origin/i, /source/i, /from/i, /ursprung/i, /frÃ¥n/i, /von/i, /origen/i];
+    const originPatterns = [/origin/i, /source/i, /from/i, /ursprung/i, /från/i, /von/i, /origen/i];
 
     for (let r = 0; r < headerRows.length; r++) {
       const cells = Array.from(headerRows[r].querySelectorAll("th, td"));
@@ -3844,48 +3869,44 @@
     }, delayMs);
   }
 
+  function handleBalancerEnterKeyDown(event) {
+    const key = event.key || event.code;
+    const isEnter = key === "Enter" || event.which === 13;
+
+    if (!isEnter) return;
+
+    if (event.repeat || state.enterKeyHeld) {
+      event.preventDefault();
+      return;
+    }
+
+    const button = getFirstEnabledSendButton();
+    if (!button) return;
+
+    state.enterKeyHeld = true;
+    event.preventDefault();
+    button.click();
+  }
+
+  function handleBalancerEnterKeyUp(event) {
+    const key = event.key || event.code;
+    if (key === "Enter" || event.which === 13) {
+      state.enterKeyHeld = false;
+    }
+  }
+
+  function handleBalancerWindowBlur() {
+    state.enterKeyHeld = false;
+  }
+
   function installHoldEnterSendHandler() {
     if (state.enterSendHandlerInstalled) return;
 
     state.enterSendHandlerInstalled = true;
     state.enterKeyHeld = false;
-
-    window.addEventListener("keydown", function (event) {
-      const key = event.key || event.code;
-      const isEnter = key === "Enter" || event.which === 13;
-
-      if (!isEnter) {
-        return;
-      }
-
-      // A held key generates repeated keydown events. Always suppress their default
-      // button activation and require a new physical key press for the next market action.
-      if (event.repeat || state.enterKeyHeld) {
-        event.preventDefault();
-        return;
-      }
-
-      const button = getFirstEnabledSendButton();
-
-      if (!button) {
-        return;
-      }
-
-      state.enterKeyHeld = true;
-      event.preventDefault();
-      button.click();
-    }, true);
-
-    window.addEventListener("keyup", function (event) {
-      const key = event.key || event.code;
-      if (key === "Enter" || event.which === 13) {
-        state.enterKeyHeld = false;
-      }
-    }, true);
-
-    window.addEventListener("blur", function () {
-      state.enterKeyHeld = false;
-    });
+    window.addEventListener("keydown", handleBalancerEnterKeyDown, true);
+    window.addEventListener("keyup", handleBalancerEnterKeyUp, true);
+    window.addEventListener("blur", handleBalancerWindowBlur);
   }
 
   function getCsrfToken() {
@@ -4925,6 +4946,12 @@
 
     const style = document.getElementById(STYLE_ID);
     if (style) style.remove();
+
+    window.removeEventListener("keydown", handleBalancerEnterKeyDown, true);
+    window.removeEventListener("keyup", handleBalancerEnterKeyUp, true);
+    window.removeEventListener("blur", handleBalancerWindowBlur);
+    state.enterSendHandlerInstalled = false;
+    state.enterKeyHeld = false;
 
     window.twacticsResourceBalancerLoaded = false;
     delete window.twacticsResourceBalancer;
