@@ -236,25 +236,54 @@
 	        return (h * 3600 + m * 60 + s) * 1000;
 	    }
 
+	    function getServerTimeParts() {
+	        const serverTimeEl = document.getElementById("serverTime");
+	        if (!serverTimeEl) return null;
+
+	        const match = serverTimeEl.textContent.trim().match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+	        if (!match) return null;
+
+	        return {
+	            hours: parseInt(match[1], 10),
+	            minutes: parseInt(match[2], 10),
+	            seconds: parseInt(match[3], 10)
+	        };
+	    }
+
 	    function parseSpecificTime(value) {
 	        if (!value) return null;
 
 	        const parts = value.split(":");
 	        if (parts.length < 2) return null;
 
-	        const now = new Date();
-	        const target = new Date();
-
-	        target.setHours(parseInt(parts[0], 10) || 0);
-	        target.setMinutes(parseInt(parts[1], 10) || 0);
-	        target.setSeconds(parts[2] ? parseInt(parts[2], 10) || 0 : 0);
-	        target.setMilliseconds(0);
-
-	        if (target <= now) {
-	            target.setDate(target.getDate() + 1);
+	        const serverTime = getServerTimeParts();
+	        if (!serverTime) {
+	            alert("Could not read the Tribal Wars server time.");
+	            return null;
 	        }
 
-	        return target.getTime() - now.getTime();
+	        const targetHours = parseInt(parts[0], 10) || 0;
+	        const targetMinutes = parseInt(parts[1], 10) || 0;
+	        const targetSeconds = parts[2] ? parseInt(parts[2], 10) || 0 : 0;
+
+	        const currentSeconds =
+	            serverTime.hours * 3600 +
+	            serverTime.minutes * 60 +
+	            serverTime.seconds;
+
+	        const targetTotalSeconds =
+	            targetHours * 3600 +
+	            targetMinutes * 60 +
+	            targetSeconds;
+
+	        let differenceSeconds = targetTotalSeconds - currentSeconds;
+
+	        // If the selected server time has already passed today, use tomorrow.
+	        if (differenceSeconds <= 0) {
+	            differenceSeconds += 24 * 60 * 60;
+	        }
+
+	        return differenceSeconds * 1000;
 	    }
 
 	    function clampDurationInput(input, maxValue) {
@@ -359,7 +388,7 @@
 	        content.style.padding = "12px";
 
 	        const help = document.createElement("div");
-	        help.textContent = "Choose a countdown duration or a specific target time.";
+	        help.textContent = "Choose a countdown duration or a specific Tribal Wars server time.";
 	        help.style.marginBottom = "10px";
 
 	        const durationLabel = document.createElement("div");
@@ -395,7 +424,7 @@
 	        durationWrap.appendChild(ss);
 
 	        const specificLabel = document.createElement("div");
-	        specificLabel.textContent = "Specific time";
+	        specificLabel.textContent = "Specific time (server time)";
 	        specificLabel.style.fontWeight = "bold";
 	        specificLabel.style.marginBottom = "5px";
 
@@ -503,7 +532,7 @@
 	        feedbackText.textContent = "Enjoy!";
 
 	        const createdBy = document.createElement("div");
-	        createdBy.textContent = "Created by Twactics";
+	        createdBy.textContent = "Created by Twactics (zidrox)";
 
 	        footer.appendChild(feedbackText);
 	        footer.appendChild(createdBy);
