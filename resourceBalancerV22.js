@@ -18,11 +18,9 @@
  * - Treats Build coverage as target queue time coverage, not only number of queued buildings
  * - Caps warehouse safety per resource so one overflowing resource does not block other resources
  * - Creates optional conservative relay replenishment requests after direct target requests
- * - Creates optional overflow/resource rotation requests from idle, farm-blocked or near-full villages
  * - Parses incoming trader resources from both icon/class markup and plain resource cells
  * - Stops planning if incoming rows are visible but cannot be parsed, to avoid duplicate overfill requests
  * - Allows relay middlemen without an active queue only when they do not have an active AM construction template
- * - Prioritizes moving surplus away from villages without AM construction templates and farm level 30 pressure
  * - Prioritizes nearest affordable donors in AM construction mode so urgent targets receive resources faster
  * - Adds UI toggle and click help dialogs for Low-point priority and Relay replenishment
  * - Ignores individual origin resource amounts below 500 to avoid tiny request fragments
@@ -33,6 +31,13 @@
  * - Allows one grouped manual request action per target row
  * - Tries to balance wood, clay and iron arrival timing within fixed 30-minute windows
  * - Supports TribalWars.scriptData settings input when enabled in the Script Library
+ * - Uses one shared network limiter for all GET/POST traffic (minimum 220ms between requests; below 5 requests/second)
+ * - Requires a fresh Enter key press for every market request; held/repeated Enter events are ignored
+ *
+ * v1.0.3:
+ * - Keeps the v1.0.1 planning/request logic unchanged.
+ * - Closes Resource Requester through a lightweight Twactics activation event.
+ * - Cleans up global Enter handlers on close and resets stale loaded state before reopening.
  *
  * This script does NOT:
  * - Send attacks, support, or troops
@@ -51,9 +56,6 @@
  *     "prioritizeLowPoints": true,
  *     "enableRelayReplenishment": true,
  *     "relaySafetyBufferMinutes": 30,
- *     "enableOverflowRotation": true,
- *     "overflowRotationSourcePercent": 88,
- *     "overflowRotationTargetLimitPercent": 88,
  *     "debugConsole": false
  *   }
  * }
@@ -75,19 +77,65 @@
 (function () {
   "use strict";
 
+  const TWACTICS_TOOL_ID = "resource-balancer";
+  const TWACTICS_ACTIVATE_EVENT = "twactics:activate";
+
+  function handleTwacticsActivate(event) {
+    const nextId = event && event.detail && event.detail.id;
+    if (!nextId || nextId === TWACTICS_TOOL_ID) return;
+    closeDialog();
+  }
+
+  window.addEventListener(TWACTICS_ACTIVATE_EVENT, handleTwacticsActivate);
+
+  // Backward-compatible fallback for Resource Requester versions that predate
+  // the shared activation event.
+  if (window.twacticsResourceRequester && typeof window.twacticsResourceRequester.close === "function") {
+    try {
+      window.twacticsResourceRequester.close();
+    } catch (err) {
+      console.warn("Twactics Resource Balancer could not close Resource Requester:", err);
+    }
+  } else {
+    const staleRequesterBox = document.getElementById("twactics-resource-requester");
+    if (staleRequesterBox) staleRequesterBox.remove();
+    const staleRequesterStyle = document.getElementById("twactics-resource-requester-style");
+    if (staleRequesterStyle) staleRequesterStyle.remove();
+  }
+
+  window.dispatchEvent(new CustomEvent(TWACTICS_ACTIVATE_EVENT, {
+    detail: { id: TWACTICS_TOOL_ID }
+  }));
+
   if (window.twacticsResourceBalancerLoaded) {
-    console.log("Twactics Resource Balancer already loaded");
-    return;
+    if (window.twacticsResourceBalancer && typeof window.twacticsResourceBalancer.close === "function") {
+      try {
+        window.twacticsResourceBalancer.close();
+      } catch (err) {
+        console.warn("Twactics Resource Balancer could not reset the previous instance:", err);
+      }
+    } else {
+      const staleBox = document.getElementById("twactics-resource-balancer");
+      if (staleBox) staleBox.remove();
+      const staleStyle = document.getElementById("twactics-resource-balancer-style");
+      if (staleStyle) staleStyle.remove();
+      window.twacticsResourceBalancerLoaded = false;
+    }
   }
 
   window.twacticsResourceBalancerLoaded = true;
 
   const SCRIPT_NAME = "Twactics Resource Balancer";
-  const SCRIPT_VERSION = "1.1.0";
+  const SCRIPT_VERSION = "1.0.3";
   const BOX_ID = "twactics-resource-balancer";
   const STYLE_ID = "twactics-resource-balancer-style";
   const DATA_VERSION = 1;
   const SETTINGS_STORAGE_KEY = "twacticsResourceBalancerSettings";
+  // Script Library review requirement: all script-started network traffic shares this limiter.
+  // 220ms minimum spacing is intentionally stricter than the 5 requests/second maximum.
+  const NETWORK_MIN_INTERVAL_MS = 220;
+  let networkRequestChain = Promise.resolve();
+  let lastNetworkRequestStartedAt = 0;
 
   const DEFAULTS = {
     useAmTemplates: true,
@@ -103,7 +151,7 @@
     emptyQueueBoost: 80,
     lowPointsBoost: 35,
     prioritizeLowPoints: true,
-    sendDelayMs: 50,
+    sendDelayMs: 250,
     donorPreference: "smart_balanced",
     donorDistancePenalty: 2.25,
     noTemplateDonorBonus: 75,
@@ -124,10 +172,6 @@
     queueSoonRefillBuildingCount: 1,
     enableRelayReplenishment: true,
     relaySafetyBufferMinutes: 30,
-    enableOverflowRotation: true,
-    overflowRotationSourcePercent: 88,
-    overflowRotationTargetLimitPercent: 88,
-    overflowRotationMaxSources: 80,
     debugConsole: false
   };
 
@@ -234,9 +278,6 @@
       prioritizeLowPoints: source.prioritizeLowPoints !== false,
       enableRelayReplenishment: source.enableRelayReplenishment !== false,
       relaySafetyBufferMinutes: Math.max(0, Math.min(360, parseFloatSafe(source.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes))),
-      enableOverflowRotation: source.enableOverflowRotation !== false,
-      overflowRotationSourcePercent: Math.max(50, Math.min(99, parseFloatSafe(source.overflowRotationSourcePercent, DEFAULTS.overflowRotationSourcePercent))),
-      overflowRotationTargetLimitPercent: Math.max(50, Math.min(99, parseFloatSafe(source.overflowRotationTargetLimitPercent, DEFAULTS.overflowRotationTargetLimitPercent))),
       debugConsole: source.debugConsole === true
     };
   }
@@ -296,8 +337,7 @@
       ui.reserveWarehousePercent,
       ui.maxDistance,
       ui.prioritizeLowPoints,
-      ui.enableRelayReplenishment,
-      ui.enableOverflowRotation
+      ui.enableRelayReplenishment
     ].forEach(input => {
       if (!input || input.__twacticsSettingsAutoSave) return;
       input.__twacticsSettingsAutoSave = true;
@@ -402,6 +442,34 @@
     return new Promise(resolve => window.setTimeout(resolve, Math.max(0, ms || 0)));
   }
 
+  function runRateLimitedNetworkRequest(task, label) {
+    const execute = async function () {
+      const elapsed = Date.now() - lastNetworkRequestStartedAt;
+      const remaining = Math.max(0, NETWORK_MIN_INTERVAL_MS - elapsed);
+
+      if (remaining > 0) {
+        await wait(remaining);
+      }
+
+      lastNetworkRequestStartedAt = Date.now();
+
+      if (state.lastSettings && state.lastSettings.debugConsole) {
+        console.log(SCRIPT_NAME + " network request", {
+          label: label || "request",
+          startedAt: new Date(lastNetworkRequestStartedAt).toISOString(),
+          minIntervalMs: NETWORK_MIN_INTERVAL_MS
+        });
+      }
+
+      return task();
+    };
+
+    // Chain both success and failure paths so every script-started request shares one queue.
+    const scheduled = networkRequestChain.then(execute, execute);
+    networkRequestChain = scheduled.catch(function () {});
+    return scheduled;
+  }
+
   function getHttpStatusFromError(err) {
     const message = err && err.message ? err.message : String(err || "");
     const match = message.match(/HTTP\s+(\d+)/i);
@@ -420,13 +488,15 @@
 
     while (attempt <= opts.retries) {
       try {
-        const response = await fetch(url, {
-          method: "GET",
-          credentials: "same-origin",
-          headers: {
-            Accept: "text/html, */*; q=0.01"
-          }
-        });
+        const response = await runRateLimitedNetworkRequest(function () {
+          return fetch(url, {
+            method: "GET",
+            credentials: "same-origin",
+            headers: {
+              Accept: "text/html, */*; q=0.01"
+            }
+          });
+        }, opts.label || ("GET " + url));
 
         if (!response.ok) {
           const error = new Error("HTTP " + response.status + " while loading " + url);
@@ -1648,10 +1718,12 @@
       console.warn(SCRIPT_NAME + " could not read cached building constants:", err);
     }
 
-    const response = await fetch("/interface.php?func=get_building_info", {
-      method: "GET",
-      credentials: "same-origin"
-    });
+    const response = await runRateLimitedNetworkRequest(function () {
+      return fetch("/interface.php?func=get_building_info", {
+        method: "GET",
+        credentials: "same-origin"
+      });
+    }, "GET building constants");
 
     if (!response.ok) {
       throw new Error("Could not load building constants.");
@@ -1952,9 +2024,6 @@
     const savedSettings = state.savedSettings || {};
     const enableRelayReplenishment = ui.enableRelayReplenishment ? ui.enableRelayReplenishment.checked : (savedSettings.enableRelayReplenishment !== undefined ? savedSettings.enableRelayReplenishment !== false : DEFAULTS.enableRelayReplenishment);
     const relaySafetyBufferMinutes = savedSettings.relaySafetyBufferMinutes !== undefined ? Math.max(0, Math.min(360, parseFloatSafe(savedSettings.relaySafetyBufferMinutes, DEFAULTS.relaySafetyBufferMinutes))) : DEFAULTS.relaySafetyBufferMinutes;
-    const enableOverflowRotation = ui.enableOverflowRotation ? ui.enableOverflowRotation.checked : (savedSettings.enableOverflowRotation !== undefined ? savedSettings.enableOverflowRotation !== false : DEFAULTS.enableOverflowRotation);
-    const overflowRotationSourcePercent = savedSettings.overflowRotationSourcePercent !== undefined ? Math.max(50, Math.min(99, parseFloatSafe(savedSettings.overflowRotationSourcePercent, DEFAULTS.overflowRotationSourcePercent))) : DEFAULTS.overflowRotationSourcePercent;
-    const overflowRotationTargetLimitPercent = savedSettings.overflowRotationTargetLimitPercent !== undefined ? Math.max(50, Math.min(99, parseFloatSafe(savedSettings.overflowRotationTargetLimitPercent, DEFAULTS.overflowRotationTargetLimitPercent))) : DEFAULTS.overflowRotationTargetLimitPercent;
     const debugConsole = savedSettings.debugConsole === true;
 
     return {
@@ -1991,10 +2060,6 @@
       prioritizeLowPoints: prioritizeLowPoints,
       enableRelayReplenishment: enableRelayReplenishment,
       relaySafetyBufferMinutes: relaySafetyBufferMinutes,
-      enableOverflowRotation: enableOverflowRotation,
-      overflowRotationSourcePercent: overflowRotationSourcePercent,
-      overflowRotationTargetLimitPercent: overflowRotationTargetLimitPercent,
-      overflowRotationMaxSources: DEFAULTS.overflowRotationMaxSources,
       debugConsole: debugConsole
     };
   }
@@ -2084,9 +2149,6 @@
       relayCandidates: [],
       relayAccepted: [],
       relayRejected: [],
-      overflowRotationCandidates: [],
-      overflowRotationAccepted: [],
-      overflowRotationRejected: [],
       targetExclusions: []
     };
 
@@ -2101,11 +2163,7 @@
     const relayLaunches = settings.enableRelayReplenishment
       ? buildRelayReplenishmentLaunches(directLaunches, targets, donors, settings, directLaunches.length + 1)
       : [];
-    const preRotationLaunches = directLaunches.concat(relayLaunches);
-    const overflowRotationLaunches = settings.enableOverflowRotation
-      ? buildOverflowRotationLaunches(preRotationLaunches, targets, donors, settings, preRotationLaunches.length + 1)
-      : [];
-    const launches = preRotationLaunches.concat(overflowRotationLaunches);
+    const launches = directLaunches.concat(relayLaunches);
     const targetPlans = groupLaunchesByTarget(launches, settings);
     const donorAudit = buildDonorAudit(donors, targets, launches, settings);
 
@@ -3192,305 +3250,6 @@
     return relayLaunches;
   }
 
-
-  function buildProjectedResourcesByCoord(villages, launches) {
-    const projected = new Map();
-
-    (villages || []).forEach(village => {
-      if (!village || !village.coord) return;
-      projected.set(village.coord, getCurrentResourcesWithIncoming(village));
-    });
-
-    (launches || []).forEach(launch => {
-      if (!launch || !launch.resources) return;
-
-      if (launch.origin && launch.origin.coord) {
-        const originProjected = projected.get(launch.origin.coord) || getCurrentResourcesWithIncoming(launch.origin);
-        subtractResources(originProjected, launch.resources);
-        originProjected.wood = Math.max(0, originProjected.wood || 0);
-        originProjected.stone = Math.max(0, originProjected.stone || 0);
-        originProjected.iron = Math.max(0, originProjected.iron || 0);
-        projected.set(launch.origin.coord, originProjected);
-      }
-
-      if (launch.target && launch.target.coord) {
-        const targetProjected = projected.get(launch.target.coord) || getCurrentResourcesWithIncoming(launch.target);
-        addResources(targetProjected, launch.resources);
-        projected.set(launch.target.coord, targetProjected);
-      }
-    });
-
-    return projected;
-  }
-
-  function getOverflowRotationTargetLimit(village, settings) {
-    const capacity = Math.max(0, village && village.capacity || 0);
-    if (capacity <= 0) return null;
-
-    const defaultSafe = settings.targetWarehouseLimitPercent !== undefined ? settings.targetWarehouseLimitPercent : DEFAULTS.targetWarehouseLimitPercent;
-    const rotationLimit = settings.overflowRotationTargetLimitPercent !== undefined ? settings.overflowRotationTargetLimitPercent : DEFAULTS.overflowRotationTargetLimitPercent;
-    const limitPercent = Math.max(0, Math.min(100, Math.min(defaultSafe, rotationLimit)));
-
-    return Math.floor(capacity * (limitPercent / 100));
-  }
-
-  function getOverflowRotationSpace(village, projectedResources, settings) {
-    const limit = getOverflowRotationTargetLimit(village, settings);
-    if (limit === null) return emptyResources();
-
-    const current = projectedResources || getCurrentResourcesWithIncoming(village);
-
-    return {
-      wood: Math.max(0, limit - (current.wood || 0)),
-      stone: Math.max(0, limit - (current.stone || 0)),
-      iron: Math.max(0, limit - (current.iron || 0))
-    };
-  }
-
-  function getOverflowRotationSourceResources(donor, settings) {
-    const village = donor && donor.village ? donor.village : null;
-    const available = donor && donor.available ? donor.available : emptyResources();
-    const current = village ? getCurrentResourcesOnly(village) : emptyResources();
-    const capacity = Math.max(0, village && village.capacity || 0);
-    const sourcePercent = settings.overflowRotationSourcePercent !== undefined ? settings.overflowRotationSourcePercent : DEFAULTS.overflowRotationSourcePercent;
-    const sourceLimit = capacity > 0 ? Math.floor(capacity * Math.max(0, Math.min(100, sourcePercent)) / 100) : 0;
-    const farmBlockedNoTemplate = Boolean(donor && donor.farmBlocked && !donor.hasTemplate);
-
-    const resources = emptyResources();
-
-    ["wood", "stone", "iron"].forEach(key => {
-      if (farmBlockedNoTemplate) {
-        resources[key] = Math.max(0, available[key] || 0);
-      } else {
-        const aboveSourceLimit = sourceLimit > 0 ? Math.max(0, (current[key] || 0) - sourceLimit) : 0;
-        resources[key] = Math.max(0, Math.min(available[key] || 0, aboveSourceLimit));
-      }
-    });
-
-    return cleanSmallResourceAmounts(resources, settings.minResourcePerOrigin).resources;
-  }
-
-  function getNearestTargetDistance(coord, targets) {
-    if (!coord || !targets || !targets.length) return 0;
-    let min = 9999;
-
-    targets.forEach(target => {
-      if (!target || !target.village || !target.village.coord) return;
-      const distance = getDistance(coord, target.village.coord);
-      if (distance < min) min = distance;
-    });
-
-    return min === 9999 ? 0 : min;
-  }
-
-  function getOverflowRotationTargetScore(sourceDonor, targetVillage, space, distance, activeTargets, projected, settings) {
-    const current = projected || getCurrentResourcesWithIncoming(targetVillage);
-    const capacity = Math.max(1, targetVillage.capacity || 1);
-    const targetFillRatio = Math.max(current.wood || 0, current.stone || 0, current.iron || 0) / capacity;
-    const sourceDistanceToNeed = getNearestTargetDistance(sourceDonor.village.coord, activeTargets);
-    const targetDistanceToNeed = getNearestTargetDistance(targetVillage.coord, activeTargets);
-    const closerToNeedBonus = activeTargets && activeTargets.length ? Math.max(-30, Math.min(60, (sourceDistanceToNeed - targetDistanceToNeed) * 4)) : 0;
-    const targetHasTemplate = Boolean(targetVillage.amTemplateName);
-    const targetQueueEmpty = (targetVillage.queueCount || 0) === 0 && (targetVillage.queueEndSeconds || 0) === 0;
-    const targetFarmBlocked = isFarmBlockedDonor(targetVillage, settings);
-
-    let score = totalResources(space) / 1000;
-    score -= distance * Math.max(0.35, settings.donorDistancePenalty * 0.55);
-    score += closerToNeedBonus;
-
-    if (targetHasTemplate) score += targetQueueEmpty ? 18 : 32;
-    if (!targetHasTemplate && !targetFarmBlocked) score += 14;
-    if (targetFarmBlocked) score -= 200;
-    score += Math.max(0, 1 - targetFillRatio) * 25;
-
-    return score;
-  }
-
-  function buildOverflowRotationLaunches(existingLaunches, targets, donors, settings, startId) {
-    const launches = [];
-    const activeTargets = (targets || []).filter(target => totalResources(target.need || emptyResources()) >= settings.minShipment);
-    const projected = buildProjectedResourcesByCoord(state.villages, existingLaunches || []);
-    const activeTargetIds = new Set(activeTargets.map(target => String(target.village.id)));
-    let launchId = Math.max(1, startId || 1);
-    let sourceCount = 0;
-
-    const sourceDonors = (donors || [])
-      .filter(donor => donor && donor.village && donor.merchantsAvailable > 0)
-      .map(donor => {
-        const rotationResources = getOverflowRotationSourceResources(donor, settings);
-        const total = Math.min(totalResources(rotationResources), donor.merchantsAvailable * settings.merchantCapacity);
-        const farmBlockedNoTemplate = Boolean(donor.farmBlocked && !donor.hasTemplate);
-        const current = getCurrentResourcesOnly(donor.village);
-        const capacity = Math.max(1, donor.village.capacity || 1);
-        const maxFillRatio = Math.max(current.wood || 0, current.stone || 0, current.iron || 0) / capacity;
-        return {
-          donor: donor,
-          resources: rotationResources,
-          total: total,
-          priority: (farmBlockedNoTemplate ? 100000 : 0) + maxFillRatio * 1000 + total / 1000
-        };
-      })
-      .filter(item => item.total >= settings.minShipment && hasResourceAtLeast(item.resources, settings.minResourcePerOrigin))
-      .sort((a, b) => b.priority - a.priority);
-
-    sourceDonors.forEach(source => {
-      if (sourceCount >= (settings.overflowRotationMaxSources || DEFAULTS.overflowRotationMaxSources)) return;
-      sourceCount += 1;
-
-      const donor = source.donor;
-      const donorId = String(donor.village.id);
-      const sourceResources = cloneResources(source.resources);
-      const candidateBase = {
-        origin: donor.village.coord,
-        originId: donor.village.id,
-        name: donor.village.name,
-        hasAmTemplate: donor.hasTemplate,
-        farmBlocked: donor.farmBlocked,
-        deadVillage: donor.deadVillage,
-        merchantsAvailable: donor.merchantsAvailable,
-        sourceResources: cloneResources(sourceResources),
-        reason: donor.deadVillage ? "farm capped + no AM template" : (donor.farmBlocked ? "farm capped / low free farm" : "resource above rotation source threshold")
-      };
-
-      if (state.debug && state.debug.overflowRotationCandidates) {
-        state.debug.overflowRotationCandidates.push(Object.assign({}, candidateBase));
-      }
-
-      let safety = 0;
-      while (totalResources(sourceResources) >= settings.minShipment && donor.merchantsAvailable > 0 && safety < 80) {
-        safety += 1;
-
-        const matches = (state.villages || [])
-          .filter(village => {
-            if (!village || !village.coord) return false;
-            if (String(village.id) === donorId) return false;
-            if (!village.has_rally_point && village.has_rally_point !== undefined) return false;
-            if (isFarmBlockedDonor(village, settings) && !village.amTemplateName) return false;
-
-            const distance = getDistance(donor.village.coord, village.coord);
-            if (settings.maxDistance > 0 && distance > settings.maxDistance) return false;
-
-            const space = getOverflowRotationSpace(village, projected.get(village.coord), settings);
-            const matching = getMatchingResources(space, sourceResources);
-            return totalResources(matching) >= settings.minShipment && hasResourceAtLeast(matching, settings.minResourcePerOrigin);
-          })
-          .map(village => {
-            const distance = getDistance(donor.village.coord, village.coord);
-            const travelMinutes = getTravelMinutes(distance, settings);
-            const arrivalBucket = getArrivalBucketIndex(travelMinutes, settings);
-            const space = getOverflowRotationSpace(village, projected.get(village.coord), settings);
-            const matching = getMatchingResources(space, sourceResources);
-            return {
-              village: village,
-              distance: distance,
-              travelMinutes: travelMinutes,
-              arrivalBucket: arrivalBucket,
-              space: space,
-              matching: matching,
-              score: getOverflowRotationTargetScore(donor, village, matching, distance, activeTargets, projected.get(village.coord), settings) + (activeTargetIds.has(String(village.id)) ? 10 : 0)
-            };
-          })
-          .sort((a, b) => {
-            if (Math.abs(b.score - a.score) > settings.scoreDistanceTieThreshold) return b.score - a.score;
-            if (a.distance !== b.distance) return a.distance - b.distance;
-            return b.score - a.score;
-          });
-
-        if (!matches.length) {
-          if (state.debug && state.debug.overflowRotationRejected) {
-            state.debug.overflowRotationRejected.push(Object.assign({}, candidateBase, {
-              remainingSourceResources: cloneResources(sourceResources),
-              reason: "no safe rotation target with warehouse space"
-            }));
-          }
-          break;
-        }
-
-        const match = matches[0];
-        const rotationNeed = getMatchingResources(match.matching, sourceResources);
-        const rotationTarget = {
-          village: match.village,
-          initialNeed: cloneResources(rotationNeed),
-          arrivalBuckets: new Map()
-        };
-        const shipment = createShipment(donor, rotationTarget, rotationNeed, settings, match);
-
-        if (totalResources(shipment.resources) < settings.minShipment || !hasResourceAtLeast(shipment.resources, settings.minResourcePerOrigin)) {
-          if (state.debug && state.debug.overflowRotationRejected) {
-            state.debug.overflowRotationRejected.push(Object.assign({}, candidateBase, {
-              target: match.village.coord,
-              targetId: match.village.id,
-              attempted: cloneResources(shipment.attemptedResources || emptyResources()),
-              kept: cloneResources(shipment.resources || emptyResources()),
-              reason: "rotation shipment below minimum after small-fragment filter"
-            }));
-          }
-          break;
-        }
-
-        subtractResources(donor.available, shipment.resources);
-        subtractResources(sourceResources, shipment.resources);
-        donor.merchantsAvailable = Math.max(0, donor.merchantsAvailable - shipment.merchantsUsed);
-        donor.totalAvailable = Math.min(totalResources(donor.available), donor.merchantsAvailable * settings.merchantCapacity);
-        donor.usedTotal += totalResources(shipment.resources);
-        donor.usedTransfers += 1;
-
-        const originProjected = projected.get(donor.village.coord) || getCurrentResourcesWithIncoming(donor.village);
-        subtractResources(originProjected, shipment.resources);
-        projected.set(donor.village.coord, originProjected);
-
-        const targetProjected = projected.get(match.village.coord) || getCurrentResourcesWithIncoming(match.village);
-        addResources(targetProjected, shipment.resources);
-        projected.set(match.village.coord, targetProjected);
-
-        const rotationReason = "Overflow rotation: moving surplus from " + (donor.deadVillage ? "farm-capped no-template village" : donor.farmBlocked ? "farm-capped village" : "near-full warehouse") + " into safe warehouse space";
-
-        const launch = {
-          id: launchId++,
-          origin: donor.village,
-          target: match.village,
-          resources: shipment.resources,
-          total: totalResources(shipment.resources),
-          merchantsUsed: shipment.merchantsUsed,
-          distance: match.distance,
-          travelMinutes: match.travelMinutes,
-          arrivalBucket: match.arrivalBucket,
-          targetScore: 0,
-          targetOrder: 200000 + launches.length,
-          targetPriorityTier: 95,
-          targetQueueCoverage: null,
-          donorScore: match.score,
-          targetReason: rotationReason,
-          donorReason: donor.reason,
-          isOverflowRotation: true,
-          planType: "rotation",
-          rotationSourceReason: candidateBase.reason,
-          rotationTargetSpaceBefore: cloneResources(match.space)
-        };
-
-        launches.push(launch);
-
-        if (state.debug && state.debug.overflowRotationAccepted) {
-          state.debug.overflowRotationAccepted.push({
-            origin: donor.village.coord,
-            originId: donor.village.id,
-            target: match.village.coord,
-            targetId: match.village.id,
-            resources: cloneResources(shipment.resources),
-            total: launch.total,
-            travelMinutes: Math.round(match.travelMinutes),
-            score: Math.round(match.score * 10) / 10,
-            sourceReason: candidateBase.reason,
-            targetSpaceBefore: cloneResources(match.space),
-            sourceRemaining: cloneResources(sourceResources)
-          });
-        }
-      }
-    });
-
-    return launches;
-  }
-
   function pushRelayRejected(candidate, reason) {
     if (!state.debug || !state.debug.relayRejected) return;
     state.debug.relayRejected.push(Object.assign({}, candidate || {}, { reason: reason }));
@@ -3537,8 +3296,7 @@
     const map = new Map();
 
     launches.forEach(launch => {
-      const planType = launch.planType || (launch.isRelay ? "relay" : (launch.isOverflowRotation ? "rotation" : "direct"));
-      const key = planType + ":" + String(launch.target.id);
+      const key = (launch.isRelay ? "relay:" : "direct:") + String(launch.target.id);
 
       if (!map.has(key)) {
         map.set(key, {
@@ -3554,8 +3312,7 @@
           targetPriorityTier: launch.targetPriorityTier,
           targetQueueCoverage: launch.targetQueueCoverage || null,
           isRelay: Boolean(launch.isRelay),
-          isOverflowRotation: Boolean(launch.isOverflowRotation),
-          planType: planType,
+          planType: launch.isRelay ? "relay" : "direct",
           relayOutgoingOffset: launch.relayOutgoingOffset ? cloneResources(launch.relayOutgoingOffset) : emptyResources(),
           relayOriginalTargets: launch.relayOriginalTargets ? launch.relayOriginalTargets.slice() : []
         });
@@ -3572,10 +3329,6 @@
           plan.relayOriginalTargets = launch.relayOriginalTargets.slice();
         }
       }
-      if (launch.isOverflowRotation) {
-        plan.isOverflowRotation = true;
-        plan.planType = "rotation";
-      }
       plan.launches.push(launch);
       plan.resources.wood += launch.resources.wood;
       plan.resources.stone += launch.resources.stone;
@@ -3590,11 +3343,8 @@
       plan.arrivalBalance = createArrivalBalanceSummary(plan, settings || DEFAULTS);
     });
 
-    const planTypeOrder = { direct: 0, relay: 1, rotation: 2 };
     return plans.sort((a, b) => {
-      const aOrder = planTypeOrder[a.planType || (a.isRelay ? "relay" : "direct")] || 0;
-      const bOrder = planTypeOrder[b.planType || (b.isRelay ? "relay" : "direct")] || 0;
-      if (aOrder !== bOrder) return aOrder - bOrder;
+      if (Boolean(a.isRelay) !== Boolean(b.isRelay)) return a.isRelay ? 1 : -1;
       return (a.targetOrder || 999999) - (b.targetOrder || 999999);
     });
   }
@@ -4011,9 +3761,6 @@
         prioritizeLowPoints: settings.prioritizeLowPoints,
         enableRelayReplenishment: settings.enableRelayReplenishment !== false,
         relaySafetyBufferMinutes: settings.relaySafetyBufferMinutes,
-        enableOverflowRotation: settings.enableOverflowRotation !== false,
-        overflowRotationSourcePercent: settings.overflowRotationSourcePercent,
-        overflowRotationTargetLimitPercent: settings.overflowRotationTargetLimitPercent,
         dataRequestDelayMs: DEFAULTS.dataRequestDelayMs,
         templateRequestDelayMs: DEFAULTS.templateRequestDelayMs,
         fetchRetryDelayMs: DEFAULTS.fetchRetryDelayMs,
@@ -4031,9 +3778,6 @@
         relayCandidates: debug.relayCandidates ? debug.relayCandidates.length : 0,
         relayAccepted: debug.relayAccepted ? debug.relayAccepted.length : 0,
         relayRejected: debug.relayRejected ? debug.relayRejected.length : 0,
-        overflowRotationCandidates: debug.overflowRotationCandidates ? debug.overflowRotationCandidates.length : 0,
-        overflowRotationAccepted: debug.overflowRotationAccepted ? debug.overflowRotationAccepted.length : 0,
-        overflowRotationRejected: debug.overflowRotationRejected ? debug.overflowRotationRejected.length : 0,
         incomingRowsParsed: debug.incomingTransportLoad && debug.incomingTransportLoad.selected ? debug.incomingTransportLoad.selected.rowsParsed : 0,
         queueCoverageTargetHours: settings.constructionHours,
         queueCoverageTargetBuildings: settings.targetQueueCoverageBuildings,
@@ -4074,11 +3818,6 @@
         accepted: debug.relayAccepted || [],
         rejected: debug.relayRejected || []
       },
-      overflowRotation: {
-        candidates: debug.overflowRotationCandidates || [],
-        accepted: debug.overflowRotationAccepted || [],
-        rejected: debug.overflowRotationRejected || []
-      },
       cappedTargets: debug.cappedTargets || [],
       skippedSmallShipments: debug.skippedSmallShipments || [],
       rejectedTinyResourceFragments: debug.rejectedTinyResourceFragments || []
@@ -4101,7 +3840,6 @@
       console.log("Unplanned targets", diagnostics.unplannedTargets);
       console.log("Target exclusions / no-need AM villages", diagnostics.targetExclusions);
       console.log("Relay replenishment", diagnostics.relayReplenishment);
-      console.log("Overflow rotation", diagnostics.overflowRotation);
       console.log("Capped targets", diagnostics.cappedTargets);
       console.log("Skipped small shipments", diagnostics.skippedSmallShipments);
       console.log("Rejected tiny resource fragments", diagnostics.rejectedTinyResourceFragments);
@@ -4152,27 +3890,46 @@
     }, delayMs);
   }
 
+  function handleBalancerEnterKeyDown(event) {
+    const key = event.key || event.code;
+    const isEnter = key === "Enter" || event.which === 13;
+
+    if (!isEnter) return;
+
+    // Keep the original v1.0.1 Enter behavior: one fresh key press per request.
+    if (event.repeat || state.enterKeyHeld) {
+      event.preventDefault();
+      return;
+    }
+
+    const button = getFirstEnabledSendButton();
+    if (!button) return;
+
+    state.enterKeyHeld = true;
+    event.preventDefault();
+    button.click();
+  }
+
+  function handleBalancerEnterKeyUp(event) {
+    const key = event.key || event.code;
+    if (key === "Enter" || event.which === 13) {
+      state.enterKeyHeld = false;
+    }
+  }
+
+  function handleBalancerWindowBlur() {
+    state.enterKeyHeld = false;
+  }
+
   function installHoldEnterSendHandler() {
     if (state.enterSendHandlerInstalled) return;
 
     state.enterSendHandlerInstalled = true;
+    state.enterKeyHeld = false;
 
-    window.addEventListener("keydown", function (event) {
-      const key = event.key || event.code;
-
-      if (key !== "Enter" && event.which !== 13) {
-        return;
-      }
-
-      const button = getFirstEnabledSendButton();
-
-      if (!button) {
-        return;
-      }
-
-      event.preventDefault();
-      button.click();
-    });
+    window.addEventListener("keydown", handleBalancerEnterKeyDown, true);
+    window.addEventListener("keyup", handleBalancerEnterKeyUp, true);
+    window.addEventListener("blur", handleBalancerWindowBlur);
   }
 
   function getCsrfToken() {
@@ -4194,25 +3951,27 @@
   }
 
   function postMarketAction(options, data) {
-    return new Promise((resolve, reject) => {
-      try {
-        TribalWars.post(
-          "market",
-          options,
-          data,
-          response => {
-            if (responseHasError(response)) {
-              reject(response);
-              return;
-            }
-            resolve(response);
-          },
-          error => reject(error)
-        );
-      } catch (err) {
-        reject(err);
-      }
-    });
+    return runRateLimitedNetworkRequest(function () {
+      return new Promise((resolve, reject) => {
+        try {
+          TribalWars.post(
+            "market",
+            options,
+            data,
+            response => {
+              if (responseHasError(response)) {
+                reject(response);
+                return;
+              }
+              resolve(response);
+            },
+            error => reject(error)
+          );
+        } catch (err) {
+          reject(err);
+        }
+      });
+    }, "POST market call");
   }
 
   function buildCallDataForTargetPlan(targetPlan) {
@@ -4320,13 +4079,6 @@
     renderDiagnostics(planResult);
   }
 
-  function getTargetPlanLabelPrefix(targetPlan) {
-    if (!targetPlan) return "";
-    if (targetPlan.isRelay || targetPlan.planType === "relay") return "Relay refill: ";
-    if (targetPlan.isOverflowRotation || targetPlan.planType === "rotation") return "Resource rotation: ";
-    return "";
-  }
-
   function renderTargetTable(targetPlans) {
     const title = document.createElement("div");
     title.className = "twrp-section-title";
@@ -4342,7 +4094,7 @@
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
 
-    ["#", "Target", "Resources", "Origins", "Merch", "Dist", "Action"].forEach(label => {
+    ["#", "Target", "Resources", "Origins", "Dist", "Action"].forEach(label => {
       const th = document.createElement("th");
       th.textContent = label;
       headRow.appendChild(th);
@@ -4357,11 +4109,16 @@
       const row = document.createElement("tr");
 
       appendCell(row, String(targetPlan.id));
-      appendCell(row, getTargetPlanLabelPrefix(targetPlan) + targetPlan.target.name, "twrp-left twrp-target-name");
+      appendCell(row, (targetPlan.isRelay ? "Relay refill: " : "") + targetPlan.target.name, "twrp-left twrp-target-name");
       const targetAudit = createTargetPlanStorageAudit(targetPlan, state.lastSettings || getSettings());
-      const incomingLine = totalResources(targetAudit.incoming) > 0 ? "\nIncoming: " + formatResources(targetAudit.incoming) : "\nIncoming: -";
-      const safeLine = targetAudit.safeLimit === null ? "" : "\nAfter: " + formatResources(targetAudit.afterPlanned) + " / safe " + formatNumber(targetAudit.safeLimit);
-      appendCell(row, formatResources(targetPlan.resources) + "\n" + (targetPlan.arrivalBalance || "") + incomingLine + safeLine, "twrp-left twrp-resource-cell");
+      const incomingLine = totalResources(targetAudit.incoming) > 0 ? "Incoming: " + formatResources(targetAudit.incoming) : "Incoming: -";
+      const safeLine = targetAudit.safeLimit === null ? "" : "After: " + formatResources(targetAudit.afterPlanned) + " / safe " + formatNumber(targetAudit.safeLimit);
+
+      const resourcesCell = document.createElement("td");
+      resourcesCell.className = "twrp-left twrp-resource-icons-cell";
+      resourcesCell.appendChild(createResourceIconLine(targetPlan.resources));
+      resourcesCell.title = [targetPlan.arrivalBalance || "", incomingLine, safeLine].filter(Boolean).join("\n");
+      row.appendChild(resourcesCell);
 
       const originsCell = document.createElement("td");
       originsCell.className = "twrp-left";
@@ -4379,7 +4136,7 @@
         line.className = "twrp-origin-line";
         line.innerHTML =
           "<strong>" + escapeHtml(launch.origin.name) + "</strong><br>" +
-          "<span>" + escapeHtml((launch.isRelay ? "Relay refill: " : (launch.isOverflowRotation ? "Resource rotation: " : "")) + formatResources(launch.resources)) + " | " +
+          "<span>" + escapeHtml((launch.isRelay ? "Relay refill: " : "") + formatResources(launch.resources)) + " | " +
           escapeHtml(launch.distance.toFixed(1)) + " fields" +
           (launch.travelMinutes !== undefined ? " | ~" + formatTravelMinutes(launch.travelMinutes) : "") +
           "</span>";
@@ -4390,7 +4147,6 @@
       originsCell.appendChild(details);
       row.appendChild(originsCell);
 
-      appendCell(row, String(targetPlan.merchantsUsed));
       appendCell(row, targetPlan.maxDistance.toFixed(1));
 
       const actionCell = document.createElement("td");
@@ -4501,44 +4257,6 @@
       ));
     }
 
-    const rotationData = state.lastDiagnostics && state.lastDiagnostics.overflowRotation ? state.lastDiagnostics.overflowRotation : null;
-    const rotationAccepted = rotationData && rotationData.accepted ? rotationData.accepted : [];
-    const rotationRejected = rotationData && rotationData.rejected ? rotationData.rejected : [];
-    const rotationRows = [];
-
-    rotationAccepted.slice(0, 8).forEach(row => {
-      rotationRows.push([
-        "Accepted",
-        row.origin || "",
-        row.target || "",
-        formatResources(row.resources || emptyResources()),
-        "~" + formatTravelMinutes(row.travelMinutes || 0),
-        row.sourceReason || "overflow rotation"
-      ]);
-    });
-
-    rotationRejected.slice(0, Math.max(0, 12 - rotationRows.length)).forEach(row => {
-      rotationRows.push([
-        "Rejected",
-        row.origin || row.name || "",
-        row.target || "-",
-        formatResources(row.remainingSourceResources || row.sourceResources || emptyResources()),
-        "-",
-        row.reason || "not eligible"
-      ]);
-    });
-
-    if (rotationRows.length) {
-      const rotationTitle = document.createElement("div");
-      rotationTitle.className = "twrp-section-title";
-      rotationTitle.textContent = "Overflow rotation audit";
-      details.appendChild(rotationTitle);
-      details.appendChild(createMiniTable(
-        ["Status", "Origin", "Staging target", "Resources", "Travel", "Reason"],
-        rotationRows
-      ));
-    }
-
     const donorTitle = document.createElement("div");
     donorTitle.className = "twrp-section-title";
     donorTitle.textContent = "Top donors / why used or skipped";
@@ -4588,6 +4306,33 @@
 
     table.appendChild(tbody);
     wrap.appendChild(table);
+
+    return wrap;
+  }
+
+  function createResourceIconLine(resources) {
+    const wrap = document.createElement("div");
+    wrap.className = "twrp-resource-line";
+
+    [
+      { key: "wood", icon: "/graphic/holz.png", label: "Wood" },
+      { key: "stone", icon: "/graphic/lehm.png", label: "Clay" },
+      { key: "iron", icon: "/graphic/eisen.png", label: "Iron" }
+    ].forEach(resource => {
+      const amount = Number(resources && resources[resource.key]) || 0;
+      if (amount <= 0) return;
+
+      const item = document.createElement("span");
+      item.className = "twrp-resource-badge";
+      item.innerHTML =
+        '<img src="' + resource.icon + '" alt="' + resource.label + '" title="' + resource.label + '">' +
+        '<span>' + escapeHtml(formatNumber(amount)) + '</span>';
+      wrap.appendChild(item);
+    });
+
+    if (!wrap.childNodes.length) {
+      wrap.textContent = "-";
+    }
 
     return wrap;
   }
@@ -5069,6 +4814,11 @@
 
       .twrp-main-table th:nth-child(3),
       .twrp-main-table td:nth-child(3) {
+        min-width: 180px;
+      }
+
+      .twrp-main-table th:nth-child(4),
+      .twrp-main-table td:nth-child(4) {
         min-width: 150px;
       }
 
@@ -5080,9 +4830,29 @@
         font-weight: bold;
       }
 
-      .twrp-resource-cell {
-        font-family: monospace;
-        font-size: 12px;
+      .twrp-resource-icons-cell {
+        white-space: nowrap;
+      }
+
+      .twrp-resource-line {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .twrp-resource-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-weight: bold;
+        color: #4b3318;
+      }
+
+      .twrp-resource-badge img {
+        width: 16px;
+        height: 16px;
+        display: block;
       }
 
       .twrp-origin-list {
@@ -5199,6 +4969,13 @@
 
     const style = document.getElementById(STYLE_ID);
     if (style) style.remove();
+
+    window.removeEventListener(TWACTICS_ACTIVATE_EVENT, handleTwacticsActivate);
+    window.removeEventListener("keydown", handleBalancerEnterKeyDown, true);
+    window.removeEventListener("keyup", handleBalancerEnterKeyUp, true);
+    window.removeEventListener("blur", handleBalancerWindowBlur);
+    state.enterSendHandlerInstalled = false;
+    state.enterKeyHeld = false;
 
     window.twacticsResourceBalancerLoaded = false;
     delete window.twacticsResourceBalancer;
@@ -5411,7 +5188,6 @@
     const maxDistance = createInput("Max distance", initialSettings.maxDistance);
     const prioritizeLowPoints = createCheckbox("Low-point priority", initialSettings.prioritizeLowPoints);
     const enableRelayReplenishment = createCheckbox("Relay replenishment", initialSettings.enableRelayReplenishment !== false);
-    const enableOverflowRotation = createCheckbox("Overflow rotation", initialSettings.enableOverflowRotation !== false);
 
     addHint(planMode.wrap, "AM template or WH %");
     addHint(constructionHours.wrap, "hours");
@@ -5420,7 +5196,6 @@
     addHint(maxDistance.wrap, "0 = any");
     addHint(prioritizeLowPoints.wrap, "lowest points first");
     addHint(enableRelayReplenishment.wrap, "refill used origins");
-    addHint(enableOverflowRotation.wrap, "move idle surplus");
 
     addInfoButton(
       prioritizeLowPoints.wrap,
@@ -5432,12 +5207,6 @@
       enableRelayReplenishment.wrap,
       "Relay replenishment",
       "After normal target requests, the planner can refill origin villages that just sent resources onward.\n\nExample: Village A sends resources to a target. Village B can send a refill to Village A, so Village A is not drained after helping.\n\nIf Village A has an active AM construction template, it must also have an active queue and the refill must arrive before the queue risks stopping.\n\nIf Village A has no active AM construction template, it may be used as a finished/idle middleman even without a queue. Relay still respects the 90% warehouse cap per resource."
-    );
-
-    addInfoButton(
-      enableOverflowRotation.wrap,
-      "Overflow rotation",
-      "Creates extra manual requests that move surplus away from idle villages, especially villages with no AM construction template and farm level 30 / low free farm.\n\nThe target village is chosen for safe warehouse space, distance, and whether it places resources closer to future construction targets. It still respects the warehouse safety cap and merchant limits.\n\nThis is not an automatic send. It only adds additional recommended request rows that you can review before clicking."
     );
 
     [
@@ -5452,8 +5221,7 @@
     toggleRow.className = "twrp-toggle-row";
     [
       prioritizeLowPoints.wrap,
-      enableRelayReplenishment.wrap,
-      enableOverflowRotation.wrap
+      enableRelayReplenishment.wrap
     ].forEach(node => toggleRow.appendChild(node));
 
     panel.appendChild(grid);
@@ -5511,7 +5279,6 @@
     ui.maxDistance = maxDistance.input;
     ui.prioritizeLowPoints = prioritizeLowPoints.input;
     ui.enableRelayReplenishment = enableRelayReplenishment.input;
-    ui.enableOverflowRotation = enableOverflowRotation.input;
     ui.planButton = planButton;
     ui.status = status;
     ui.results = results;
