@@ -14,9 +14,13 @@
  * - Reads incoming resource transports from Overview -> Transports -> Incoming
  * - Reads static village groups from Overview -> Groups
  * - Builds a manual request plan based on the player's exact resource inputs per target
+ * - Reserves origin resources and whole merchant slots across the full calculated plan
  * - Can optionally cap planned requests with overflow protection using current resources and incoming transports
  * - Uses TribalWars.scriptData as supported user-data input when enabled in the Script Library
  * - Saves in-UI changes locally in the browser as a convenience fallback
+ * - Routes every script-owned GET/POST through one shared network limiter (minimum 210ms between request starts; below 5 requests/second)
+ * - Caches non-volatile world/account metadata (group list and group membership coordinates) for one hour
+ * - Keeps live resources, merchants and incoming transports uncached so planning uses current values
  *
  * This script does NOT:
  * - Send attacks, support, or troops
@@ -77,11 +81,17 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.7";
+  const SCRIPT_VERSION = "v1.0.8";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
+  const WORLD_CACHE_STORAGE_KEY = "twacticsResourceRequesterWorldCache";
   const DATA_VERSION = 1;
+  const WORLD_CACHE_VERSION = 1;
+  const WORLD_CACHE_TTL_MS = 60 * 60 * 1000;
+  const NETWORK_MAX_REQUESTS_PER_SECOND = 5;
+  // 210ms keeps request starts below 5 requests/second while avoiding an extra send cooldown.
+  const NETWORK_MIN_INTERVAL_MS = 210;
   const REQUESTER_STARTUP_GUARD_KEY = "__twacticsResourceRequesterStartupGuardUntil";
   const REQUESTER_STARTUP_GUARD_MS = 2000;
   const DEBUG_PREFIX = "[Twactics Requester Debug]";
@@ -117,6 +127,12 @@
 
   const ui = {};
   let lastRequestEnterAt = 0;
+  let draggableCleanup = null;
+
+  // One shared limiter for every network request this script owns. Requests may overlap
+  // while in flight, but their start times are globally spaced by NETWORK_MIN_INTERVAL_MS.
+  let networkStartQueue = Promise.resolve();
+  let lastNetworkStartAt = 0;
 
   // Short startup guard: if the Script Library/browser accidentally fires the Balancer
   // immediately after Requester, the paired Balancer build will suppress that duplicate launch.
@@ -284,17 +300,19 @@
   }
 
   async function fetchHtml(url) {
-    const response = await fetch(url, {
-      method: "GET",
-      credentials: "same-origin",
-      headers: { "Accept": "text/html, */*; q=0.01" }
+    return scheduleNetworkRequest("GET " + url, async function () {
+      const response = await fetch(url, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { "Accept": "text/html, */*; q=0.01" }
+      });
+
+      if (!response.ok) {
+        throw new Error("HTTP " + response.status + " while loading " + url);
+      }
+
+      return response.text();
     });
-
-    if (!response.ok) {
-      throw new Error("HTTP " + response.status + " while loading " + url);
-    }
-
-    return response.text();
   }
 
   function parseHtml(html) {
@@ -472,7 +490,7 @@
     for (let i = 1; i < urls.length; i++) {
       const html = await fetchHtml(urls[i]);
       docs.push(parseHtml(html));
-      await wait(120);
+      // No local sleep is needed here. fetchHtml() uses the shared request limiter.
     }
 
     return docs;
@@ -482,7 +500,101 @@
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  function scheduleNetworkRequest(label, task) {
+    const gate = networkStartQueue.then(async function () {
+      const elapsed = Date.now() - lastNetworkStartAt;
+      const delay = Math.max(0, NETWORK_MIN_INTERVAL_MS - elapsed);
+
+      if (delay > 0) {
+        await wait(delay);
+      }
+
+      lastNetworkStartAt = Date.now();
+
+      debugLog("network start", {
+        label: label || "request",
+        minIntervalMs: NETWORK_MIN_INTERVAL_MS,
+        maxRequestsPerSecond: NETWORK_MAX_REQUESTS_PER_SECOND
+      });
+    });
+
+    // Advance the start gate independently of request completion. This keeps throughput
+    // responsive while still guaranteeing the minimum spacing between request starts.
+    networkStartQueue = gate.then(function () {}, function () {});
+
+    return gate.then(function () {
+      return task();
+    });
+  }
+
+  function getWorldCacheStorageKey() {
+    const world = typeof game_data !== "undefined" && game_data.world ? String(game_data.world) : "unknown-world";
+    const playerId = typeof game_data !== "undefined" && game_data.player && game_data.player.id
+      ? String(game_data.player.id)
+      : "unknown-player";
+    const sitterId = typeof game_data !== "undefined" && game_data.player
+      ? String(game_data.player.sitter || "0")
+      : "0";
+
+    return world + ":" + playerId + ":" + sitterId + ":" + WORLD_CACHE_STORAGE_KEY;
+  }
+
+  function readWorldCache() {
+    try {
+      const raw = localStorage.getItem(getWorldCacheStorageKey());
+      if (!raw) return { version: WORLD_CACHE_VERSION, entries: {} };
+
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.version !== WORLD_CACHE_VERSION || !parsed.entries || typeof parsed.entries !== "object") {
+        return { version: WORLD_CACHE_VERSION, entries: {} };
+      }
+
+      return parsed;
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not read world cache:", err);
+      return { version: WORLD_CACHE_VERSION, entries: {} };
+    }
+  }
+
+  function writeWorldCache(cache) {
+    try {
+      localStorage.setItem(getWorldCacheStorageKey(), JSON.stringify(cache));
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not write world cache:", err);
+    }
+  }
+
+  function getCachedWorldData(key) {
+    const cache = readWorldCache();
+    const entry = cache.entries[key];
+
+    if (!entry || typeof entry.cachedAt !== "number") return null;
+
+    if (Date.now() - entry.cachedAt >= WORLD_CACHE_TTL_MS) {
+      delete cache.entries[key];
+      writeWorldCache(cache);
+      return null;
+    }
+
+    return entry.value;
+  }
+
+  function setCachedWorldData(key, value) {
+    const cache = readWorldCache();
+    cache.entries[key] = {
+      cachedAt: Date.now(),
+      value: value
+    };
+    writeWorldCache(cache);
+    return value;
+  }
+
   async function loadGroupList() {
+    const cachedGroups = getCachedWorldData("group-list");
+    if (Array.isArray(cachedGroups) && cachedGroups.length) {
+      return cachedGroups;
+    }
+
     const url = buildGameUrl({ screen: "overview_villages", mode: "groups", type: "static", group: 0 });
     const html = await fetchHtml(url);
     const doc = parseHtml(html);
@@ -511,7 +623,7 @@
       groups.unshift({ id: "0", name: "All villages" });
     }
 
-    return groups;
+    return setCachedWorldData("group-list", groups);
   }
 
   function getVillageDataFromProductionRow(row) {
@@ -748,6 +860,12 @@
   async function getCoordsFromGroup(groupId) {
     if (!groupId) return [];
 
+    const cacheKey = "group-coords:" + String(groupId);
+    const cachedCoords = getCachedWorldData(cacheKey);
+    if (Array.isArray(cachedCoords)) {
+      return cachedCoords;
+    }
+
     const url = buildGameUrl({ screen: "overview_villages", mode: "prod", group: groupId, page: -1 });
     const html = await fetchHtml(url);
     const doc = parseHtml(html);
@@ -765,7 +883,7 @@
       });
     });
 
-    return coords;
+    return setCachedWorldData(cacheKey, coords);
   }
 
   async function resolveTabCoords(tab) {
@@ -908,6 +1026,28 @@
     return Math.max(0, Math.round((amounts && amounts.wood || 0) + (amounts && amounts.clay || 0) + (amounts && amounts.iron || 0)));
   }
 
+  function getUsableMerchantCapacity(capacityLeft) {
+    const merchantCapacity = getMerchantCapacity();
+    return Math.floor(Math.max(0, Number(capacityLeft || 0)) / merchantCapacity) * merchantCapacity;
+  }
+
+  function getMerchantCapacityCost(amounts) {
+    const total = totalAmounts(amounts);
+    if (total <= 0) return 0;
+
+    const merchantCapacity = getMerchantCapacity();
+    return Math.ceil(total / merchantCapacity) * merchantCapacity;
+  }
+
+  function reserveOriginForSend(origin, send) {
+    const merchantCost = getMerchantCapacityCost(send);
+
+    subtractAmounts(origin, send);
+    origin.merchantCapacityLeft = Math.max(0, origin.merchantCapacityLeft - merchantCost);
+
+    return merchantCost;
+  }
+
   function buildRequestPlan(tab, coords) {
     const originCoords = coords.origins.filter(coord => state.production.has(coord));
     const targetCoords = coords.targets.filter(coord => state.production.has(coord));
@@ -958,7 +1098,8 @@
         if (totalAmounts(need) <= 0) return;
 
         const origin = getOriginAvailability(originItem.coord, originState);
-        if (!origin || origin.merchantCapacityLeft <= 0) return;
+        const usableMerchantCapacity = origin ? getUsableMerchantCapacity(origin.merchantCapacityLeft) : 0;
+        if (!origin || usableMerchantCapacity <= 0) return;
 
         let send = {
           wood: Math.min(need.wood, origin.wood),
@@ -966,13 +1107,15 @@
           iron: Math.min(need.iron, origin.iron)
         };
 
-        send = scaleAmountsToCapacity(send, origin.merchantCapacityLeft);
+        send = scaleAmountsToCapacity(send, usableMerchantCapacity);
 
         if (totalAmounts(send) <= 0) return;
 
+        const merchantCost = getMerchantCapacityCost(send);
+        if (merchantCost > usableMerchantCapacity) return;
+
         subtractAmounts(need, send);
-        subtractAmounts(origin, send);
-        origin.merchantCapacityLeft -= totalAmounts(send);
+        reserveOriginForSend(origin, send);
 
         requests.push({
           originCoord: origin.coord,
@@ -982,7 +1125,9 @@
           wood: send.wood,
           clay: send.clay,
           iron: send.iron,
-          total: totalAmounts(send)
+          total: totalAmounts(send),
+          merchantCost: merchantCost,
+          merchantSlots: Math.ceil(merchantCost / getMerchantCapacity())
         });
       });
 
@@ -1082,12 +1227,16 @@
     const csrf = getCsrfToken();
     if (csrf) postOptions.h = csrf;
 
-    TribalWars.post("market", postOptions, data, function (response) {
+    scheduleNetworkRequest("POST market call " + row.targetCoord, function () {
+      return new Promise(function (resolve, reject) {
+        TribalWars.post("market", postOptions, data, resolve, reject);
+      });
+    }).then(function (response) {
       const message = response && (response.success || response.message) || "Request sent.";
       if (typeof UI !== "undefined" && UI.SuccessMessage) UI.SuccessMessage(message, 1500);
       console.log(SCRIPT_NAME + " request success", { targetCoord: row.targetCoord, response: response });
       removeRequestedRow(button);
-    }, function (error) {
+    }).catch(function (error) {
       console.error(SCRIPT_NAME + " request failed:", error);
       if (typeof UI !== "undefined" && UI.ErrorMessage) UI.ErrorMessage("Request failed.", 2000);
       if (button) {
@@ -1425,11 +1574,15 @@
   }
 
   function makeDraggable(box, handle) {
+    if (typeof draggableCleanup === "function") {
+      draggableCleanup();
+    }
+
     let isDragging = false;
     let offsetX = 0;
     let offsetY = 0;
 
-    handle.addEventListener("mousedown", function (event) {
+    function handleMouseDown(event) {
       if (event.target.closest && event.target.closest("button")) return;
 
       isDragging = true;
@@ -1441,19 +1594,31 @@
       box.style.top = rect.top + "px";
       box.style.right = "auto";
       document.body.style.userSelect = "none";
-    });
+    }
 
-    document.addEventListener("mousemove", function (event) {
+    function handleMouseMove(event) {
       if (!isDragging) return;
       box.style.left = Math.max(0, event.clientX - offsetX) + "px";
       box.style.top = Math.max(0, event.clientY - offsetY) + "px";
-    });
+    }
 
-    document.addEventListener("mouseup", function () {
+    function handleMouseUp() {
       if (!isDragging) return;
       isDragging = false;
       document.body.style.userSelect = "";
-    });
+    }
+
+    handle.addEventListener("mousedown", handleMouseDown);
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+
+    draggableCleanup = function () {
+      handle.removeEventListener("mousedown", handleMouseDown);
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.userSelect = "";
+      draggableCleanup = null;
+    };
   }
 
   function closeWidget() {
@@ -1464,6 +1629,10 @@
     if (style) style.remove();
 
     document.removeEventListener("keydown", handleRequestEnter, true);
+
+    if (typeof draggableCleanup === "function") {
+      draggableCleanup();
+    }
 
     delete window.twacticsResourceRequester;
   }
