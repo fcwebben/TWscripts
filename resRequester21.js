@@ -68,6 +68,7 @@
  * - The limiter spaces request starts by 220 ms, which stays below the requested maximum of 5 requests/second.
  * - Non-volatile group/world metadata is cached in localStorage for 60 minutes per world/player.
  * - Volatile resource, merchant and incoming-transport data is deliberately refreshed instead of cached for an hour.
+ * - v1.0.2: fixes tab/header icon encoding and enforces one active Twactics tool at a time.
  */
 
 /*
@@ -86,7 +87,7 @@
   "use strict";
 
   const SCRIPT_NAME = "Twactics Resource Requester";
-  const SCRIPT_VERSION = "v1.0.1";
+  const SCRIPT_VERSION = "v1.0.2";
   const BOX_ID = "twactics-resource-requester";
   const STYLE_ID = "twactics-resource-requester-style";
   const STORAGE_KEY = "twacticsResourceRequesterData";
@@ -129,6 +130,35 @@
 
   const ui = {};
   let lastRequestEnterAt = 0;
+  const TWACTICS_TOOL_KEY = "twacticsResourceRequester";
+  const TWACTICS_ACTIVE_TOOL_KEY = "__twacticsActiveTool";
+
+  function closeOtherTwacticsTools() {
+    const activeTool = window[TWACTICS_ACTIVE_TOOL_KEY];
+
+    if (activeTool && activeTool.key !== TWACTICS_TOOL_KEY && typeof activeTool.close === "function") {
+      try {
+        activeTool.close();
+      } catch (err) {
+        console.warn(SCRIPT_NAME + " could not close the previously active Twactics tool:", err);
+      }
+    }
+
+    Object.keys(window).forEach(key => {
+      if (!/^twactics/i.test(key) || key === TWACTICS_TOOL_KEY || key === TWACTICS_ACTIVE_TOOL_KEY) return;
+
+      const candidate = window[key];
+      if (!candidate || typeof candidate !== "object" || typeof candidate.close !== "function") return;
+
+      try {
+        candidate.close();
+      } catch (err) {
+        console.warn(SCRIPT_NAME + " could not close Twactics tool " + key + ":", err);
+      }
+    });
+  }
+
+  closeOtherTwacticsTools();
 
   // One shared limiter for every network request this script owns.
   // Requests may overlap while in flight, but their start times are globally spaced.
@@ -145,6 +175,12 @@
     reload: loadBaseDataAndRender,
     exportData: exportUserData,
     save: saveUiState
+  };
+
+  window[TWACTICS_ACTIVE_TOOL_KEY] = {
+    key: TWACTICS_TOOL_KEY,
+    name: SCRIPT_NAME,
+    close: closeWidget
   };
 
   function cleanText(value) {
@@ -1430,6 +1466,10 @@
 
     document.removeEventListener("keydown", handleRequestEnter, true);
 
+    if (window[TWACTICS_ACTIVE_TOOL_KEY] && window[TWACTICS_ACTIVE_TOOL_KEY].key === TWACTICS_TOOL_KEY) {
+      delete window[TWACTICS_ACTIVE_TOOL_KEY];
+    }
+
     delete window.twacticsResourceRequester;
   }
 
@@ -1508,7 +1548,7 @@
       renameButton.type = "button";
       renameButton.className = "twrr-tab-icon";
       renameButton.title = "Rename tab";
-      renameButton.textContent = "â";
+      renameButton.textContent = "\u270E";
       renameButton.addEventListener("click", function (event) {
         event.stopPropagation();
         renameTab(index);
@@ -1518,7 +1558,7 @@
       removeButton.type = "button";
       removeButton.className = "twrr-tab-icon twrr-tab-remove";
       removeButton.title = "Remove tab";
-      removeButton.textContent = "ð";
+      removeButton.textContent = "\uD83D\uDDD1";
       removeButton.addEventListener("click", function (event) {
         event.stopPropagation();
         removeTab(index);
@@ -1613,7 +1653,7 @@
     settingsButton.type = "button";
     settingsButton.className = "twrr-icon-button";
     settingsButton.title = "Settings";
-    settingsButton.textContent = "â";
+    settingsButton.textContent = "\u2699";
     settingsButton.addEventListener("click", function () {
       if (ui.settingsPanel) ui.settingsPanel.classList.toggle("twrr-open");
     });
@@ -1831,9 +1871,9 @@
     const summary = document.createElement("div");
     summary.className = "twrr-summary";
     summary.innerHTML =
-      "<strong>Origins:</strong> " + coords.origins.length + " Â· " +
-      "<strong>Targets:</strong> " + coords.targets.length + " Â· " +
-      "<strong>Max distance:</strong> " + state.settings.maxDistance + " Â· " +
+      "<strong>Origins:</strong> " + coords.origins.length + "\u00B7" +
+      "<strong>Targets:</strong> " + coords.targets.length + "\u00B7" +
+      "<strong>Max distance:</strong> " + state.settings.maxDistance + "\u00B7" +
       "<strong>Overflow protection:</strong> " + (state.settings.overflowProtection ? "on" : "off");
     ui.results.appendChild(summary);
 
