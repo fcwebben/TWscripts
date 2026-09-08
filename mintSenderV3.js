@@ -20,6 +20,7 @@
  * - Simulates planned relay incoming resources before choosing later relay destinations
  * - Uses one shared network limiter for all script-started GET/POST traffic
  * - Requires a separate manual action for every resource transfer
+ * - Skips any planned transfer below 900 total resources so every send uses at least one meaningful merchant load
  * - Supports TribalWars.scriptData settings input when enabled in the Script Library
  *
  * Routing overview:
@@ -92,7 +93,7 @@
     window.twacticsSmartResourceSenderLoaded = true;
 
     const SCRIPT_NAME = 'Twactics Smart Resource Sender';
-    const SCRIPT_VERSION = '1.0.0';
+    const SCRIPT_VERSION = '1.0.1';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 1;
@@ -100,6 +101,7 @@
     const LEGACY_STORAGE_KEY = 'smartTargetResourceRouter.settings.v2';
     const RESOURCE_KEYS = ['wood', 'stone', 'iron'];
     const MERCHANT_CAPACITY = 1000;
+    const MIN_TRANSFER_TOTAL = 900;
 
     // Script Library review requirement: keep script-started traffic below 5 requests/second.
     const NETWORK_MIN_INTERVAL_MS = 210;
@@ -652,7 +654,7 @@
                 allowedPriorities.includes(item.priority) &&
                 item.hopDistance <= hopRadius + 1e-9 &&
                 item.candidateToTarget + 1e-9 < sourceToTarget &&
-                item.useful > 0
+                item.useful >= MIN_TRANSFER_TOTAL
             )
             .sort((a, b) => {
                 if (a.priority !== b.priority) return a.priority - b.priority;
@@ -673,7 +675,7 @@
     function addDirectTransfer(transfers, source, finalTarget, rule, note, cfg) {
         const amount = calculateDirectShipment(source, cfg);
         const total = totalResources(amount);
-        if (total <= 0) return false;
+        if (total < MIN_TRANSFER_TOTAL) return false;
 
         const sourceBefore = maxFill(source);
         const merchants = applyOutgoing(source, amount);
@@ -710,7 +712,7 @@
         let relayedSomething = false;
         let safety = 0;
 
-        while (source.availableMerchants > 0 && totalResources(relayAvailable(source, cfg)) > 0 && safety++ < 100) {
+        while (source.availableMerchants > 0 && totalResources(relayAvailable(source, cfg)) >= MIN_TRANSFER_TOTAL && safety++ < 100) {
             const choice = findRelayCandidate(source, state, finalTarget, allowedPriorities, cfg);
             if (!choice) break;
 
@@ -718,7 +720,7 @@
             const receiverBefore = maxProjectedFill(choice.candidate);
             const amount = allocateRelayShipment(source, choice.candidate, choice.priority, cfg);
             const total = totalResources(amount);
-            if (total <= 0) break;
+            if (total < MIN_TRANSFER_TOTAL) break;
 
             const merchants = applyOutgoing(source, amount);
             applyIncoming(choice.candidate, amount);
@@ -1277,6 +1279,7 @@
                     <span class="twsr-pill">WH% = fullest resource</span>
                     <span class="twsr-pill">Closer-to-target relays only</span>
                     <span class="twsr-pill">Direct ratio 28 / 30 / 25</span>
+                    <span class="twsr-pill">Minimum 900 resources / send</span>
                     <span class="twsr-pill">Manual send per row</span>
                 </div>
 
