@@ -53,7 +53,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.2.1";
+  const SCRIPT_VERSION = "v1.2.2";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
@@ -333,6 +333,9 @@
 		villagesByCoord: new Map(),
 		inventoryRelics: [],
 		placedRelics: [],
+    inactiveRelicPlacements: [],
+    blockedPlacementCoords: new Set(),
+    blockedPlacementVillageIds: new Set(),
 		plan: [],
 		unlockedRelicSlots: 10,
     worldRelicSettings: {
@@ -1649,6 +1652,80 @@
     return "";
   }
 
+  function extractInactiveRelicPlacementsFromOverviewHtml(html) {
+    const doc = parseHtml(html);
+    const blocked = [];
+
+    Array.from(doc.querySelectorAll("table.inactive-relics-table tr")).forEach(row => {
+      if (row.querySelector("th")) return;
+
+      const locationCell = row.querySelector('[data-label="Location"]');
+      if (!locationCell) return;
+
+      const villageAnchor =
+        locationCell.querySelector(".village_anchor[data-id]") ||
+        row.querySelector(".village_anchor[data-id]");
+      const locationLink =
+        locationCell.querySelector('a[href*="screen=info_village"]') ||
+        locationCell.querySelector('a[href*="id="]');
+      const locationText = cleanText(locationLink ? locationLink.textContent : locationCell.textContent);
+      const coordData = parseCoord(locationText);
+      const villageId = cleanText(
+        (villageAnchor && villageAnchor.getAttribute("data-id")) ||
+        (locationLink && getParam("id", locationLink.getAttribute("href"))) ||
+        ""
+      );
+
+      if (!coordData && !villageId) return;
+
+      const relicNameEl = row.querySelector(".inactive-relic-name strong") || row.querySelector("td strong");
+      const inactiveUntilCell = row.querySelector('[data-label="Inactive until"]');
+
+      blocked.push({
+        villageId: villageId,
+        coord: coordData ? coordData.coord : "",
+        x: coordData ? coordData.x : null,
+        y: coordData ? coordData.y : null,
+        locationName: locationText,
+        relicName: cleanText(relicNameEl ? relicNameEl.textContent : "Inactive relic"),
+        inactiveUntil: cleanText(inactiveUntilCell ? inactiveUntilCell.textContent : "")
+      });
+    });
+
+    return uniqueBy(blocked, item => item.coord || ("id:" + item.villageId));
+  }
+
+  function rebuildBlockedPlacementVillages(inactiveRelics) {
+    state.inactiveRelicPlacements = (inactiveRelics || []).slice();
+    state.blockedPlacementCoords = new Set();
+    state.blockedPlacementVillageIds = new Set();
+
+    state.inactiveRelicPlacements.forEach(item => {
+      const villageId = cleanText(item && item.villageId);
+      const coord = cleanText(item && item.coord);
+
+      if (villageId) state.blockedPlacementVillageIds.add(villageId);
+      if (coord) state.blockedPlacementCoords.add(coord);
+
+      if (villageId && state.villagesById.has(villageId)) {
+        const village = state.villagesById.get(villageId);
+        if (village && village.coord) state.blockedPlacementCoords.add(village.coord);
+      }
+    });
+  }
+
+  function isPlacementVillageBlocked(village) {
+    if (!village) return false;
+
+    const villageId = cleanText(village.id);
+    const coord = cleanText(village.coord);
+
+    return !!(
+      (coord && state.blockedPlacementCoords && state.blockedPlacementCoords.has(coord)) ||
+      (villageId && state.blockedPlacementVillageIds && state.blockedPlacementVillageIds.has(villageId))
+    );
+  }
+
   function extractPlacedRelicsFromOverviewHtml(html) {
     const doc = parseHtml(html);
     const relics = [];
@@ -2348,7 +2425,7 @@
       const relicKey = getRelicIdentityKey(placement.relic);
       const centerKey = placement.center.coord;
 
-      if (usedRelics.has(relicKey) || usedCenters.has(centerKey)) {
+      if (usedRelics.has(relicKey) || usedCenters.has(centerKey) || isPlacementVillageBlocked(placement.center)) {
         return { valid: false, totalScore: -Infinity, totalWaste: Infinity, plan: [] };
       }
 
@@ -2406,6 +2483,7 @@
 
           for (let villageIndex = 0; villageIndex < state.villages.length; villageIndex++) {
             const center = state.villages[villageIndex];
+            if (isPlacementVillageBlocked(center)) continue;
 
             if (
               getRelicIdentityKey(relic) === getRelicIdentityKey(currentPlacements[index].relic) &&
@@ -2444,7 +2522,7 @@
 
       remainingRelics.forEach(relic => {
         state.villages.forEach(center => {
-          if (usedCenters.has(center.coord)) return;
+          if (usedCenters.has(center.coord) || isPlacementVillageBlocked(center)) return;
 
           const scored = calculatePlacementScore(relic, center, workingBonuses, goal, weighting, optimizationContext);
 
@@ -2565,6 +2643,7 @@
       state.inventoryRelics,
       extractPlacedRelicsFromOverviewHtml(responses[2])
     );
+    rebuildBlockedPlacementVillages(extractInactiveRelicPlacementsFromOverviewHtml(responses[2]));
 		state.unlockedRelicSlots = countUnlockedRelicSlotsFromOverviewHtml(responses[2]);
     applyWorldRelicSettings(detectWorldRelicSettings({
       inventoryRelics: state.inventoryRelics,
@@ -2594,6 +2673,7 @@
     console.log(SCRIPT_NAME + " focus group:", { id: state.focusGroupId, name: state.focusGroupName, coords: Array.from(state.focusCoords) });
 	  console.log(SCRIPT_NAME + " inventory relics:", state.inventoryRelics);
 	  console.log(SCRIPT_NAME + " placed relics:", state.placedRelics);
+    console.log(SCRIPT_NAME + " blocked placement villages (inactive/captured relics):", state.inactiveRelicPlacements);
     console.log(SCRIPT_NAME + " AM recruitment demand:", { active: state.recruitmentDemandActive, meta: state.amRecruitmentMeta, data: Array.from(state.amRecruitmentDemandByCoord.entries()) });
     console.log(SCRIPT_NAME + " world relic settings:", state.worldRelicSettings);
 
@@ -2649,6 +2729,9 @@
             ? " AM demand: active for " + state.amRecruitmentDemandScoringRows + " scoring village(s)."
             : " AM demand: unavailable/empty; balanced fallback used.")
         : "";
+      const blockedStatus = state.inactiveRelicPlacements.length
+        ? " Blocked placement villages: " + state.inactiveRelicPlacements.length + " (inactive/captured relics)."
+        : "";
 
       setStatus(
         "Loaded " +
@@ -2663,7 +2746,7 @@
           formatSettingNumber(getBenefitCap()) +
           "% (" +
           getBenefitCapSourceLabel() +
-          ")." + focusStatus + amStatus,
+          ")." + focusStatus + amStatus + blockedStatus,
         "success"
       );
     } catch (err) {
@@ -3161,6 +3244,14 @@ function buildVillageImpactSummary(plan) {
       ));
     }
 
+    if (state.inactiveRelicPlacements.length) {
+      contextBar.appendChild(createUiElement(
+        "span",
+        "twrp-context-pill",
+        "Blocked placement villages: " + state.inactiveRelicPlacements.length
+      ));
+    }
+
     ui.results.appendChild(summary);
     ui.results.appendChild(contextBar);
   }
@@ -3345,7 +3436,11 @@ function buildVillageImpactSummary(plan) {
     ];
 
     if ((state.lastGoal === "offense" || state.lastGoal === "recruitment") && state.focusGroupId !== "0") {
-      scoringParts.push("Only villages in Focus Group '" + state.focusGroupName + "' contribute score. Relics may still be placed on any owned village.");
+      scoringParts.push("Only villages in Focus Group '" + state.focusGroupName + "' contribute score. Relics may still be placed on any eligible owned village.");
+    }
+
+    if (state.inactiveRelicPlacements.length) {
+      scoringParts.push(state.inactiveRelicPlacements.length + " village(s) with inactive/captured relics are excluded as placement centers while they are locked. They can still receive relic effects from another village's range.");
     }
 
     if (state.lastGoal === "recruitment" && state.recruitmentDemandRequested) {
