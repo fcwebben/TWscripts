@@ -13,12 +13,12 @@
  * - Reads relic data from Treasury -> Inventory
  * - Reads placed relics from Treasury -> Overview
  * - Calculates suggested relic placements after a manual user click
- * - Can focus Offensive strength scoring on one village group while still placing relics on any owned village
+ * - Can focus Offensive strength or Recruitment output scoring on one village group while still placing relics on any owned village
  * - Can optionally read Account Manager troop targets/current counts for recruitment-demand scoring
  * - Uses diminishing-return scoring for Offense/Recruitment so balanced useful bonuses are preferred over one-stat stacking
  *
- * v1.2.0 notes:
- * - Placement universe is always all owned villages (group=0). Focus Group changes scoring targets, not placement eligibility.
+ * v1.2.1 notes:
+ * - Focus Group can be used for both Offensive strength and Recruitment output. Placement universe remains all owned villages (group=0).
  * - Optional AM demand mode reads screen=am_troops and /interface.php?func=get_unit_info only when enabled.
  * - AM remaining time is a workload estimate from target-current unit counts and world unit build times; it does not write to AM.
  *
@@ -53,7 +53,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.2.0";
+  const SCRIPT_VERSION = "v1.2.1";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
@@ -351,6 +351,8 @@
     amTemplates: [],
     amRecruitmentDemandByCoord: new Map(),
     amRecruitmentDemandMax: 0,
+    amRecruitmentDemandScoringMax: 0,
+    amRecruitmentDemandScoringRows: 0,
     amRecruitmentMeta: { rows: 0, timedRows: 0, timingSource: "none", note: "" },
     unitBuildTimes: {},
 		logs: []
@@ -1598,6 +1600,7 @@
     state.amRecruitmentDemandMax = demand.maxTotal;
     state.amRecruitmentMeta = demand.meta;
     state.recruitmentDemandActive = demand.map.size > 0 && demand.maxTotal > 0;
+    refreshRecruitmentDemandScoringScope();
 
     return { amUrl: amData.amUrl, templates: templates, rows: rows, demand: demand };
   }
@@ -1989,12 +1992,33 @@
     return state.amRecruitmentDemandByCoord && state.amRecruitmentDemandByCoord.get(village.coord);
   }
 
+  function refreshRecruitmentDemandScoringScope() {
+    let maxTotal = 0;
+    let rows = 0;
+
+    if (!state.amRecruitmentDemandByCoord) {
+      state.amRecruitmentDemandScoringMax = 0;
+      state.amRecruitmentDemandScoringRows = 0;
+      return;
+    }
+
+    state.amRecruitmentDemandByCoord.forEach((demand, coord) => {
+      if (!demand || demand.total <= 0) return;
+      if (state.focusGroupId !== "0" && (!state.focusCoords || !state.focusCoords.has(coord))) return;
+      rows += 1;
+      maxTotal = Math.max(maxTotal, Number(demand.total || 0));
+    });
+
+    state.amRecruitmentDemandScoringMax = maxTotal;
+    state.amRecruitmentDemandScoringRows = rows;
+  }
+
   function getScoringVillageWeight(village, goal, weighting, optimizationContext) {
     if (goal === "noble" && state.targetCoords && state.targetCoords.size) {
       return state.targetCoords.has(village.coord) ? 1 : 0;
     }
 
-    if (goal === "offense" && state.focusGroupId !== "0") {
+    if ((goal === "offense" || goal === "recruitment") && state.focusGroupId !== "0") {
       if (!state.focusCoords || !state.focusCoords.has(village.coord)) return 0;
     }
 
@@ -2002,8 +2026,9 @@
 
     if (goal === "recruitment" && state.recruitmentDemandActive) {
       const demand = getRecruitmentDemandForVillage(village);
-      if (!demand || demand.total <= 0 || state.amRecruitmentDemandMax <= 0) return 0;
-      const urgency = Math.sqrt(Math.min(1, demand.total / state.amRecruitmentDemandMax));
+      const scoringMax = Number(state.amRecruitmentDemandScoringMax || 0);
+      if (!demand || demand.total <= 0 || scoringMax <= 0) return 0;
+      const urgency = Math.sqrt(Math.min(1, demand.total / scoringMax));
       weight *= 0.35 + 0.65 * urgency;
     }
 
@@ -2082,7 +2107,11 @@
   function isVillageIncludedInGoalImpact(village, goal) {
     if (!village) return false;
     if (goal === "noble" && state.targetCoords && state.targetCoords.size) return state.targetCoords.has(village.coord);
-    if (goal === "offense" && state.focusGroupId !== "0") return state.focusCoords && state.focusCoords.has(village.coord);
+
+    if ((goal === "offense" || goal === "recruitment") && state.focusGroupId !== "0") {
+      if (!state.focusCoords || !state.focusCoords.has(village.coord)) return false;
+    }
+
     if (goal === "recruitment" && state.recruitmentDemandActive) {
       const demand = getRecruitmentDemandForVillage(village);
       return !!(demand && demand.total > 0);
@@ -2453,7 +2482,7 @@
     state.focusGroupId = "0";
     state.focusGroupName = "All villages";
 
-    if (goal !== "offense" || !ui.focusGroupSelect) return null;
+    if ((goal !== "offense" && goal !== "recruitment") || !ui.focusGroupSelect) return null;
 
     const groupId = String(ui.focusGroupSelect.value || "0");
     state.focusGroupId = groupId;
@@ -2482,6 +2511,8 @@
     state.amTemplates = [];
     state.amRecruitmentDemandByCoord = new Map();
     state.amRecruitmentDemandMax = 0;
+    state.amRecruitmentDemandScoringMax = 0;
+    state.amRecruitmentDemandScoringRows = 0;
     state.amRecruitmentMeta = { rows: 0, timedRows: 0, timingSource: "none", note: "" };
     state.unitBuildTimes = {};
   }
@@ -2511,8 +2542,10 @@
 		setStatus("Loading ALL villages for placement, relic data and selected Focus Group...", "warn");
 	  } else if (goal === "production") {
       setStatus("Loading all village building levels, inventory and overview data...", "warn");
-	  } else if (state.recruitmentDemandRequested) {
-      setStatus("Loading all villages, relic data and Account Manager troop demand...", "warn");
+	  } else if (goal === "recruitment" && state.recruitmentDemandRequested) {
+      setStatus("Loading all villages, relic data, selected Focus Group and Account Manager troop demand...", "warn");
+    } else if (goal === "recruitment") {
+      setStatus("Loading all villages, relic data and selected Focus Group...", "warn");
     } else {
 		setStatus("Loading all villages, inventory and overview data...", "warn");
 	  }
@@ -2608,12 +2641,12 @@
         urls: urls
       });
 
-      const focusStatus = goal === "offense"
+      const focusStatus = goal === "offense" || goal === "recruitment"
         ? " Focus: " + state.focusGroupName + " (" + (state.focusGroupId === "0" ? state.villages.length : state.focusCoords.size) + " scoring villages; placement can use all villages)."
         : "";
       const amStatus = goal === "recruitment" && state.recruitmentDemandRequested
         ? (state.recruitmentDemandActive
-            ? " AM demand: active for " + state.amRecruitmentMeta.rows + " village(s)."
+            ? " AM demand: active for " + state.amRecruitmentDemandScoringRows + " scoring village(s)."
             : " AM demand: unavailable/empty; balanced fallback used.")
         : "";
 
@@ -3112,7 +3145,7 @@ function buildVillageImpactSummary(plan) {
     contextBar.appendChild(createUiElement("span", "twrp-context-pill", getWeightingLabel(context.weighting)));
     contextBar.appendChild(createUiElement("span", "twrp-context-pill", getBenefitCapPillText()));
 
-    if (context.goal === "offense") {
+    if (context.goal === "offense" || context.goal === "recruitment") {
       contextBar.appendChild(createUiElement(
         "span",
         "twrp-context-pill",
@@ -3124,7 +3157,7 @@ function buildVillageImpactSummary(plan) {
       contextBar.appendChild(createUiElement(
         "span",
         "twrp-context-pill",
-        state.recruitmentDemandActive ? ("AM demand: " + state.amRecruitmentMeta.rows + " villages") : "AM demand: fallback"
+        state.recruitmentDemandActive ? ("AM demand: " + state.amRecruitmentDemandScoringRows + " scoring villages") : "AM demand: fallback"
       ));
     }
 
@@ -3198,7 +3231,7 @@ function buildVillageImpactSummary(plan) {
 
       const scoreRow = createUiElement("div", "twrp-score-row");
       scoreRow.appendChild(createMetricCard("Score", formatScore(item.score), "value"));
-      if (state.lastGoal === "offense" && state.focusGroupId !== "0") {
+      if ((state.lastGoal === "offense" || state.lastGoal === "recruitment") && state.focusGroupId !== "0") {
         scoreRow.appendChild(createMetricCard("Focus", item.scoredCoverageCount || 0, "of " + item.covered.length + " covered"));
       } else {
         scoreRow.appendChild(createMetricCard("Coverage", item.covered.length, "villages"));
@@ -3311,7 +3344,7 @@ function buildVillageImpactSummary(plan) {
       "Waste estimates value lost because scoring villages are already capped or near capped."
     ];
 
-    if (state.lastGoal === "offense" && state.focusGroupId !== "0") {
+    if ((state.lastGoal === "offense" || state.lastGoal === "recruitment") && state.focusGroupId !== "0") {
       scoringParts.push("Only villages in Focus Group '" + state.focusGroupName + "' contribute score. Relics may still be placed on any owned village.");
     }
 
@@ -3338,6 +3371,7 @@ function buildVillageImpactSummary(plan) {
 
     const rows = Array.from(state.amRecruitmentDemandByCoord.values())
       .filter(item => item.total > 0)
+      .filter(item => state.focusGroupId === "0" || (state.focusCoords && state.focusCoords.has(item.coord)))
       .sort((a, b) => b.total - a.total)
       .slice(0, 12);
 
@@ -4271,7 +4305,7 @@ function buildVillageImpactSummary(plan) {
         ui.nobleTargetWrap.style.display = goalSelect.value === "noble" ? "block" : "none";
       }
       if (ui.focusGroupWrap) {
-        ui.focusGroupWrap.style.display = goalSelect.value === "offense" ? "block" : "none";
+        ui.focusGroupWrap.style.display = (goalSelect.value === "offense" || goalSelect.value === "recruitment") ? "block" : "none";
       }
       if (ui.recruitmentDemandWrap) {
         ui.recruitmentDemandWrap.style.display = goalSelect.value === "recruitment" ? "block" : "none";
@@ -4356,7 +4390,7 @@ function buildVillageImpactSummary(plan) {
     focusAll.value = "0";
     focusAll.textContent = "All villages";
     focusGroupSelect.appendChild(focusAll);
-    const focusGroupHelp = createUiElement("small", "twrp-muted", "Only villages in this group contribute Offensive-strength score. Relics can still be placed on ANY owned village if their range reaches the focus group.");
+    const focusGroupHelp = createUiElement("small", "twrp-muted", "For Offensive strength or Recruitment output, only villages in this group contribute score. Relics can still be placed on ANY owned village if their range reaches the focus group.");
     focusGroupWrap.appendChild(focusGroupLabel);
     focusGroupWrap.appendChild(focusGroupSelect);
     focusGroupWrap.appendChild(focusGroupHelp);
