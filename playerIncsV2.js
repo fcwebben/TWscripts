@@ -13,8 +13,9 @@
  * - Reads the player's village list
  * - Fetches only villages that are visibly marked as having incoming attacks
  * - Reads incoming command rows from those village pages
- * - Opens each incoming attack's same-origin command details page in the background
- * - Reads the Origin -> Player from the command details instead of the editable command name
+ * - Resolves Origin players from command rows when available, otherwise from same-origin command details
+ * - Uses bounded parallel requests, retry/backoff, and a per-tab command-origin cache for speed
+ * - Reads the Origin -> Player instead of the editable command name
  * - Counts total / noble / large / medium / small attacks
  * - Aggregates attacks by attacking player
  * - Shows each attacker's share and number of targeted villages
@@ -44,10 +45,24 @@
     "use strict";
 
     const SCRIPT_NAME = "Twactics Incoming Analyzer";
-    const SCRIPT_VERSION = "v1.1.0";
+    const SCRIPT_VERSION = "v1.2.0";
     const BOX_ID = "twactics-incoming-analyzer";
-    const REQUEST_DELAY_MS = 250;
-    const COMMAND_REQUEST_DELAY_MS = 200;
+
+    // Keep a small, bounded number of same-origin requests in flight.
+    // This is much faster than sleeping after every request while still
+    // avoiding an unbounded Promise.all() burst.
+    const VILLAGE_CONCURRENCY = 4;
+    const COMMAND_CONCURRENCY = 6;
+    const FETCH_TIMEOUT_MS = 12000;
+    const MAX_FETCH_RETRIES = 2;
+    const UI_REFRESH_MS = 100;
+
+    // Command IDs are stable for the lifetime of a command. Cache resolved
+    // Origin players for the current browser tab so re-running the analyzer
+    // does not fetch the same command details again.
+    const CACHE_PREFIX = "twacticsIncomingAnalyzerOriginCache";
+    const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+    const MAX_CACHE_ENTRIES = 2000;
 
     const state = {
         stopped: false,
@@ -56,10 +71,15 @@
         failedCommands: 0,
         unresolvedCommands: 0,
         commandCount: 0,
+        commandsResolved: 0,
+        directOriginHits: 0,
+        cacheHits: 0,
+        networkCommandRequests: 0,
         totalPlayerVillages: 0,
         villagesWithIncomings: 0,
         totals: emptyCounts(),
-        attackers: new Map()
+        attackers: new Map(),
+        cacheDirty: false
     };
 
     if (window.twacticsIncomingAnalyzer && typeof window.twacticsIncomingAnalyzer.close === "function") {
@@ -106,6 +126,111 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    function getWorldCacheKey() {
+        const world = (typeof game_data !== "undefined" && game_data.world) ? game_data.world : window.location.host;
+        return CACHE_PREFIX + ":" + world;
+    }
+
+    function loadCommandCache() {
+        try {
+            const raw = sessionStorage.getItem(getWorldCacheKey());
+            if (!raw) return new Map();
+
+            const parsed = JSON.parse(raw);
+            const now = Date.now();
+            const map = new Map();
+
+            Object.keys(parsed || {}).forEach(commandId => {
+                const item = parsed[commandId];
+                if (!item || !item.player || !item.player.name || !item.savedAt) return;
+                if (now - item.savedAt > CACHE_TTL_MS) return;
+                map.set(String(commandId), item);
+            });
+
+            return map;
+        } catch (err) {
+            return new Map();
+        }
+    }
+
+    const commandCache = loadCommandCache();
+
+    function getCachedAttacker(commandId) {
+        if (!commandId) return null;
+        const item = commandCache.get(String(commandId));
+        if (!item) return null;
+
+        if (Date.now() - item.savedAt > CACHE_TTL_MS) {
+            commandCache.delete(String(commandId));
+            state.cacheDirty = true;
+            return null;
+        }
+
+        return item.player;
+    }
+
+    function cacheAttacker(commandId, attacker) {
+        if (!commandId || !attacker || !attacker.name) return;
+        commandCache.set(String(commandId), {
+            player: { id: String(attacker.id || ""), name: attacker.name },
+            savedAt: Date.now()
+        });
+        state.cacheDirty = true;
+    }
+
+    function saveCommandCache() {
+        if (!state.cacheDirty) return;
+
+        try {
+            const entries = Array.from(commandCache.entries())
+                .filter(entry => Date.now() - entry[1].savedAt <= CACHE_TTL_MS)
+                .sort((a, b) => b[1].savedAt - a[1].savedAt)
+                .slice(0, MAX_CACHE_ENTRIES);
+
+            const compact = {};
+            entries.forEach(entry => { compact[entry[0]] = entry[1]; });
+            sessionStorage.setItem(getWorldCacheKey(), JSON.stringify(compact));
+            state.cacheDirty = false;
+        } catch (err) {
+            // Cache failure must never break the scan.
+        }
+    }
+
+    async function runPool(items, concurrency, worker, onProgress) {
+        if (!items.length) return;
+
+        let nextIndex = 0;
+        let completed = 0;
+        const workerCount = Math.min(Math.max(1, concurrency), items.length);
+
+        async function runner() {
+            while (!state.stopped) {
+                const index = nextIndex++;
+                if (index >= items.length) return;
+
+                try {
+                    await worker(items[index], index);
+                } finally {
+                    completed += 1;
+                    if (typeof onProgress === "function") {
+                        onProgress(completed, items[index], index);
+                    }
+                }
+            }
+        }
+
+        await Promise.all(Array.from({ length: workerCount }, runner));
+    }
+
+    let uiRefreshTimer = null;
+    function scheduleResultsUpdate(playerName) {
+        if (uiRefreshTimer || state.stopped) return;
+        uiRefreshTimer = setTimeout(() => {
+            uiRefreshTimer = null;
+            if (!state.stopped) updateResults(playerName, false);
+        }, UI_REFRESH_MS);
+    }
+
     function getParam(name, url) {
         try {
             return new URL(url || window.location.href, window.location.origin).searchParams.get(name);
@@ -145,6 +270,11 @@
 
     function closeWidget() {
         state.stopped = true;
+        saveCommandCache();
+        if (uiRefreshTimer) {
+            clearTimeout(uiRefreshTimer);
+            uiRefreshTimer = null;
+        }
         const box = document.getElementById(BOX_ID);
         if (box) box.remove();
         if (window.twacticsIncomingAnalyzer) {
@@ -235,20 +365,45 @@
         return { all, withIncomings };
     }
 
-    async function fetchHtml(url) {
-        const response = await fetch(url, {
-            method: "GET",
-            credentials: "same-origin",
-            headers: {
-                "Accept": "text/html, */*; q=0.01"
+    async function fetchHtml(url, attempt) {
+        attempt = attempt || 0;
+        const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const timeout = controller ? setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS) : null;
+
+        try {
+            const response = await fetch(url, {
+                method: "GET",
+                credentials: "same-origin",
+                cache: "no-store",
+                headers: {
+                    "Accept": "text/html, */*; q=0.01"
+                },
+                signal: controller ? controller.signal : undefined
+            });
+
+            if (!response.ok) {
+                const retryable = response.status === 429 || response.status === 502 || response.status === 503 || response.status === 504;
+                if (retryable && attempt < MAX_FETCH_RETRIES) {
+                    const retryAfter = parseFloat(response.headers.get("Retry-After"));
+                    const waitMs = Number.isFinite(retryAfter)
+                        ? Math.max(300, retryAfter * 1000)
+                        : 350 * Math.pow(2, attempt);
+                    await sleep(waitMs);
+                    return fetchHtml(url, attempt + 1);
+                }
+                throw new Error("HTTP " + response.status);
             }
-        });
 
-        if (!response.ok) {
-            throw new Error("HTTP " + response.status);
+            return await response.text();
+        } catch (err) {
+            if (attempt < MAX_FETCH_RETRIES && err && err.name === "AbortError") {
+                await sleep(350 * Math.pow(2, attempt));
+                return fetchHtml(url, attempt + 1);
+            }
+            throw err;
+        } finally {
+            if (timeout) clearTimeout(timeout);
         }
-
-        return response.text();
     }
 
     function parseHtml(html) {
@@ -289,6 +444,27 @@
 
         if (!name) return null;
         return { name: name, id: id };
+    }
+
+    function getOriginPlayerFromCommandRow(row) {
+        // Some Tribal Wars markup variants expose a player link directly in the
+        // command row. If so, use it immediately and skip screen=info_command.
+        const targetPlayerId = getParam("id") || "";
+        const candidates = [];
+        const seen = new Set();
+
+        Array.from(row.querySelectorAll('a[href*="screen=info_player"]')).forEach(link => {
+            const player = getPlayerFromLink(link);
+            if (!player || !player.name) return;
+            if (targetPlayerId && player.id === targetPlayerId) return;
+
+            const key = player.id ? "id:" + player.id : "name:" + player.name.toLowerCase();
+            if (seen.has(key)) return;
+            seen.add(key);
+            candidates.push(player);
+        });
+
+        return candidates.length === 1 ? candidates[0] : null;
     }
 
     function getCommandDetails(row) {
@@ -430,6 +606,23 @@
                 commandUrl: command ? command.url : ""
             };
 
+            // Fast path 1: use an Origin player already present in the command row.
+            const directAttacker = getOriginPlayerFromCommandRow(row);
+            if (directAttacker) {
+                state.directOriginHits += 1;
+                addAttackToAttacker(directAttacker, attack);
+                if (attack.commandId) cacheAttacker(attack.commandId, directAttacker);
+                return;
+            }
+
+            // Fast path 2: reuse a command resolved earlier in this tab/session.
+            const cachedAttacker = getCachedAttacker(attack.commandId);
+            if (cachedAttacker) {
+                state.cacheHits += 1;
+                addAttackToAttacker(cachedAttacker, attack);
+                return;
+            }
+
             if (attack.commandUrl) {
                 pending.push(attack);
             } else {
@@ -441,8 +634,17 @@
     }
 
     async function resolveCommandAttacker(attack) {
+        const cached = getCachedAttacker(attack.commandId);
+        if (cached) {
+            state.cacheHits += 1;
+            return cached;
+        }
+
+        state.networkCommandRequests += 1;
         const html = await fetchHtml(attack.commandUrl);
-        return parseOriginPlayer(html);
+        const attacker = parseOriginPlayer(html);
+        if (attacker) cacheAttacker(attack.commandId, attacker);
+        return attacker;
     }
 
     function getSortedAttackers() {
@@ -826,7 +1028,10 @@
                 note.textContent = "Scan completed with " + parts.join(" and ") + ". Total attack counts remain available, but the attacker breakdown may be partial.";
             } else {
                 note.classList.remove("twia-warning");
-                note.textContent = "Scan completed. Every recognized incoming attack was matched to its Origin player from the command details page. No game actions were performed.";
+                note.textContent = "Scan completed. Every recognized incoming attack was matched to its Origin player. " +
+                    state.networkCommandRequests + " command-detail request" + (state.networkCommandRequests === 1 ? "" : "s") +
+                    " were needed; " + (state.directOriginHits + state.cacheHits) + " attack" + ((state.directOriginHits + state.cacheHits) === 1 ? "" : "s") +
+                    " were resolved without an extra command-detail request. No game actions were performed.";
             }
         }
     }
@@ -908,27 +1113,25 @@
         const pendingCommands = [];
         const seenCommandIds = new Set();
 
-        for (let i = 0; i < villages.withIncomings.length; i++) {
-            if (state.stopped) return;
-
-            const village = villages.withIncomings[i];
-
-            try {
-                const html = await fetchHtml(village.url);
-                pendingCommands.push(...parseVillageCommands(html, village, seenCommandIds));
-            } catch (err) {
-                state.failed += 1;
-                console.error("[" + SCRIPT_NAME + "] Failed to scan", village, err);
+        await runPool(
+            villages.withIncomings,
+            VILLAGE_CONCURRENCY,
+            async village => {
+                if (state.stopped) return;
+                try {
+                    const html = await fetchHtml(village.url);
+                    pendingCommands.push(...parseVillageCommands(html, village, seenCommandIds));
+                } catch (err) {
+                    state.failed += 1;
+                    console.error("[" + SCRIPT_NAME + "] Failed to scan", village, err);
+                }
+            },
+            completed => {
+                state.scanned = completed;
+                updateProgress(completed, villages.withIncomings.length, "Step 1/2: Scanning incoming commands...");
+                scheduleResultsUpdate(playerName);
             }
-
-            state.scanned = i + 1;
-            updateProgress(state.scanned, villages.withIncomings.length, "Step 1/2: Scanning incoming commands...");
-            updateResults(playerName, false);
-
-            if (i < villages.withIncomings.length - 1) {
-                await sleep(REQUEST_DELAY_MS);
-            }
-        }
+        );
 
         if (state.stopped) return;
 
@@ -937,35 +1140,39 @@
         if (pendingCommands.length) {
             updateProgress(0, pendingCommands.length, "Step 2/2: Resolving Origin players...");
 
-            for (let i = 0; i < pendingCommands.length; i++) {
-                if (state.stopped) return;
-
-                const attack = pendingCommands[i];
-
-                try {
-                    const attacker = await resolveCommandAttacker(attack);
-                    if (attacker) {
-                        addAttackToAttacker(attacker, attack);
-                    } else {
-                        state.unresolvedCommands += 1;
-                        console.warn("[" + SCRIPT_NAME + "] Could not identify Origin player for command", attack.commandId);
+            await runPool(
+                pendingCommands,
+                COMMAND_CONCURRENCY,
+                async attack => {
+                    if (state.stopped) return;
+                    try {
+                        const attacker = await resolveCommandAttacker(attack);
+                        if (attacker) {
+                            addAttackToAttacker(attacker, attack);
+                        } else {
+                            state.unresolvedCommands += 1;
+                            console.warn("[" + SCRIPT_NAME + "] Could not identify Origin player for command", attack.commandId);
+                        }
+                    } catch (err) {
+                        state.failedCommands += 1;
+                        console.error("[" + SCRIPT_NAME + "] Failed to resolve command", attack.commandId, err);
                     }
-                } catch (err) {
-                    state.failedCommands += 1;
-                    console.error("[" + SCRIPT_NAME + "] Failed to resolve command", attack.commandId, err);
+                },
+                completed => {
+                    state.commandsResolved = completed;
+                    updateProgress(completed, pendingCommands.length, "Step 2/2: Resolving Origin players...");
+                    scheduleResultsUpdate(playerName);
                 }
-
-                updateProgress(i + 1, pendingCommands.length, "Step 2/2: Resolving Origin players...");
-                updateResults(playerName, false);
-
-                if (i < pendingCommands.length - 1) {
-                    await sleep(COMMAND_REQUEST_DELAY_MS);
-                }
-            }
+            );
         }
 
         if (state.stopped) return;
 
+        if (uiRefreshTimer) {
+            clearTimeout(uiRefreshTimer);
+            uiRefreshTimer = null;
+        }
+        saveCommandCache();
         updateResults(playerName, true);
         const unresolved = state.unresolvedCommands + state.failedCommands;
         const finalStatus = unresolved || state.failed ? "Completed with warnings" : "Scan complete";
