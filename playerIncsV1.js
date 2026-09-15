@@ -13,6 +13,8 @@
  * - Reads the player's village list
  * - Fetches only villages that are visibly marked as having incoming attacks
  * - Reads incoming command rows from those village pages
+ * - Opens each incoming attack's same-origin command details page in the background
+ * - Reads the Origin -> Player from the command details instead of the editable command name
  * - Counts total / noble / large / medium / small attacks
  * - Aggregates attacks by attacking player
  * - Shows each attacker's share and number of targeted villages
@@ -42,14 +44,18 @@
     "use strict";
 
     const SCRIPT_NAME = "Twactics Incoming Analyzer";
-    const SCRIPT_VERSION = "v1.0.0";
+    const SCRIPT_VERSION = "v1.1.0";
     const BOX_ID = "twactics-incoming-analyzer";
     const REQUEST_DELAY_MS = 250;
+    const COMMAND_REQUEST_DELAY_MS = 200;
 
     const state = {
         stopped: false,
         scanned: 0,
         failed: 0,
+        failedCommands: 0,
+        unresolvedCommands: 0,
+        commandCount: 0,
         totalPlayerVillages: 0,
         villagesWithIncomings: 0,
         totals: emptyCounts(),
@@ -274,23 +280,82 @@
         });
     }
 
-    function getAttacker(row) {
-        const quickLabel = cleanText((row.querySelector(".quickedit-label") || {}).textContent);
-        let name = quickLabel ? cleanText(quickLabel.split(":")[0]) : "";
+    function getPlayerFromLink(link) {
+        if (!link) return null;
 
-        const playerLinks = Array.from(row.querySelectorAll('a[href*="screen=info_player"]'));
-        const playerLink = playerLinks.find(link => getParam("id", link.href || link.getAttribute("href"))) || playerLinks[0] || null;
-        const id = playerLink ? (getParam("id", playerLink.href || playerLink.getAttribute("href")) || "") : "";
+        const href = link.href || link.getAttribute("href") || "";
+        const id = getParam("id", href) || "";
+        const name = cleanText(link.textContent);
 
-        if (!name && playerLink) {
-            name = cleanText(playerLink.textContent);
+        if (!name) return null;
+        return { name: name, id: id };
+    }
+
+    function getCommandDetails(row) {
+        const links = Array.from(row.querySelectorAll('a[href*="screen=info_command"]'));
+        const link = links.find(item => getParam("id", item.href || item.getAttribute("href"))) || links[0] || null;
+
+        if (link) {
+            const href = link.href || link.getAttribute("href") || "";
+            const id = getParam("id", href) || "";
+            if (id) {
+                return { id: id, url: href };
+            }
         }
 
-        if (!name) {
-            name = "Unknown attacker";
+        // Fallback: command rows normally expose the command id on their quickedit node.
+        // Build the same screen=info_command&id=... URL ourselves if no direct link exists.
+        const quickEdit = row.querySelector(".quickedit[data-id]");
+        let id = quickEdit ? cleanText(quickEdit.getAttribute("data-id")) : "";
+
+        if (!id) {
+            const rowId = cleanText(row.getAttribute("data-id") || row.id || "");
+            const match = rowId.match(/(\d{5,})/);
+            id = match ? match[1] : "";
         }
 
-        return { name, id };
+        if (!id) return null;
+
+        const url = new URL("/game.php", window.location.origin);
+        const currentVillageId =
+            (typeof game_data !== "undefined" && game_data.village && game_data.village.id)
+                ? String(game_data.village.id)
+                : (getParam("village") || "");
+
+        if (currentVillageId) url.searchParams.set("village", currentVillageId);
+
+        if (
+            typeof game_data !== "undefined" &&
+            game_data.player &&
+            parseInt(game_data.player.sitter || 0, 10) > 0
+        ) {
+            url.searchParams.set("t", String(game_data.player.id));
+        }
+
+        url.searchParams.set("screen", "info_command");
+        url.searchParams.set("id", id);
+
+        return { id: id, url: url.pathname + url.search };
+    }
+
+    function parseOriginPlayer(html) {
+        const doc = parseHtml(html);
+
+        // On screen=info_command the origin player is the first player row in the
+        // command details table. Prefer the structural Origin row (rowspan=2), then
+        // fall back to the first info_player link in the command details page.
+        const rows = Array.from(doc.querySelectorAll("tr"));
+        for (const row of rows) {
+            const firstCell = row.querySelector(":scope > td[rowspan], :scope > th[rowspan]");
+            const playerLink = row.querySelector('a[href*="screen=info_player"]');
+            if (firstCell && playerLink) {
+                const player = getPlayerFromLink(playerLink);
+                if (player) return player;
+            }
+        }
+
+        const firstPlayerLink = doc.querySelector('a[href*="screen=info_player"]');
+        return getPlayerFromLink(firstPlayerLink);
     }
 
     function ensureAttacker(attacker) {
@@ -313,19 +378,26 @@
         return state.attackers.get(key);
     }
 
-    function addAttack(attacker, kind, noble, village) {
+    function countAttack(kind, noble) {
         state.totals.attacks += 1;
         state.totals[kind] += 1;
         if (noble) state.totals.noble += 1;
+    }
+
+    function addAttackToAttacker(attacker, attack) {
+        if (!attacker) {
+            state.unresolvedCommands += 1;
+            return;
+        }
 
         const entry = ensureAttacker(attacker);
         entry.attacks += 1;
-        entry[kind] += 1;
-        if (noble) entry.noble += 1;
-        entry.targets.add(village.coord || village.id || village.name || village.url);
+        entry[attack.kind] += 1;
+        if (attack.noble) entry.noble += 1;
+        entry.targets.add(attack.village.coord || attack.village.id || attack.village.name || attack.village.url);
     }
 
-    function parseVillageCommands(html, village) {
+    function parseVillageCommands(html, village, seenCommandIds) {
         const doc = parseHtml(html);
         let rows = Array.from(doc.querySelectorAll("#commands_outgoings tr.command-row"));
 
@@ -334,13 +406,43 @@
             rows = Array.from(doc.querySelectorAll("tr.command-row"));
         }
 
+        const pending = [];
+
         rows.forEach(row => {
             const kind = getAttackKind(row);
             if (!kind) return;
 
-            const attacker = getAttacker(row);
-            addAttack(attacker, kind, rowHasNoble(row), village);
+            const noble = rowHasNoble(row);
+            const command = getCommandDetails(row);
+
+            // Guard against accidental duplicate command rows without losing attacks
+            // that do not expose a command ID at all.
+            if (command && seenCommandIds.has(command.id)) return;
+            if (command) seenCommandIds.add(command.id);
+
+            countAttack(kind, noble);
+
+            const attack = {
+                kind: kind,
+                noble: noble,
+                village: village,
+                commandId: command ? command.id : "",
+                commandUrl: command ? command.url : ""
+            };
+
+            if (attack.commandUrl) {
+                pending.push(attack);
+            } else {
+                state.unresolvedCommands += 1;
+            }
         });
+
+        return pending;
+    }
+
+    async function resolveCommandAttacker(attack) {
+        const html = await fetchHtml(attack.commandUrl);
+        return parseOriginPlayer(html);
     }
 
     function getSortedAttackers() {
@@ -711,12 +813,20 @@
         if (copyBtn) copyBtn.disabled = state.attackers.size === 0;
 
         if (done && note) {
-            if (state.failed > 0) {
+            const unresolved = state.unresolvedCommands + state.failedCommands;
+            if (state.failed > 0 || unresolved > 0) {
                 note.classList.add("twia-warning");
-                note.textContent = "Scan completed with " + state.failed + " failed village request" + (state.failed === 1 ? "" : "s") + ". Results are partial.";
+                const parts = [];
+                if (state.failed > 0) {
+                    parts.push(state.failed + " failed village request" + (state.failed === 1 ? "" : "s"));
+                }
+                if (unresolved > 0) {
+                    parts.push(unresolved + " attack" + (unresolved === 1 ? "" : "s") + " with unresolved origin player");
+                }
+                note.textContent = "Scan completed with " + parts.join(" and ") + ". Total attack counts remain available, but the attacker breakdown may be partial.";
             } else {
                 note.classList.remove("twia-warning");
-                note.textContent = "Scan completed. Attacker totals add up to all recognized incoming attacks. No game actions were performed.";
+                note.textContent = "Scan completed. Every recognized incoming attack was matched to its Origin player from the command details page. No game actions were performed.";
             }
         }
     }
@@ -793,7 +903,10 @@
         }
 
         notify("success", "Scanning incomings for " + villages.withIncomings.length + " village" + (villages.withIncomings.length === 1 ? "" : "s") + "...");
-        updateProgress(0, villages.withIncomings.length, "Scanning incoming commands...");
+        updateProgress(0, villages.withIncomings.length, "Step 1/2: Scanning incoming commands...");
+
+        const pendingCommands = [];
+        const seenCommandIds = new Set();
 
         for (let i = 0; i < villages.withIncomings.length; i++) {
             if (state.stopped) return;
@@ -802,14 +915,14 @@
 
             try {
                 const html = await fetchHtml(village.url);
-                parseVillageCommands(html, village);
+                pendingCommands.push(...parseVillageCommands(html, village, seenCommandIds));
             } catch (err) {
                 state.failed += 1;
                 console.error("[" + SCRIPT_NAME + "] Failed to scan", village, err);
             }
 
             state.scanned = i + 1;
-            updateProgress(state.scanned, villages.withIncomings.length, "Scanning incoming commands...");
+            updateProgress(state.scanned, villages.withIncomings.length, "Step 1/2: Scanning incoming commands...");
             updateResults(playerName, false);
 
             if (i < villages.withIncomings.length - 1) {
@@ -819,9 +932,54 @@
 
         if (state.stopped) return;
 
+        state.commandCount = pendingCommands.length;
+
+        if (pendingCommands.length) {
+            updateProgress(0, pendingCommands.length, "Step 2/2: Resolving Origin players...");
+
+            for (let i = 0; i < pendingCommands.length; i++) {
+                if (state.stopped) return;
+
+                const attack = pendingCommands[i];
+
+                try {
+                    const attacker = await resolveCommandAttacker(attack);
+                    if (attacker) {
+                        addAttackToAttacker(attacker, attack);
+                    } else {
+                        state.unresolvedCommands += 1;
+                        console.warn("[" + SCRIPT_NAME + "] Could not identify Origin player for command", attack.commandId);
+                    }
+                } catch (err) {
+                    state.failedCommands += 1;
+                    console.error("[" + SCRIPT_NAME + "] Failed to resolve command", attack.commandId, err);
+                }
+
+                updateProgress(i + 1, pendingCommands.length, "Step 2/2: Resolving Origin players...");
+                updateResults(playerName, false);
+
+                if (i < pendingCommands.length - 1) {
+                    await sleep(COMMAND_REQUEST_DELAY_MS);
+                }
+            }
+        }
+
+        if (state.stopped) return;
+
         updateResults(playerName, true);
-        updateProgress(villages.withIncomings.length, villages.withIncomings.length, state.failed ? "Completed with warnings" : "Scan complete");
-        notify("success", "Incoming scan complete: " + formatNumber(state.totals.attacks) + " attacks from " + formatNumber(state.attackers.size) + " player" + (state.attackers.size === 1 ? "" : "s") + ".");
+        const unresolved = state.unresolvedCommands + state.failedCommands;
+        const finalStatus = unresolved || state.failed ? "Completed with warnings" : "Scan complete";
+        const finalTotal = pendingCommands.length || villages.withIncomings.length;
+        updateProgress(finalTotal, finalTotal, finalStatus);
+
+        const resolvedAttackCount = getSortedAttackers().reduce((sum, attacker) => sum + attacker.attacks, 0);
+        notify(
+            unresolved || state.failed ? "info" : "success",
+            "Incoming scan complete: " + formatNumber(state.totals.attacks) +
+            " attacks, " + formatNumber(resolvedAttackCount) +
+            " matched to " + formatNumber(state.attackers.size) +
+            " origin player" + (state.attackers.size === 1 ? "" : "s") + "."
+        );
     }
 
     run().catch(err => {
