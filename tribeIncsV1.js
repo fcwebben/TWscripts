@@ -17,7 +17,7 @@
  * - Resolves Origin -> Player from command details when needed
  * - Aggregates attacks by Origin player across the whole tribe
  * - Builds Origin player -> target member breakdowns
- * - Uses a strict global request-start limiter (~4.5 req/s)
+ * - Uses a faster adaptive global request-start limiter (~14 req/s base)
  * - Uses retry/backoff and a shared per-tab command-origin cache
  * - Uses only same-origin Tribal Wars pages
  *
@@ -45,17 +45,21 @@
     "use strict";
 
     const SCRIPT_NAME = "Twactics Tribe Incoming Analyzer";
-    const SCRIPT_VERSION = "v1.0.0";
+    const SCRIPT_VERSION = "v1.1.0";
     const BOX_ID = "twactics-tribe-incoming-analyzer";
 
-    // The older Get Incs script starts requests at a minimum 200 ms interval
-    // (5 starts/second). Stay slightly below that rate across ALL request types.
-    const REQUEST_START_INTERVAL_MS = 220; // ~4.54 request starts / second
-    const PROFILE_CONCURRENCY = 6;
-    const VILLAGE_CONCURRENCY = 6;
-    const COMMAND_CONCURRENCY = 6;
+    // Read-only page requests can be scheduled more aggressively than action
+    // submissions. Start at ~14.3 request starts/second, but automatically slow
+    // down if the server responds with throttling/transient overload statuses.
+    // The limiter is global across profile, village and command-detail requests.
+    const BASE_REQUEST_START_INTERVAL_MS = 70; // ~14.29 request starts / second
+    const MAX_REQUEST_START_INTERVAL_MS = 350; // ~2.86/s under sustained backoff
+    const RATE_RECOVERY_SUCCESS_COUNT = 25;
+    const PROFILE_CONCURRENCY = 12;
+    const VILLAGE_CONCURRENCY = 12;
+    const COMMAND_CONCURRENCY = 12;
     const FETCH_TIMEOUT_MS = 15000;
-    const MAX_FETCH_RETRIES = 2;
+    const MAX_FETCH_RETRIES = 3;
     const UI_REFRESH_MS = 150;
 
     // Reuse the same cache namespace as Twactics Incoming Analyzer v1.2.0 so
@@ -87,7 +91,10 @@
         networkCommandRequests: 0,
         cacheDirty: false,
         totalExpectedVillages: 0,
-        totalDiscoveredVillages: 0
+        totalDiscoveredVillages: 0,
+        currentRequestIntervalMs: BASE_REQUEST_START_INTERVAL_MS,
+        consecutiveRequestSuccesses: 0,
+        rateBackoffs: 0
     };
 
     if (window.twacticsTribeIncomingAnalyzer && typeof window.twacticsTribeIncomingAnalyzer.close === "function") {
@@ -364,11 +371,39 @@
     let requestGate = Promise.resolve();
     let lastRequestStart = 0;
 
+    function getCurrentRequestRate() {
+        return 1000 / Math.max(1, state.currentRequestIntervalMs);
+    }
+
+    function applyRateBackoff(status) {
+        const multiplier = status === 429 ? 2.0 : 1.5;
+        state.currentRequestIntervalMs = Math.min(
+            MAX_REQUEST_START_INTERVAL_MS,
+            Math.max(BASE_REQUEST_START_INTERVAL_MS, Math.ceil(state.currentRequestIntervalMs * multiplier))
+        );
+        state.consecutiveRequestSuccesses = 0;
+        state.rateBackoffs += 1;
+    }
+
+    function registerRequestSuccess() {
+        state.consecutiveRequestSuccesses += 1;
+        if (
+            state.currentRequestIntervalMs > BASE_REQUEST_START_INTERVAL_MS &&
+            state.consecutiveRequestSuccesses >= RATE_RECOVERY_SUCCESS_COUNT
+        ) {
+            state.currentRequestIntervalMs = Math.max(
+                BASE_REQUEST_START_INTERVAL_MS,
+                Math.floor(state.currentRequestIntervalMs * 0.8)
+            );
+            state.consecutiveRequestSuccesses = 0;
+        }
+    }
+
     function waitForRequestSlot() {
         const ticket = requestGate.then(async () => {
             if (state.stopped) throw new Error("Stopped");
             const elapsed = Date.now() - lastRequestStart;
-            const waitMs = Math.max(0, REQUEST_START_INTERVAL_MS - elapsed);
+            const waitMs = Math.max(0, state.currentRequestIntervalMs - elapsed);
             if (waitMs > 0) await sleep(waitMs);
             lastRequestStart = Date.now();
         });
@@ -395,17 +430,19 @@
 
             if (!response.ok) {
                 const retryable = response.status === 429 || response.status === 502 || response.status === 503 || response.status === 504;
+                if (retryable) applyRateBackoff(response.status);
                 if (retryable && attempt < MAX_FETCH_RETRIES) {
                     const retryAfter = parseFloat(response.headers.get("Retry-After"));
                     const waitMs = Number.isFinite(retryAfter)
                         ? Math.max(500, retryAfter * 1000)
-                        : 700 * Math.pow(2, attempt);
+                        : 500 * Math.pow(2, attempt);
                     await sleep(waitMs);
                     return fetchHtml(url, attempt + 1);
                 }
                 throw new Error("HTTP " + response.status + " for " + url);
             }
 
+            registerRequestSuccess();
             return await response.text();
         } catch (err) {
             if (attempt < MAX_FETCH_RETRIES && err && err.name === "AbortError") {
@@ -855,6 +892,13 @@
             " (" + formatBreakdown(counts, true) + ")";
     }
 
+    function tribeAttackText(counts) {
+        return formatNumber(counts.attacks) + " attack" + (counts.attacks === 1 ? "" : "s") +
+            " (Small: " + formatNumber(counts.small) +
+            " | Medium: " + formatNumber(counts.medium) +
+            " | Large: " + formatNumber(counts.large) + ")";
+    }
+
     function buildMemberRows() {
         if (!state.members.length) {
             return '<tr><td colspan="6" class="ttia-empty">No tribe members found.</td></tr>';
@@ -943,7 +987,7 @@
     function buildSummaryHtml() {
         const unresolved = state.unresolvedCommands + state.failedCommands;
         return [
-            '<div class="ttia-target">Tribe: <strong>' + escapeHtml(state.tribeName) + "</strong></div>",
+            '<div class="ttia-target">Tribe: <strong>' + escapeHtml(state.tribeName) + '</strong> - <strong>' + escapeHtml(tribeAttackText(state.totals)) + "</strong></div>",
             '<div class="ttia-summary-grid">',
             summaryItem("Members", formatNumber(state.members.length)),
             summaryItem("Expected villages", formatNumber(state.totalExpectedVillages)),
@@ -965,7 +1009,7 @@
 
     function buildCopyText() {
         const lines = [];
-        lines.push("Tribe " + state.tribeName + ":");
+        lines.push("Tribe: " + state.tribeName + " - " + tribeAttackText(state.totals));
 
         state.members.forEach(member => {
             lines.push(member.name + ": " + attackText(member.counts));
@@ -1094,7 +1138,7 @@
                 <div id="ttia-matrix" class="ttia-matrix">${buildMatrixHtml()}</div>
 
                 <div class="ttia-note" id="ttia-note">
-                    Request starts are globally spaced by ${REQUEST_START_INTERVAL_MS} ms (~${(1000 / REQUEST_START_INTERVAL_MS).toFixed(2)}/s). No game actions are performed.
+                    Read-only requests start at ~${(1000 / BASE_REQUEST_START_INTERVAL_MS).toFixed(1)}/s and automatically back off if Tribal Wars throttles the scan. No game actions are performed.
                 </div>
 
                 <div class="ttia-footer"><span>MIT</span><span>Created by Twactics (zidrox)</span></div>
@@ -1231,7 +1275,8 @@
                 note.textContent = "Scan complete. Every recognized incoming attack was matched to an Origin player. " +
                     state.networkCommandRequests + " command-detail request" + (state.networkCommandRequests === 1 ? "" : "s") +
                     " were needed; " + (state.directOriginHits + state.cacheHits) + " attack" + ((state.directOriginHits + state.cacheHits) === 1 ? "" : "s") +
-                    " were resolved without an extra command-detail request. Request starts stayed globally rate-limited.";
+                    " were resolved without an extra command-detail request. Final request rate: ~" + getCurrentRequestRate().toFixed(1) +
+                    "/s" + (state.rateBackoffs ? " after " + state.rateBackoffs + " automatic backoff" + (state.rateBackoffs === 1 ? "" : "s") : " (no backoff needed)") + ".";
             }
         }
     }
