@@ -16,14 +16,22 @@
  * - Detects rare/perfect substats from the game's `perfect` flag
  * - Classifies relics into custom tiers
  * - Keeps offense+defense, attack and defense as separate benefit buckets
+ * - Suggests what to keep, upgrade, reroll, use as material, or discard
  * - Does not perform any game action; analysis starts after a manual script run
  *
+ * v1.2.0:
+ * - Adds read-only Keep / Upgrade / Reroll / Material / Trash recommendations.
+ * - Upgrade planning groups relics by family + quality and never sacrifices a
+ *   better relic to upgrade a worse one.
+ * - Supports optional PP-assisted Shoddy/Sturdy upgrades using one material relic.
+ * - Renowned relics are treated as reroll-only because they cannot be upgraded.
+ * - Upgrade advice is conservative: only clearly weak duplicates are selected as
+ *   materials, while useful rolls are preserved.
+ *
  * v1.1.0:
- * - Inventory loading now uses the same RelicSystem.Inventory.init JSON method as
- *   Twactics Relic Planner.
- * - Rare detection now uses subStat.perfect === true.
+ * - Inventory loading uses RelicSystem.Inventory.init JSON, matching Relic Planner.
+ * - Rare detection uses subStat.perfect === true.
  * - Added structured sub-stat ID mapping and same-origin inventory fetching.
- * - Upgrade/reroll recommendations are intentionally reserved for a later version.
  *
  * This script does NOT:
  * - Send attacks, support, or troops
@@ -52,7 +60,7 @@
     try { window.__TW_RELIC_ANALYZER_V1__.destroy(); } catch (e) {}
   }
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const STAT_CAP = 20;
 
   // ------------------------------------------------------------
@@ -83,6 +91,20 @@
       scoutPerception: false
     },
 
+    recommendations: {
+      // Shoddy/Sturdy can upgrade with one same-family/same-quality material
+      // when the player is willing to spend Premium Points.
+      allowPPUpgrades: false,
+
+      // C-tier and better are preserved by default. D/E/F can become material.
+      // B-tier and better are considered strong enough to invest upgrade mats in.
+      keepThroughTier: 'C',
+      upgradeThroughTier: 'B',
+      materialFromTier: 'D'
+    },
+
+    // Legacy DOM hints retained only as text-fallback helpers. Inventory loading
+    // itself uses RelicSystem.Inventory.init JSON.
     // The scanner first tries these likely relic-card wrappers.
     // If none work, it falls back to scanning generic visible containers.
     selectors: [
@@ -140,6 +162,23 @@
     enhanced: 3,
     superior: 4,
     renowned: 5
+  };
+
+  const QUALITY_NEXT = {
+    shoddy: 'sturdy',
+    sturdy: 'enhanced',
+    enhanced: 'superior',
+    superior: 'renowned',
+    renowned: null
+  };
+
+  const ACTION_ORDER = {
+    UPGRADE: 0,
+    KEEP: 1,
+    REROLL: 2,
+    MATERIAL: 3,
+    TRASH: 4,
+    REVIEW: 5
   };
 
   const TIER_ORDER = {
@@ -587,7 +626,9 @@
       const relic = normalizeInventoryRelic(raw, index);
       if (relic) map.set(relic.id, relic);
     });
-    return Array.from(map.values());
+    const relics = Array.from(map.values());
+    buildInventoryRecommendations(relics);
+    return relics;
   }
 
   async function scanRelics() {
@@ -673,6 +714,169 @@
       }
       return sum;
     }, 0);
+  }
+
+  // ------------------------------------------------------------
+  // UPGRADE / REROLL RECOMMENDATION ENGINE (READ-ONLY)
+  // ------------------------------------------------------------
+
+  function tierRank(tier) {
+    return TIER_ORDER[tier] !== undefined ? TIER_ORDER[tier] : 999;
+  }
+
+  function tierAtLeastAsGood(tier, threshold) {
+    return tierRank(tier) <= tierRank(threshold);
+  }
+
+  function tierAtLeastAsBad(tier, threshold) {
+    return tierRank(tier) >= tierRank(threshold);
+  }
+
+  function compareRelicQualityForDecision(a, b) {
+    return (tierRank(a.tier) - tierRank(b.tier)) ||
+      ((b.rawRelevantValue || 0) - (a.rawRelevantValue || 0)) ||
+      ((b.substats || []).filter(s => s.rare).length - (a.substats || []).filter(s => s.rare).length) ||
+      String(a.id).localeCompare(String(b.id));
+  }
+
+  function compareWorstFirst(a, b) {
+    return (tierRank(b.tier) - tierRank(a.tier)) ||
+      ((a.rawRelevantValue || 0) - (b.rawRelevantValue || 0)) ||
+      ((a.substats || []).filter(s => s.rare).length - (b.substats || []).filter(s => s.rare).length) ||
+      String(a.id).localeCompare(String(b.id));
+  }
+
+  function getUpgradeMaterialCount(rarity) {
+    if ((rarity === 'shoddy' || rarity === 'sturdy') && CONFIG.recommendations.allowPPUpgrades) {
+      return 1;
+    }
+    return 2;
+  }
+
+  function baseRecommendation(relic) {
+    const rarity = relic.rarity;
+    const nextQuality = QUALITY_NEXT[rarity] || null;
+
+    if (!rarity) {
+      return { action:'REVIEW', reason:'Unknown quality; review manually.', nextQuality:null, materialIds:[] };
+    }
+
+    if (rarity === 'renowned') {
+      if (tierAtLeastAsGood(relic.tier, CONFIG.recommendations.keepThroughTier)) {
+        return {
+          action:'KEEP',
+          reason:'Renowned cannot be upgraded and this roll is useful enough to keep.',
+          nextQuality:null,
+          materialIds:[]
+        };
+      }
+      return {
+        action:'REROLL',
+        reason:'Renowned cannot be upgraded; weak roll, so reroll is the improvement path.',
+        nextQuality:null,
+        materialIds:[]
+      };
+    }
+
+    if (tierAtLeastAsGood(relic.tier, CONFIG.recommendations.keepThroughTier)) {
+      return {
+        action:'KEEP',
+        reason:'Useful roll. Preserve it as a potential upgrade target.',
+        nextQuality:nextQuality,
+        materialIds:[]
+      };
+    }
+
+    if (relic.tier === 'F') {
+      return {
+        action:'TRASH',
+        reason:'No useful rolled substats. Prefer material use when a valid upgrade target exists.',
+        nextQuality:nextQuality,
+        materialIds:[]
+      };
+    }
+
+    return {
+      action:'REROLL',
+      reason:'Weak roll and not currently needed as upgrade material.',
+      nextQuality:nextQuality,
+      materialIds:[]
+    };
+  }
+
+  function buildInventoryRecommendations(relics) {
+    (relics || []).forEach(relic => {
+      relic.recommendation = baseRecommendation(relic);
+    });
+
+    const groups = new Map();
+    (relics || []).forEach(relic => {
+      if (!relic.rarity || relic.rarity === 'renowned') return;
+      const key = relic.family + '::' + relic.rarity;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(relic);
+    });
+
+    groups.forEach(group => {
+      if (group.length < 2) return;
+
+      const sortedBest = group.slice().sort(compareRelicQualityForDecision);
+      const targets = sortedBest.filter(r => tierAtLeastAsGood(r.tier, CONFIG.recommendations.upgradeThroughTier));
+      if (!targets.length) return;
+
+      // One upgrade target per family+quality bucket for now. This prevents a
+      // recommendation chain from trying to consume the same material twice.
+      const target = targets[0];
+      const needed = getUpgradeMaterialCount(target.rarity);
+
+      const candidateMaterials = group
+        .filter(r => r.id !== target.id)
+        .filter(r => tierAtLeastAsBad(r.tier, CONFIG.recommendations.materialFromTier))
+        .sort(compareWorstFirst);
+
+      if (candidateMaterials.length < needed) return;
+
+      const chosen = candidateMaterials.slice(0, needed);
+      const nextQuality = QUALITY_NEXT[target.rarity];
+      target.recommendation = {
+        action:'UPGRADE',
+        reason:'Strong roll with enough clearly weaker same-family/same-quality relics available as material.',
+        nextQuality:nextQuality,
+        materialIds:chosen.map(r => r.id),
+        materialNames:chosen.map(r => r.name),
+        ppAssisted:(target.rarity === 'shoddy' || target.rarity === 'sturdy') && CONFIG.recommendations.allowPPUpgrades,
+        requiredMaterials:needed
+      };
+
+      chosen.forEach(material => {
+        material.recommendation = {
+          action:'MATERIAL',
+          reason:'Selected as a weaker material relic for #' + target.id + ' (' + target.name + ').',
+          targetId:target.id,
+          targetName:target.name,
+          nextQuality:null,
+          materialIds:[]
+        };
+      });
+    });
+
+    return relics;
+  }
+
+  function recommendationText(relic) {
+    const rec = relic && relic.recommendation;
+    if (!rec) return 'Review';
+    if (rec.action === 'UPGRADE') {
+      const mats = (rec.materialIds || []).map(id => '#' + id).join(', ');
+      return 'Upgrade to ' + titleCase(rec.nextQuality || '') +
+        (mats ? ' using ' + mats : '') +
+        (rec.ppAssisted ? ' + PP' : '');
+    }
+    if (rec.action === 'MATERIAL') return 'Material for #' + (rec.targetId || '?');
+    if (rec.action === 'REROLL') return 'Reroll';
+    if (rec.action === 'KEEP') return 'Keep';
+    if (rec.action === 'TRASH') return 'Trash / spare material';
+    return 'Review';
   }
 
   // ------------------------------------------------------------
@@ -764,7 +968,7 @@
           position: fixed;
           top: 18px;
           right: 18px;
-          width: min(920px, calc(100vw - 36px));
+          width: min(1180px, calc(100vw - 36px));
           max-height: calc(100vh - 36px);
           z-index: 2147483647;
           background: #f4e4bc;
@@ -845,6 +1049,14 @@
         #${UI_ID} .twra-tier-d { background: #dde0e3; }
         #${UI_ID} .twra-tier-e { background: #e9e0d5; }
         #${UI_ID} .twra-tier-f { background: #d7c4c4; }
+        #${UI_ID} .twra-action { display:inline-block; padding:2px 5px; border:1px solid rgba(0,0,0,.25); border-radius:2px; font-weight:bold; white-space:nowrap; }
+        #${UI_ID} .twra-action-upgrade { background:#bfe6a8; }
+        #${UI_ID} .twra-action-keep { background:#d8ef99; }
+        #${UI_ID} .twra-action-reroll { background:#ffe2a8; }
+        #${UI_ID} .twra-action-material { background:#d5dce6; }
+        #${UI_ID} .twra-action-trash { background:#e1c4c4; }
+        #${UI_ID} .twra-action-review { background:#eee; }
+        #${UI_ID} .twra-reason { max-width:260px; line-height:1.35; }
         #${UI_ID} .twra-rare { color: #762da8; font-weight: bold; }
         #${UI_ID} .twra-muted { opacity: .68; }
         #${UI_ID} .twra-empty { padding: 16px; line-height: 1.55; }
@@ -875,12 +1087,16 @@
           <option value="rarity">Rarity</option>
           <option value="family">Family</option>
           <option value="raw">Raw relevant value</option>
+          <option value="action">Recommendation</option>
         </select>
+        <label title="For Shoddy/Sturdy: allow one same-family/same-quality material relic plus Premium Points instead of two materials.">
+          <input type="checkbox" data-filter="pp" ${CONFIG.recommendations.allowPPUpgrades ? 'checked' : ''}> PP upgrade Shoddy/Sturdy
+        </label>
         <span class="twra-muted" data-role="count"></span>
       </div>
       <div class="twra-body" data-role="body"></div>
       <div class="twra-foot">
-        ★ = rare/perfect substat from game data. Tiering uses the 2 rolled substats, not the fixed main stat. Read-only analyzer; no game actions are performed.
+        ★ = rare/perfect substat from game data. Recommendations are advisory only. Materials are only selected from clearly weaker same-family + same-quality relics. No upgrade, reroll, destroy, or other game action is performed.
       </div>
     `;
 
@@ -892,6 +1108,9 @@
     function redraw() {
       const side = root.querySelector('[data-filter="side"]').value;
       const sort = root.querySelector('[data-filter="sort"]').value;
+      const ppBox = root.querySelector('[data-filter="pp"]');
+      CONFIG.recommendations.allowPPUpgrades = !!(ppBox && ppBox.checked);
+      buildInventoryRecommendations(state.relics);
       let rows = state.relics.slice();
 
       if (side !== 'ALL') rows = rows.filter(r => r.side === side);
@@ -908,6 +1127,7 @@
         }
         if (sort === 'family') return a.familyName.localeCompare(b.familyName);
         if (sort === 'raw') return b.rawRelevantValue - a.rawRelevantValue;
+        if (sort === 'action') return (ACTION_ORDER[a.recommendation?.action] ?? 99) - (ACTION_ORDER[b.recommendation?.action] ?? 99) || (TIER_ORDER[a.tier] - TIER_ORDER[b.tier]);
         return 0;
       });
 
@@ -935,6 +1155,8 @@
               <th>Substat 1</th>
               <th>Substat 2</th>
               <th>Relevant</th>
+              <th>Recommendation</th>
+              <th>Why</th>
             </tr>
           </thead>
           <tbody>
@@ -950,6 +1172,8 @@
                 <td class="twra-stat">${formatStat(r.substats[0])}</td>
                 <td class="twra-stat">${formatStat(r.substats[1])}</td>
                 <td>${r.rawRelevantValue}%</td>
+                <td><span class="twra-action twra-action-${String(r.recommendation?.action || 'review').toLowerCase()}">${cssEscape(recommendationText(r))}</span></td>
+                <td class="twra-reason">${cssEscape(r.recommendation?.reason || '')}</td>
               </tr>
             `).join('')}
           </tbody>
@@ -1027,6 +1251,7 @@
 
       window.__TW_RELIC_ANALYZER_V1__ = {
         version: VERSION, relics, config: CONFIG, scan: scanRelics, calculateTier,
+        buildInventoryRecommendations, recommendationText,
         evaluateAgainstCurrentStats, effectiveUnitAttack, effectiveUnitDefense,
         inventoryMethod: 'RelicSystem.Inventory.init JSON',
         destroy() {
@@ -1038,7 +1263,7 @@
             id:r.id, name:r.name, side:r.side, rarity:r.rarityName, tier:r.tierLabel,
             main:r.mainStat?.text || '', sub1:r.substats[0]?.text || '',
             sub1Rare:!!r.substats[0]?.rare, sub2:r.substats[1]?.text || '',
-            sub2Rare:!!r.substats[1]?.rare
+            sub2Rare:!!r.substats[1]?.rare, recommendation:recommendationText(r)
           })));
           return this.relics;
         }
