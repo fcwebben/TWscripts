@@ -1,50 +1,48 @@
 /*
- * Tribal Wars Relic Analyzer v1.0.0
- * ------------------------------------------------------------
- * Purpose:
- * - Scan relics visible in the current Tribal Wars relic/inventory UI
- * - Separate OFF and DEF relic families
- * - Detect main stat + substats where possible
- * - Detect rare (purple) substats where possible
- * - Classify relics into custom tiers
- * - Keep offense+defense / attack / defense as separate 20% buckets
- * - Show a sortable analyzer overlay
+ * Copyright (c) 2026 Twactics
+ * License: MIT
  *
- * IMPORTANT:
- * This is v1. The exact Tribal Wars relic DOM can differ between worlds/UI
- * versions. The scanner is intentionally defensive and text-driven.
- * If the game's DOM uses different wrappers, adjust SELECTORS below.
+ * Twactics Relic Analyzer
  *
- * Future v2 groundwork already included:
- * - rarity parsing (Shoddy / Sturdy / Enhanced / Superior / Renowned)
- * - normalized relic family
- * - relic object model suitable for upgrade / reroll recommendations
+ * Reads relic data from Treasury -> Inventory and classifies supported combat
+ * relics into custom OFF/DEF tiers. Relic inventory is read from the structured
+ * data passed to RelicSystem.Inventory.init(...), matching Twactics Relic Planner.
  *
- * OFF relic families:
- * - Greataxe
- * - Shortspear
- * - Bonfire
- * - Morningstar
- * - Shortbow
+ * This script:
+ * - Reads relic data from Treasury -> Inventory
+ * - Uses the game's structured relic JSON rather than scraping visible relic cards
+ * - Separates OFF and DEF relic families
+ * - Keeps the fixed main stat separate from the two rolled substats
+ * - Detects rare/perfect substats from the game's `perfect` flag
+ * - Classifies relics into custom tiers
+ * - Keeps offense+defense, attack and defense as separate benefit buckets
+ * - Does not perform any game action; analysis starts after a manual script run
  *
- * DEF relic families:
- * - Halberd
- * - Longsword
- * - Banner
- * - Longbow
+ * v1.1.0:
+ * - Inventory loading now uses the same RelicSystem.Inventory.init JSON method as
+ *   Twactics Relic Planner.
+ * - Rare detection now uses subStat.perfect === true.
+ * - Added structured sub-stat ID mapping and same-origin inventory fetching.
+ * - Upgrade/reroll recommendations are intentionally reserved for a later version.
  *
- * Stat cap model:
- * - unit.both     max 20
- * - unit.attack   max 20
- * - unit.defense  max 20
- * Therefore a unit can theoretically have +40% effective attack from
- * +20% offense&defense and +20% attack.
- *
- * Usage:
- * 1. Open the relic inventory / relic screen.
- * 2. Make sure the relics you want analyzed are loaded/visible.
- * 3. Paste/run this script in DevTools console OR wrap as a userscript.
- * 4. The analyzer window appears in the top-right.
+ * This script does NOT:
+ * - Send attacks, support, or troops
+ * - Auto-click game actions
+ * - Equip, remove, upgrade, trade, destroy, or reroll relics
+ * - Use external servers or external files
+ */
+
+/*
+ * Disclaimer:
+ * By uploading a user-generated mod for use with Tribal Wars, the creator grants
+ * InnoGames a perpetual, irrevocable, worldwide, royalty-free, non-exclusive
+ * license to use, reproduce, distribute, publicly display, modify, and create
+ * derivative works of the mod. This license permits InnoGames to incorporate the
+ * mod into any aspect of the game and its related services, including promotional
+ * and commercial endeavors, without any requirement for compensation or
+ * attribution to the uploader. The uploader represents and warrants that they
+ * have the legal right to grant this license and that the mod does not infringe
+ * upon any third-party rights. German law applies.
  */
 
 (function () {
@@ -54,7 +52,7 @@
     try { window.__TW_RELIC_ANALYZER_V1__.destroy(); } catch (e) {}
   }
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const STAT_CAP = 20;
 
   // ------------------------------------------------------------
@@ -336,327 +334,268 @@
   }
 
   // ------------------------------------------------------------
-  // RARE DETECTION
+  // STRUCTURED INVENTORY LOADING
   // ------------------------------------------------------------
 
-  function rgbFromCssColor(css) {
-    if (!css) return null;
+  const SUB_STAT_KEYS_BY_ID = {
+    1: 'spear_offdef', 2: 'sword_offdef', 3: 'axe_offdef', 4: 'archer_offdef',
+    5: 'light_offdef', 6: 'marcher_offdef', 7: 'heavy_offdef',
+    8: 'catapult_damage', 9: 'ram_damage',
+    10: 'barracks_speed', 11: 'stable_speed', 12: 'workshop_speed',
+    13: 'haul_capacity', 14: 'clay_production', 15: 'wood_production',
+    16: 'iron_production', 19: 'barracks_cost', 20: 'stable_cost',
+    21: 'workshop_cost', 22: 'spear_attack', 23: 'sword_attack',
+    24: 'axe_attack', 25: 'archer_attack', 26: 'marcher_attack',
+    27: 'light_attack', 28: 'heavy_attack', 29: 'catapult_attack',
+    30: 'ram_attack', 31: 'spear_defense', 32: 'sword_defense',
+    33: 'axe_defense', 34: 'archer_defense', 35: 'light_defense',
+    36: 'marcher_defense', 37: 'heavy_defense', 38: 'catapult_defense',
+    39: 'ram_defense', 40: 'construction_speed', 41: 'merchant_travel_speed',
+    42: 'merchant_capacity', 43: 'academy_speed', 44: 'noble_refund'
+  };
 
-    let m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
-    if (m) return { r: +m[1], g: +m[2], b: +m[3] };
+  const MAIN_STAT_KEYS = {
+    halberd: 'spear_offdef',
+    longsword: 'sword_offdef',
+    greataxe: 'axe_offdef',
+    shortspear: 'light_offdef',
+    longbow: 'archer_offdef',
+    shortbow: 'marcher_offdef',
+    banner: 'heavy_offdef',
+    morningstar: 'ram_damage',
+    bonfire: 'catapult_damage'
+  };
 
-    m = css.match(/^#([0-9a-f]{6})$/i);
-    if (m) {
-      const n = parseInt(m[1], 16);
-      return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+  const INTERNAL_LABELS = {
+    spear_offdef: 'Spear fighter offense and defense power',
+    sword_offdef: 'Swordsman offense and defense power',
+    axe_offdef: 'Axeman offense and defense power',
+    archer_offdef: 'Archer offense and defense power',
+    light_offdef: 'Light cavalry offense and defense power',
+    marcher_offdef: 'Mounted archer offense and defense power',
+    heavy_offdef: 'Heavy cavalry offense and defense power',
+    catapult_damage: 'Catapult damage against buildings',
+    ram_damage: 'Ram damage against buildings',
+    barracks_speed: 'Barracks Recruit Speed',
+    stable_speed: 'Stable Recruit Speed',
+    workshop_speed: 'Workshop Recruit Speed',
+    haul_capacity: 'haul capacity', clay_production: 'clay production',
+    wood_production: 'wood production', iron_production: 'iron production',
+    barracks_cost: 'Barracks Recruit Costs', stable_cost: 'Stable Recruit Costs',
+    workshop_cost: 'Workshop Recruit Costs',
+    spear_attack: 'Spear fighter attack power', sword_attack: 'Swordsman attack power',
+    axe_attack: 'Axeman attack power', archer_attack: 'Archer attack power',
+    marcher_attack: 'Mounted archer attack power', light_attack: 'Light cavalry attack power',
+    heavy_attack: 'Heavy cavalry attack power', catapult_attack: 'Catapult attack power',
+    ram_attack: 'Ram attack power',
+    spear_defense: 'Spear fighter defense power', sword_defense: 'Swordsman defense power',
+    axe_defense: 'Axeman defense power', archer_defense: 'Archer defense power',
+    light_defense: 'Light cavalry defense power', marcher_defense: 'Mounted archer defense power',
+    heavy_defense: 'Heavy cavalry defense power', catapult_defense: 'Catapult defense power',
+    ram_defense: 'Ram defense power', construction_speed: 'Construction speed',
+    merchant_travel_speed: 'merchant travel speed', merchant_capacity: 'merchant capacity',
+    academy_speed: 'Academy Recruit Speed', noble_refund: 'refund on Nobleman production'
+  };
+
+  const UTILITY_CONFIG_KEY_BY_INTERNAL = {
+    noble_refund: 'nobleRefund', barracks_speed: 'barracksRecruitSpeed',
+    stable_speed: 'stableRecruitSpeed', workshop_speed: 'workshopRecruitSpeed',
+    academy_speed: 'academyRecruitSpeed', clay_production: 'clayProduction',
+    wood_production: 'woodProduction', iron_production: 'ironProduction',
+    construction_speed: 'constructionSpeed', merchant_travel_speed: 'merchantTravelSpeed',
+    merchant_capacity: 'merchantCapacity', haul_capacity: 'haulCapacity',
+    barracks_cost: 'barracksRecruitCost', stable_cost: 'stableRecruitCost',
+    workshop_cost: 'workshopRecruitCost'
+  };
+
+  function getParam(name, url) {
+    try {
+      return new URL(url || window.location.href, window.location.origin).searchParams.get(name);
+    } catch (err) {
+      return null;
     }
-
-    return null;
   }
 
-  function looksPurple(el) {
-    if (!el || !(el instanceof Element)) return false;
-
-    const classes = lower(el.className || '');
-    if (CONFIG.rareClassHints.some(h => classes.includes(h))) return true;
-
-    let cur = el;
-    for (let i = 0; i < 3 && cur; i++, cur = cur.parentElement) {
-      try {
-        const rgb = rgbFromCssColor(getComputedStyle(cur).color);
-        if (!rgb) continue;
-
-        const cfg = CONFIG.rareColor;
-        if (
-          rgb.b >= cfg.minBlue &&
-          rgb.r >= cfg.minRed &&
-          rgb.b - rgb.g >= cfg.blueMinusGreen &&
-          rgb.r - rgb.g >= cfg.redMinusGreen
-        ) return true;
-      } catch (e) {}
+  function getCurrentVillageId() {
+    if (typeof game_data !== 'undefined' && game_data.village && game_data.village.id) {
+      return String(game_data.village.id);
     }
-
-    return false;
+    return getParam('village') || '';
   }
 
-  // ------------------------------------------------------------
-  // DOM SCANNING
-  // ------------------------------------------------------------
+  function buildGameUrl(params) {
+    const url = new URL('/game.php', window.location.origin);
+    const villageId = getCurrentVillageId();
 
-  function isVisible(el) {
-    if (!(el instanceof Element)) return false;
-    const r = el.getBoundingClientRect();
-    const cs = getComputedStyle(el);
-    return r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+    if (typeof game_data !== 'undefined' && game_data.player && parseInt(game_data.player.sitter || 0, 10) > 0) {
+      url.searchParams.set('t', String(game_data.player.id));
+    }
+    if (villageId) url.searchParams.set('village', villageId);
+    Object.keys(params || {}).forEach(key => {
+      if (params[key] !== undefined && params[key] !== null) url.searchParams.set(key, String(params[key]));
+    });
+    return url.pathname + url.search;
   }
 
-  function candidateContainers() {
-    const found = [];
-    const seen = new Set();
+  async function fetchHtml(url) {
+    const response = await fetch(url, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { 'Accept': 'text/html, */*; q=0.01' }
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status + ' while loading ' + url);
+    return response.text();
+  }
 
-    for (const sel of CONFIG.selectors) {
-      document.querySelectorAll(sel).forEach(el => {
-        if (!seen.has(el) && isVisible(el)) {
-          seen.add(el);
-          found.push(el);
-        }
-      });
-    }
+  function parseHtml(html) {
+    return new DOMParser().parseFromString(html, 'text/html');
+  }
 
-    if (found.length) return found;
-
-    // Fallback: find text nodes mentioning known relic families, then climb.
-    const familyTerms = [
-      'Halberd', 'Longsword', 'Banner', 'Longbow',
-      'Greataxe', 'Great Axe', 'Shortspear', 'Short Spear',
-      'Bonfire', 'Morningstar', 'Morning Star', 'Shortbow', 'Short Bow'
-    ];
-
-    document.querySelectorAll('div, li, tr, td').forEach(el => {
-      if (!isVisible(el)) return;
-      const text = norm(el.innerText || '');
-      if (!text || text.length > 1800) return;
-      if (!familyTerms.some(term => text.includes(term))) return;
-
-      const family = familyCanonical(text);
-      if (!family) return;
-
-      // Prefer a reasonably compact container with multiple percentages.
-      const pctCount = (text.match(/%/g) || []).length;
-      if (pctCount < 1) return;
-
-      if (!seen.has(el)) {
-        seen.add(el);
-        found.push(el);
+  function extractBalancedValue(source, startIndex) {
+    const opening = source[startIndex];
+    const closing = opening === '{' ? '}' : opening === '[' ? ']' : null;
+    if (!closing) throw new Error('Expected balanced JSON value.');
+    let depth = 0, insideString = false, escaped = false;
+    for (let i = startIndex; i < source.length; i++) {
+      const char = source[i];
+      if (insideString) {
+        if (escaped) { escaped = false; continue; }
+        if (char === '\\') { escaped = true; continue; }
+        if (char === '"') insideString = false;
+        continue;
       }
-    });
-
-    return reduceNestedCandidates(found);
+      if (char === '"') { insideString = true; continue; }
+      if (char === opening) depth++;
+      else if (char === closing && --depth === 0) return source.slice(startIndex, i + 1);
+    }
+    throw new Error('Could not find end of JSON value.');
   }
 
-  function reduceNestedCandidates(nodes) {
-    // Keep the smallest useful container when nested candidates represent same relic.
-    const arr = nodes.filter(Boolean);
-    return arr.filter(el => {
-      return !arr.some(other => {
-        if (other === el) return false;
-        if (!el.contains(other)) return false;
-        const a = norm(el.innerText || '');
-        const b = norm(other.innerText || '');
-        return familyCanonical(a) === familyCanonical(b) && b.length >= 20;
-      });
-    });
+  function rawStatText(stat) {
+    return norm((stat && stat.name) || (stat && stat.benefit && stat.benefit.description) || '');
   }
 
-  function lineElements(container) {
-    const all = Array.from(container.querySelectorAll('*'));
-    const result = [];
-
-    for (const el of all) {
-      if (!isVisible(el)) continue;
-      const text = norm(el.textContent || '');
-      if (!text || !text.includes('%')) continue;
-      if (text.length > 220) continue;
-
-      // Avoid taking parent wrappers if a child already contains essentially same text.
-      const childSame = Array.from(el.children).some(c => {
-        const ct = norm(c.textContent || '');
-        return ct && ct.includes('%') && ct === text;
-      });
-      if (childSame) continue;
-
-      result.push(el);
+  function internalStatParts(key) {
+    const unitMap = { spear:'spear', sword:'sword', axe:'axe', archer:'archer', light:'light_cavalry', marcher:'mounted_archer', heavy:'heavy_cavalry', ram:'ram', catapult:'catapult' };
+    for (const prefix of Object.keys(unitMap)) {
+      if (key === prefix + '_offdef') return { unit: unitMap[prefix], bucket:'both' };
+      if (key === prefix + '_attack') return { unit: unitMap[prefix], bucket:'attack' };
+      if (key === prefix + '_defense') return { unit: unitMap[prefix], bucket:'defense' };
+      if (key === prefix + '_damage') return { unit: unitMap[prefix], bucket:'building_damage' };
     }
-
-    // Deduplicate exact texts but preserve multiple identical stat lines if they are distinct.
-    return result;
+    return { unit:null, bucket:'utility' };
   }
 
-  function splitTextIntoStatLines(text) {
-    return norm(text)
-      .split(/\n|\r|•|\u2022/)
-      .map(norm)
-      .filter(x => x.includes('%'));
-  }
-
-  function extractStats(container, side) {
-    const stats = [];
-    const elems = lineElements(container);
-
-    if (elems.length) {
-      for (const el of elems) {
-        const text = norm(el.textContent || '');
-        if (!text.includes('%')) continue;
-
-        // Sometimes one element contains multiple stats.
-        const lines = splitTextIntoStatLines(text);
-        const useLines = lines.length > 1 ? lines : [text];
-
-        for (const line of useLines) {
-          const stat = parseStatText(line, side);
-          if (stat.value == null) continue;
-          stat.rare = looksPurple(el);
-          stat.sourceElement = el;
-          stats.push(stat);
-        }
-      }
+  function normalizeStructuredStat(rawStat, relicFamily, side, source) {
+    if (!rawStat) return null;
+    const rawText = rawStatText(rawStat);
+    const value = parsePercent(rawText);
+    let key = '';
+    if (source === 'sub' && rawStat.id !== undefined && SUB_STAT_KEYS_BY_ID[String(rawStat.id)]) {
+      key = SUB_STAT_KEYS_BY_ID[String(rawStat.id)];
+    } else if (source === 'main') {
+      key = MAIN_STAT_KEYS[relicFamily] || '';
     }
 
-    // Fallback if DOM line extraction fails.
-    if (!stats.length) {
-      splitTextIntoStatLines(container.innerText || '').forEach(line => {
-        const stat = parseStatText(line, side);
-        if (stat.value != null) stats.push(stat);
-      });
+    // Text fallback keeps the analyzer usable if InnoGames introduces a new ID.
+    if (!key) {
+      const fallback = parseStatText(rawText, side);
+      if (!fallback) return null;
+      fallback.rare = source === 'sub' && rawStat.perfect === true;
+      fallback.perfect = fallback.rare;
+      fallback.internalKey = '';
+      return fallback;
     }
 
-    return dedupeStats(stats);
-  }
-
-  function dedupeStats(stats) {
-    const out = [];
-    const counts = new Map();
-
-    for (const s of stats) {
-      const key = `${lower(s.text)}|${s.rare ? 1 : 0}`;
-      const count = counts.get(key) || 0;
-      // Permit at most 2 identical occurrences; enough for real duplicate rolls without DOM spam.
-      if (count >= 2) continue;
-      counts.set(key, count + 1);
-      out.push(s);
+    const parts = internalStatParts(key);
+    let semantic = 'IRRELEVANT';
+    if (parts.bucket === 'both') semantic = 'BOTH';
+    else if (side === 'OFF' && (parts.bucket === 'attack' || parts.bucket === 'building_damage')) semantic = 'PRIMARY';
+    else if (side === 'DEF' && parts.bucket === 'defense') semantic = 'PRIMARY';
+    else if (parts.bucket === 'utility') {
+      const cfgKey = UTILITY_CONFIG_KEY_BY_INTERNAL[key];
+      if (cfgKey && CONFIG.utility[cfgKey]) semantic = 'UTILITY';
     }
-
-    return out;
-  }
-
-  function inferMainAndSubs(stats, rarity, family) {
-    if (!stats.length) return { mainStat: null, substats: [] };
-
-    // Best effort strategy:
-    // 1) Rare cannot be main stat, so purple lines are substats.
-    // 2) If 3+ stats are visible, pick one likely main stat based on relic family/unit theme
-    //    and rarity percentage shape; remaining two strongest candidates become substats.
-    // 3) If only 2 stats are visible, treat both as substats because some UIs hide main stat.
-
-    if (stats.length <= 2) {
-      return { mainStat: null, substats: stats.slice(0, 2) };
-    }
-
-    const expectedMainUnits = {
-      halberd: ['spear'],
-      longsword: ['sword'],
-      banner: ['heavy_cavalry'],
-      longbow: ['archer'],
-      greataxe: ['axe'],
-      shortspear: ['spear'],
-      bonfire: [],
-      morningstar: ['light_cavalry', 'heavy_cavalry'],
-      shortbow: ['archer', 'mounted_archer']
-    };
-
-    const expected = expectedMainUnits[family] || [];
-    const nonRare = stats.filter(s => !s.rare);
-
-    let main = nonRare.find(s =>
-      s.semantic === 'BOTH' && s.unit && expected.includes(s.unit)
-    );
-
-    // If not found, choose the largest non-rare BOTH stat as the likely fixed main stat.
-    if (!main) {
-      main = nonRare
-        .filter(s => s.semantic === 'BOTH')
-        .slice()
-        .sort((a, b) => Math.abs(b.value || 0) - Math.abs(a.value || 0))[0] || null;
-    }
-
-    if (!main) {
-      // Last fallback: first non-rare stat.
-      main = nonRare[0] || stats[0];
-    }
-
-    const remaining = stats.filter(s => s !== main);
-
-    // Prefer rare and combat-relevant lines as substats, then utility.
-    remaining.sort((a, b) => {
-      const score = s =>
-        (s.rare ? 1000 : 0) +
-        (s.semantic === 'PRIMARY' ? 300 : 0) +
-        (s.semantic === 'BOTH' ? 250 : 0) +
-        (s.semantic === 'UTILITY' ? 100 : 0) +
-        Math.abs(s.value || 0);
-      return score(b) - score(a);
-    });
 
     return {
-      mainStat: main,
-      substats: remaining.slice(0, 2)
+      text: rawText || ((INTERNAL_LABELS[key] || key) + (value != null ? ' +' + Math.abs(value) + '%' : '')),
+      value: value == null ? 0 : Math.abs(value),
+      unit: parts.unit,
+      bucket: parts.bucket,
+      semantic: semantic,
+      utilityKey: UTILITY_CONFIG_KEY_BY_INTERNAL[key] || null,
+      internalKey: key,
+      rare: source === 'sub' && rawStat.perfect === true,
+      perfect: source === 'sub' && rawStat.perfect === true,
+      sourceElement: null
     };
   }
 
-  function extractRelic(container, index) {
-    const text = norm(container.innerText || container.textContent || '');
-    const family = familyCanonical(text);
-    if (!family) return null;
-
+  function normalizeInventoryRelic(raw, index) {
+    if (!raw || raw.id === undefined || raw.id === null) return null;
+    const family = familyCanonical(raw.type || raw.name || '');
     const side = getSide(family);
-    if (!side) return null;
+    if (!family || !side) return null;
 
-    const rarity = parseRarity(text);
-    const stats = extractStats(container, side);
-    const separated = inferMainAndSubs(stats, rarity, family);
-
-    const id =
-      container.getAttribute('data-relic-id') ||
-      container.getAttribute('data-item-id') ||
-      container.id ||
-      `scan-${index + 1}`;
+    const rarity = parseRarity(String(raw.quality || '') + ' ' + String(raw.name || ''));
+    const mainStat = raw.main_stat ? normalizeStructuredStat(raw.main_stat, family, side, 'main') : null;
+    const substats = (raw.sub_stats || []).filter(Boolean).map(stat => normalizeStructuredStat(stat, family, side, 'sub')).filter(Boolean).slice(0, 2);
 
     const relic = {
-      id,
-      index,
-      family,
-      familyName: prettyFamily(family),
-      rarity,
-      rarityName: rarity ? titleCase(rarity) : 'Unknown',
-      name: parseName(text) || prettyFamily(family),
-      side,
-      mainStat: separated.mainStat,
-      substats: separated.substats,
-      allStats: stats,
-      tier: 'UNKNOWN',
-      tierLabel: TIER_LABELS.UNKNOWN,
-      rawRelevantValue: 0,
-      sourceElement: container,
-      rawText: text,
+      id: String(raw.id), index: index, family: family, familyName: prettyFamily(family),
+      rarity: rarity, rarityName: rarity ? titleCase(rarity) : (norm(raw.quality) || 'Unknown'),
+      name: norm(raw.name) || ((rarity ? titleCase(rarity) + ' ' : '') + prettyFamily(family)),
+      side: side, mainStat: mainStat, substats: substats,
+      allStats: [mainStat].concat(substats).filter(Boolean), tier:'UNKNOWN',
+      tierLabel:TIER_LABELS.UNKNOWN, rawRelevantValue:0, raw:raw,
+      rawText: JSON.stringify(raw),
       future: {
-        canUpgrade: rarity ? ['shoddy', 'sturdy', 'enhanced', 'superior'].includes(rarity) : null,
-        canReroll: rarity ? ['shoddy', 'sturdy', 'enhanced', 'superior', 'renowned'].includes(rarity) : null,
+        canUpgrade: rarity ? ['shoddy','sturdy','enhanced','superior'].includes(rarity) : null,
+        canReroll: rarity ? ['shoddy','sturdy','enhanced','superior','renowned'].includes(rarity) : null,
         upgradeMaterialPreference: family,
-        ppSingleMaterialEligible: rarity ? ['shoddy', 'sturdy'].includes(rarity) : null
+        ppSingleMaterialEligible: rarity ? ['shoddy','sturdy'].includes(rarity) : null
       }
     };
-
     relic.tier = calculateTier(relic);
     relic.tierLabel = TIER_LABELS[relic.tier] || relic.tier;
     relic.rawRelevantValue = calculateRawRelevantValue(relic);
-
     return relic;
   }
 
-  function scanRelics() {
-    const containers = candidateContainers();
-    const relics = containers
-      .map((el, i) => extractRelic(el, i))
-      .filter(Boolean);
-
-    // Final dedupe by source ID + normalized raw text.
-    const seen = new Set();
-    return relics.filter(r => {
-      const key = `${r.id}|${lower(r.rawText)}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+  function extractInventoryRelicsFromHtml(html) {
+    const doc = parseHtml(html);
+    const scripts = Array.from(doc.querySelectorAll('script'));
+    const rawRelics = [];
+    scripts.forEach(script => {
+      const source = script.textContent || '';
+      const marker = 'RelicSystem.Inventory.init';
+      if (!source.includes(marker)) return;
+      const markerIndex = source.indexOf(marker);
+      const callStart = source.indexOf('(', markerIndex);
+      const arrayStart = source.indexOf('[', callStart);
+      if (arrayStart === -1) return;
+      try {
+        const parsed = JSON.parse(extractBalancedValue(source, arrayStart));
+        if (Array.isArray(parsed)) parsed.forEach(item => rawRelics.push(item));
+      } catch (err) {
+        console.warn('Twactics Relic Analyzer could not parse inventory relic JSON:', err);
+      }
     });
+
+    const map = new Map();
+    rawRelics.forEach((raw, index) => {
+      const relic = normalizeInventoryRelic(raw, index);
+      if (relic) map.set(relic.id, relic);
+    });
+    return Array.from(map.values());
+  }
+
+  async function scanRelics() {
+    const inventoryUrl = buildGameUrl({ screen:'relic_system', mode:'inventory' });
+    const html = await fetchHtml(inventoryUrl);
+    const relics = extractInventoryRelicsFromHtml(html);
+    console.log('Twactics Relic Analyzer inventory relics:', relics);
+    return relics;
   }
 
   // ------------------------------------------------------------
@@ -919,7 +858,7 @@
         }
       </style>
       <div class="twra-head">
-        <div class="twra-title">Tribal Wars Relic Analyzer v${VERSION}</div>
+        <div class="twra-title">Twactics Relic Analyzer v${VERSION}</div>
         <button type="button" data-action="rescan">Rescan</button>
         <button type="button" data-action="close">×</button>
       </div>
@@ -941,7 +880,7 @@
       </div>
       <div class="twra-body" data-role="body"></div>
       <div class="twra-foot">
-        ★ = detected rare/purple substat. Tiering uses the 2 inferred substats, not the fixed main stat.
+        ★ = rare/perfect substat from game data. Tiering uses the 2 rolled substats, not the fixed main stat. Read-only analyzer; no game actions are performed.
       </div>
     `;
 
@@ -979,8 +918,8 @@
         body.innerHTML = `
           <div class="twra-empty">
             <b>No supported relics found.</b><br><br>
-            Open the relic inventory and make sure the relic cards are loaded.<br>
-            If relics are visible but not detected, the game's current DOM needs one selector adjustment in CONFIG.selectors.
+            The Treasury inventory was loaded, but no supported combat relics were found.<br>
+            Supported families: Halberd, Longsword, Banner, Longbow, Greataxe, Shortspear, Bonfire, Morningstar and Shortbow.
           </div>`;
         return;
       }
@@ -1028,15 +967,23 @@
       if (e.target.matches('[data-filter]')) redraw();
     });
 
-    root.addEventListener('click', e => {
+    root.addEventListener('click', async e => {
       const btn = e.target.closest('button[data-action]');
       if (!btn) return;
 
       if (btn.dataset.action === 'close') root.remove();
       if (btn.dataset.action === 'rescan') {
-        state.relics = scanRelics();
-        window.__TW_RELIC_ANALYZER_V1__.relics = state.relics;
-        redraw();
+        btn.disabled = true;
+        try {
+          state.relics = await scanRelics();
+          window.__TW_RELIC_ANALYZER_V1__.relics = state.relics;
+          redraw();
+        } catch (err) {
+          console.error('Twactics Relic Analyzer rescan failed:', err);
+          alert('Twactics Relic Analyzer: ' + (err.message || String(err)));
+        } finally {
+          btn.disabled = false;
+        }
       }
     });
 
@@ -1073,41 +1020,36 @@
   // START
   // ------------------------------------------------------------
 
-  const relics = scanRelics();
-  const ui = render(relics);
+  async function start() {
+    try {
+      const relics = await scanRelics();
+      const ui = render(relics);
 
-  window.__TW_RELIC_ANALYZER_V1__ = {
-    version: VERSION,
-    relics,
-    config: CONFIG,
-    scan: scanRelics,
-    calculateTier,
-    evaluateAgainstCurrentStats,
-    effectiveUnitAttack,
-    effectiveUnitDefense,
-    destroy() {
-      document.getElementById(UI_ID)?.remove();
-      delete window.__TW_RELIC_ANALYZER_V1__;
-    },
-    debug() {
-      console.table(this.relics.map(r => ({
-        id: r.id,
-        name: r.name,
-        side: r.side,
-        rarity: r.rarityName,
-        tier: r.tierLabel,
-        main: r.mainStat?.text || '',
-        sub1: r.substats[0]?.text || '',
-        sub1Rare: !!r.substats[0]?.rare,
-        sub2: r.substats[1]?.text || '',
-        sub2Rare: !!r.substats[1]?.rare
-      })));
-      return this.relics;
+      window.__TW_RELIC_ANALYZER_V1__ = {
+        version: VERSION, relics, config: CONFIG, scan: scanRelics, calculateTier,
+        evaluateAgainstCurrentStats, effectiveUnitAttack, effectiveUnitDefense,
+        inventoryMethod: 'RelicSystem.Inventory.init JSON',
+        destroy() {
+          document.getElementById(UI_ID)?.remove();
+          delete window.__TW_RELIC_ANALYZER_V1__;
+        },
+        debug() {
+          console.table(this.relics.map(r => ({
+            id:r.id, name:r.name, side:r.side, rarity:r.rarityName, tier:r.tierLabel,
+            main:r.mainStat?.text || '', sub1:r.substats[0]?.text || '',
+            sub1Rare:!!r.substats[0]?.rare, sub2:r.substats[1]?.text || '',
+            sub2Rare:!!r.substats[1]?.rare
+          })));
+          return this.relics;
+        }
+      };
+
+      if (CONFIG.debug) window.__TW_RELIC_ANALYZER_V1__.debug();
+    } catch (err) {
+      console.error('Twactics Relic Analyzer failed:', err);
+      alert('Twactics Relic Analyzer could not load Treasury inventory: ' + (err.message || String(err)));
     }
-  };
-
-  if (CONFIG.debug) {
-    console.log('[TW Relic Analyzer]', window.__TW_RELIC_ANALYZER_V1__);
-    window.__TW_RELIC_ANALYZER_V1__.debug();
   }
+
+  start();
 })();
