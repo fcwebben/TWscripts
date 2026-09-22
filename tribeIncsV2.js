@@ -11,7 +11,7 @@
  *
  * This script:
  * - Reads tribe members from the current Tribe Info page
- * - Loads each member's Player Info page (prefers page=-1 / all villages)
+ * - Loads each member's Player Info page and uses ajax=fetch_villages for members with more than 100 villages
  * - Scans only villages visibly marked as having incoming attacks
  * - Counts attacks per target tribe member
  * - Resolves Origin -> Player from command details when needed
@@ -45,19 +45,21 @@
     "use strict";
 
     const SCRIPT_NAME = "Twactics Tribe Incoming Analyzer";
-    const SCRIPT_VERSION = "v1.1.0";
+    const SCRIPT_VERSION = "v1.3.0";
     const BOX_ID = "twactics-tribe-incoming-analyzer";
 
-    // Read-only page requests can be scheduled more aggressively than action
-    // submissions. Start at ~14.3 request starts/second, but automatically slow
-    // down if the server responds with throttling/transient overload statuses.
-    // The limiter is global across profile, village and command-detail requests.
-    const BASE_REQUEST_START_INTERVAL_MS = 70; // ~14.29 request starts / second
-    const MAX_REQUEST_START_INTERVAL_MS = 350; // ~2.86/s under sustained backoff
-    const RATE_RECOVERY_SUCCESS_COUNT = 25;
-    const PROFILE_CONCURRENCY = 12;
-    const VILLAGE_CONCURRENCY = 12;
-    const COMMAND_CONCURRENCY = 12;
+    // Read-only page requests use an adaptive turbo limiter. Start at ~40
+    // request starts/second and, if the server stays healthy, ramp toward ~55.6/s.
+    // Any throttling/transient overload response immediately slows the global rate.
+    // The limiter is shared by profile, village and command-detail requests.
+    const INITIAL_REQUEST_START_INTERVAL_MS = 25; // 40.0 request starts / second
+    const MIN_REQUEST_START_INTERVAL_MS = 18;     // ~55.6/s after clean recovery/ramp
+    const MAX_REQUEST_START_INTERVAL_MS = 400;    // 2.5/s under sustained backoff
+    const RATE_RECOVERY_SUCCESS_COUNT = 35;
+    const RATE_RAMP_SUCCESS_COUNT = 80;
+    const PROFILE_CONCURRENCY = 24;
+    const VILLAGE_CONCURRENCY = 24;
+    const COMMAND_CONCURRENCY = 24;
     const FETCH_TIMEOUT_MS = 15000;
     const MAX_FETCH_RETRIES = 3;
     const UI_REFRESH_MS = 150;
@@ -92,7 +94,7 @@
         cacheDirty: false,
         totalExpectedVillages: 0,
         totalDiscoveredVillages: 0,
-        currentRequestIntervalMs: BASE_REQUEST_START_INTERVAL_MS,
+        currentRequestIntervalMs: INITIAL_REQUEST_START_INTERVAL_MS,
         consecutiveRequestSuccesses: 0,
         rateBackoffs: 0
     };
@@ -334,11 +336,100 @@
             if (href) pagination.push(normalizeGameUrl(href));
         });
 
+        // Players with more than 100 villages are truncated on the normal Player Info page.
+        // Tribal Wars exposes the remaining villages through Player.getAllVillages(...), e.g.
+        // /game.php?...&screen=info_player&ajax=fetch_villages&player_id=123456
+        const leftoverUrls = [];
+        Array.from(doc.querySelectorAll('a[onclick*="getAllVillages"], a[onclick*="fetch_villages"]')).forEach(link => {
+            const onclick = String(link.getAttribute("onclick") || "");
+            let url = "";
+
+            const playerMatch = onclick.match(/Player\.getAllVillages\s*\(\s*this\s*,\s*["']([^"']+)["']/i);
+            if (playerMatch) {
+                url = playerMatch[1];
+            } else {
+                const ajaxMatch = onclick.match(/["']([^"']*ajax=fetch_villages[^"']*)["']/i);
+                if (ajaxMatch) url = ajaxMatch[1];
+            }
+
+            if (url) {
+                url = url.replace(/&amp;/gi, "&");
+                try {
+                    leftoverUrls.push(normalizeGameUrl(url));
+                } catch (err) {
+                    // Ignore malformed inline URLs and let the normal fallbacks continue.
+                }
+            }
+        });
+
         return {
             villages: villages,
             attacked: attacked,
-            pagination: Array.from(new Set(pagination))
+            pagination: Array.from(new Set(pagination)),
+            leftoverUrls: Array.from(new Set(leftoverUrls))
         };
+    }
+
+    function extractAjaxVillageMarkup(raw) {
+        let source = String(raw || "").trim();
+        if (!source) return "";
+
+        // Tribal Wars AJAX endpoints may return either HTML directly or JSON containing
+        // an HTML fragment. Recursively collect likely village-row HTML strings if JSON.
+        if (source[0] === "{" || source[0] === "[") {
+            try {
+                const parsed = JSON.parse(source);
+                const fragments = [];
+
+                (function visit(value) {
+                    if (typeof value === "string") {
+                        if (/screen=info_village|village_anchor|<tr\b|<table\b/i.test(value)) {
+                            fragments.push(value);
+                        }
+                        return;
+                    }
+                    if (Array.isArray(value)) {
+                        value.forEach(visit);
+                        return;
+                    }
+                    if (value && typeof value === "object") {
+                        Object.keys(value).forEach(key => visit(value[key]));
+                    }
+                })(parsed);
+
+                if (fragments.length) source = fragments.join("\n");
+            } catch (err) {
+                // Not JSON; parse it as HTML below.
+            }
+        }
+
+        return source;
+    }
+
+    function parseLeftoverVillagesResponse(raw, member) {
+        const source = extractAjaxVillageMarkup(raw);
+        if (!source) return { villages: [], attacked: [], pagination: [], leftoverUrls: [] };
+
+        let doc;
+        if (/<html\b|<body\b|id\s*=\s*["']villages_list["']/i.test(source)) {
+            doc = parseHtml(source);
+        } else {
+            // A raw sequence of <tr> elements needs a table context so DOMParser keeps them.
+            doc = parseHtml('<!doctype html><html><body><table id="villages_list"><tbody>' + source + '</tbody></table></body></html>');
+        }
+
+        const scope = doc.querySelector("#villages_list") || doc;
+        const villages = [];
+        const attacked = [];
+
+        Array.from(scope.querySelectorAll("tr")).forEach(row => {
+            const village = getVillageMetaFromRow(row, member);
+            if (!village) return;
+            villages.push(village);
+            if (rowHasIncomingAttack(row)) attacked.push(village);
+        });
+
+        return { villages: villages, attacked: attacked, pagination: [], leftoverUrls: [] };
     }
 
     function registerProfilePage(member, parsed) {
@@ -376,10 +467,13 @@
     }
 
     function applyRateBackoff(status) {
-        const multiplier = status === 429 ? 2.0 : 1.5;
+        // 429 is treated as a clear throttle signal and backs off harder.
+        // 5xx overload responses also slow the scan, but less aggressively.
+        const multiplier = status === 429 ? 2.5 : 1.7;
+        const floorAfterBackoff = status === 429 ? 80 : 45;
         state.currentRequestIntervalMs = Math.min(
             MAX_REQUEST_START_INTERVAL_MS,
-            Math.max(BASE_REQUEST_START_INTERVAL_MS, Math.ceil(state.currentRequestIntervalMs * multiplier))
+            Math.max(floorAfterBackoff, Math.ceil(state.currentRequestIntervalMs * multiplier))
         );
         state.consecutiveRequestSuccesses = 0;
         state.rateBackoffs += 1;
@@ -387,13 +481,30 @@
 
     function registerRequestSuccess() {
         state.consecutiveRequestSuccesses += 1;
+
+        // If we are recovering from a backoff, return toward the normal turbo rate
+        // in controlled steps instead of snapping back immediately.
         if (
-            state.currentRequestIntervalMs > BASE_REQUEST_START_INTERVAL_MS &&
+            state.currentRequestIntervalMs > INITIAL_REQUEST_START_INTERVAL_MS &&
             state.consecutiveRequestSuccesses >= RATE_RECOVERY_SUCCESS_COUNT
         ) {
             state.currentRequestIntervalMs = Math.max(
-                BASE_REQUEST_START_INTERVAL_MS,
-                Math.floor(state.currentRequestIntervalMs * 0.8)
+                INITIAL_REQUEST_START_INTERVAL_MS,
+                Math.floor(state.currentRequestIntervalMs * 0.72)
+            );
+            state.consecutiveRequestSuccesses = 0;
+            return;
+        }
+
+        // If the server has been consistently healthy, probe a little faster.
+        if (
+            state.currentRequestIntervalMs <= INITIAL_REQUEST_START_INTERVAL_MS &&
+            state.currentRequestIntervalMs > MIN_REQUEST_START_INTERVAL_MS &&
+            state.consecutiveRequestSuccesses >= RATE_RAMP_SUCCESS_COUNT
+        ) {
+            state.currentRequestIntervalMs = Math.max(
+                MIN_REQUEST_START_INTERVAL_MS,
+                state.currentRequestIntervalMs - 2
             );
             state.consecutiveRequestSuccesses = 0;
         }
@@ -563,6 +674,16 @@
 
         const tried = new Set();
         const queuedPagination = [];
+        const queuedLeftovers = [];
+
+        function queueParsedLinks(parsed) {
+            (parsed.pagination || []).forEach(pageUrl => {
+                if (!tried.has(pageUrl) && !queuedPagination.includes(pageUrl)) queuedPagination.push(pageUrl);
+            });
+            (parsed.leftoverUrls || []).forEach(leftoverUrl => {
+                if (!tried.has(leftoverUrl) && !queuedLeftovers.includes(leftoverUrl)) queuedLeftovers.push(leftoverUrl);
+            });
+        }
 
         async function load(url) {
             const normalized = normalizeGameUrl(url);
@@ -572,17 +693,44 @@
             const html = await fetchHtml(normalized);
             const parsed = parsePlayerProfile(html, member);
             registerProfilePage(member, parsed);
-            parsed.pagination.forEach(pageUrl => {
-                if (!tried.has(pageUrl) && !queuedPagination.includes(pageUrl)) queuedPagination.push(pageUrl);
-            });
+            queueParsedLinks(parsed);
             return parsed;
         }
 
-        // Fastest path: Tribal Wars commonly accepts page=-1 as the all-pages view.
+        async function loadLeftover(url) {
+            const normalized = normalizeGameUrl(url);
+            if (tried.has(normalized)) return null;
+            tried.add(normalized);
+
+            const raw = await fetchHtml(normalized);
+            const parsed = parseLeftoverVillagesResponse(raw, member);
+            registerProfilePage(member, parsed);
+            return parsed;
+        }
+
+        async function drainLeftovers() {
+            while (
+                !state.stopped &&
+                queuedLeftovers.length &&
+                member.discoveredVillageIds.size < member.expectedVillages
+            ) {
+                const next = queuedLeftovers.shift();
+                try {
+                    await loadLeftover(next);
+                } catch (err) {
+                    console.warn("[" + SCRIPT_NAME + "] leftover villages request failed for", member.name, next, err);
+                }
+            }
+        }
+
+        // Fast path: ask for the broadest profile view first. On accounts above the
+        // normal 100-village display cap, immediately follow the native
+        // ajax=fetch_villages link to retrieve every leftover village in one request.
         let allPageWorked = false;
         try {
             const parsed = await load(setParam(member.url, "page", "-1"));
             allPageWorked = !!parsed;
+            await drainLeftovers();
         } catch (err) {
             console.warn("[" + SCRIPT_NAME + "] page=-1 failed for", member.name, err);
         }
@@ -592,9 +740,11 @@
             return;
         }
 
-        // Fallback to the normal profile page, which may expose explicit pagination.
+        // Fallback to the normal profile page. This is also where Tribal Wars most
+        // commonly exposes the Display all leftover X villages AJAX link.
         try {
             await load(member.url);
+            await drainLeftovers();
         } catch (err) {
             if (!allPageWorked) throw err;
         }
@@ -607,15 +757,17 @@
             const next = queuedPagination.shift();
             try {
                 await load(next);
+                await drainLeftovers();
             } catch (err) {
                 console.warn("[" + SCRIPT_NAME + "] pagination request failed for", member.name, next, err);
             }
         }
 
         // Last-resort numeric paging. We tolerate one duplicate page because some
-        // worlds number the first page as 0 while others expose 1 first.
+        // worlds number the first page as 0 while others expose 1 first. With the current
+        // 100-village profile cap, only estimate the small number of pages actually needed.
         if (member.discoveredVillageIds.size < member.expectedVillages) {
-            const estimatedPages = Math.min(30, Math.max(3, Math.ceil(member.expectedVillages / 10) + 2));
+            const estimatedPages = Math.min(20, Math.max(3, Math.ceil(member.expectedVillages / 100) + 2));
             let noNewStreak = 0;
 
             for (let page = 0; page < estimatedPages; page++) {
@@ -1138,7 +1290,7 @@
                 <div id="ttia-matrix" class="ttia-matrix">${buildMatrixHtml()}</div>
 
                 <div class="ttia-note" id="ttia-note">
-                    Read-only requests start at ~${(1000 / BASE_REQUEST_START_INTERVAL_MS).toFixed(1)}/s and automatically back off if Tribal Wars throttles the scan. No game actions are performed.
+                    Read-only requests start at ~${(1000 / INITIAL_REQUEST_START_INTERVAL_MS).toFixed(1)}/s, can ramp to ~${(1000 / MIN_REQUEST_START_INTERVAL_MS).toFixed(1)}/s, and automatically back off if Tribal Wars throttles the scan. No game actions are performed.
                 </div>
 
                 <div class="ttia-footer"><span>MIT</span><span>Created by Twactics (zidrox)</span></div>
