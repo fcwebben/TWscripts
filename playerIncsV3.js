@@ -18,7 +18,8 @@
  * - Reads the Origin -> Player instead of the editable command name
  * - Counts total / noble / large / medium / small attacks
  * - Aggregates attacks by attacking player
- * - Shows each attacker's share and number of targeted villages
+ * - Shows each attacker's total, small, medium, large, and targeted-village counts
+ * - Copies a full single-player report in the same format style as the Tribe Incoming Analyzer
  * - Uses only same-origin Tribal Wars pages
  *
  * This script does NOT:
@@ -45,7 +46,7 @@
     "use strict";
 
     const SCRIPT_NAME = "Twactics Incoming Analyzer";
-    const SCRIPT_VERSION = "v1.2.0";
+    const SCRIPT_VERSION = "v1.3.0";
     const BOX_ID = "twactics-incoming-analyzer";
 
     // Keep a small, bounded number of same-origin requests in flight.
@@ -667,11 +668,10 @@
         const attackers = getSortedAttackers();
 
         if (!attackers.length) {
-            return '<tr><td colspan="4" class="twia-empty">No attacking players could be identified.</td></tr>';
+            return '<tr><td colspan="7" class="twia-empty">No attacking players could be identified.</td></tr>';
         }
 
         return attackers.map((attacker, index) => {
-            const share = state.totals.attacks > 0 ? ((attacker.attacks / state.totals.attacks) * 100).toFixed(1) : "0.0";
             const tooltip = [
                 "Small: " + attacker.small,
                 "Medium: " + attacker.medium,
@@ -685,11 +685,37 @@
                 '<td class="twia-rank">' + (index + 1) + "</td>",
                 '<td class="twia-player">' + makePlayerLink(attacker) + "</td>",
                 '<td class="twia-number"><strong>' + formatNumber(attacker.attacks) + "</strong></td>",
-                '<td class="twia-number">' + share + "%</td>",
+                '<td class="twia-number">' + formatNumber(attacker.small) + "</td>",
+                '<td class="twia-number">' + formatNumber(attacker.medium) + "</td>",
+                '<td class="twia-number">' + formatNumber(attacker.large) + "</td>",
                 '<td class="twia-number">' + formatNumber(attacker.targets.size) + "</td>",
                 "</tr>"
             ].join("");
         }).join("");
+    }
+
+    function formatBreakdown(counts, includeGeneric) {
+        const parts = [];
+        if (counts.small) parts.push("Small: " + formatNumber(counts.small));
+        if (counts.medium) parts.push("Medium: " + formatNumber(counts.medium));
+        if (counts.large) parts.push("Large: " + formatNumber(counts.large));
+        if (includeGeneric && counts.generic) parts.push("Other: " + formatNumber(counts.generic));
+        if (!parts.length) {
+            parts.push("Small: 0", "Medium: 0", "Large: 0");
+        }
+        return parts.join(" | ");
+    }
+
+    function attackerAttackText(attacker) {
+        return formatNumber(attacker.attacks) + " attack" + (attacker.attacks === 1 ? "" : "s") +
+            " (" + formatBreakdown(attacker, true) + ")";
+    }
+
+    function playerAttackText(counts) {
+        return formatNumber(counts.attacks) + " attack" + (counts.attacks === 1 ? "" : "s") +
+            " (Small: " + formatNumber(counts.small) +
+            " | Medium: " + formatNumber(counts.medium) +
+            " | Large: " + formatNumber(counts.large) + ")";
     }
 
     function summaryRow(label, value, emphasis) {
@@ -749,7 +775,7 @@
                         <div class="twia-section-title">Attacker breakdown</div>
                         <div class="twia-section-subtitle">Sorted by number of incoming attacks</div>
                     </div>
-                    <button type="button" class="twia-button" id="twia-copy" disabled>Copy list</button>
+                    <button type="button" class="twia-button" id="twia-copy" disabled>Copy full report</button>
                 </div>
 
                 <div class="twia-table-wrap">
@@ -759,12 +785,14 @@
                                 <th>#</th>
                                 <th>Player</th>
                                 <th class="twia-number">Attacks</th>
-                                <th class="twia-number">Share</th>
+                                <th class="twia-number">Small</th>
+                                <th class="twia-number">Medium</th>
+                                <th class="twia-number">Large</th>
                                 <th class="twia-number">Targets</th>
                             </tr>
                         </thead>
                         <tbody id="twia-attacker-rows">
-                            <tr><td colspan="5" class="twia-empty">Scanning...</td></tr>
+                            <tr><td colspan="7" class="twia-empty">Scanning...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -958,7 +986,7 @@
         document.body.appendChild(box);
 
         box.querySelector(".twia-close").addEventListener("click", closeWidget);
-        box.querySelector("#twia-copy").addEventListener("click", copyAttackerList);
+        box.querySelector("#twia-copy").addEventListener("click", () => copyFullReport(playerName));
         makeDraggable(box, box.querySelector("#twia-drag-handle"));
 
         return box;
@@ -1012,7 +1040,7 @@
 
         if (summary) summary.innerHTML = buildSummaryHtml(playerName);
         if (rows) rows.innerHTML = buildAttackerRows();
-        if (copyBtn) copyBtn.disabled = state.attackers.size === 0;
+        if (copyBtn) copyBtn.disabled = state.totals.attacks === 0;
 
         if (done && note) {
             const unresolved = state.unresolvedCommands + state.failedCommands;
@@ -1058,19 +1086,27 @@
         });
     }
 
-    async function copyAttackerList() {
-        const attackers = getSortedAttackers();
-        if (!attackers.length) return;
+    function buildCopyText(playerName) {
+        const lines = [];
+        lines.push("Player: " + playerName + " - " + playerAttackText(state.totals));
+        lines.push("");
+        lines.push("Attacking players:");
 
-        const text = attackers.map(attacker => {
-            return attacker.name + ": " + attacker.attacks + " attack" + (attacker.attacks === 1 ? "" : "s");
-        }).join("\n");
+        getSortedAttackers().forEach(attacker => {
+            lines.push(attacker.name + ": " + attackerAttackText(attacker));
+        });
+
+        return lines.join("\n");
+    }
+
+    async function copyFullReport(playerName) {
+        if (state.totals.attacks === 0) return;
 
         try {
-            await copyText(text);
-            notify("success", "Attacker list copied.");
+            await copyText(buildCopyText(playerName));
+            notify("success", "Full player incoming report copied.");
         } catch (err) {
-            notify("error", "Could not copy attacker list.");
+            notify("error", "Could not copy the report.");
         }
     }
 
@@ -1102,7 +1138,7 @@
         if (!villages.withIncomings.length) {
             updateProgress(0, 0, "No incoming attacks found.");
             const rows = document.getElementById("twia-attacker-rows");
-            if (rows) rows.innerHTML = '<tr><td colspan="5" class="twia-empty">No incoming attacks found.</td></tr>';
+            if (rows) rows.innerHTML = '<tr><td colspan="7" class="twia-empty">No incoming attacks found.</td></tr>';
             notify("info", "No villages with incoming attacks were found.");
             return;
         }
