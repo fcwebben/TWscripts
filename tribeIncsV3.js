@@ -45,7 +45,7 @@
     "use strict";
 
     const SCRIPT_NAME = "Twactics Tribe Incoming Analyzer";
-    const SCRIPT_VERSION = "v1.3.0";
+    const SCRIPT_VERSION = "v1.4.0";
     const BOX_ID = "twactics-tribe-incoming-analyzer";
 
     // Read-only page requests use an adaptive turbo limiter. Start at ~40
@@ -1044,8 +1044,15 @@
             " (" + formatBreakdown(counts, true) + ")";
     }
 
-    function tribeAttackText(counts) {
-        return formatNumber(counts.attacks) + " attack" + (counts.attacks === 1 ? "" : "s") +
+    function simpleAttackText(counts, includeBreakdown) {
+        const base = formatNumber(counts.attacks) + " attack" + (counts.attacks === 1 ? "" : "s");
+        return includeBreakdown ? base + " (" + formatBreakdown(counts, true) + ")" : base;
+    }
+
+    function tribeAttackText(counts, includeBreakdown) {
+        const base = formatNumber(counts.attacks) + " attack" + (counts.attacks === 1 ? "" : "s");
+        if (includeBreakdown === false) return base;
+        return base +
             " (Small: " + formatNumber(counts.small) +
             " | Medium: " + formatNumber(counts.medium) +
             " | Large: " + formatNumber(counts.large) + ")";
@@ -1159,32 +1166,116 @@
         return '<div class="ttia-summary-item' + (emphasis ? " ttia-emphasis" : "") + '"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + "</strong></div>";
     }
 
-    function buildCopyText() {
+    function buildCopyText(options) {
+        options = options || {};
+        const includeHeader = options.includeHeader !== false;
+        const includeTargets = options.includeTargets !== false;
+        const includeAttackers = options.includeAttackers !== false;
+        const includeBreakdown = !!options.includeBreakdown;
+        const includeDetails = !!options.includeDetails;
+        const includeZeroTargets = !!options.includeZeroTargets;
         const lines = [];
-        lines.push("Tribe: " + state.tribeName + " - " + tribeAttackText(state.totals));
 
-        state.members.forEach(member => {
-            lines.push(member.name + ": " + attackText(member.counts));
-        });
+        function addGap() {
+            if (lines.length && lines[lines.length - 1] !== "") lines.push("");
+        }
 
-        lines.push("");
-        lines.push("Attacking players:");
-        getSortedAttackers().forEach(attacker => {
-            lines.push(attacker.name + ": " + attackText(attacker.counts));
-        });
+        if (includeHeader) {
+            lines.push("Tribe: " + state.tribeName + " - " + tribeAttackText(state.totals, includeBreakdown));
+        }
 
-        lines.push("");
-        lines.push("Origin -> target:");
-        getSortedAttackers().forEach(attacker => {
-            lines.push(attacker.name + ":");
-            Array.from(attacker.byTarget.values())
-                .sort((a, b) => b.counts.attacks - a.counts.attacks || a.name.localeCompare(b.name))
-                .forEach(target => {
-                    lines.push("  " + target.name + ": " + attackText(target.counts));
+        if (includeTargets) {
+            addGap();
+            lines.push("Attacked players:");
+            state.members
+                .filter(member => includeZeroTargets || member.counts.attacks > 0)
+                .forEach(member => {
+                    lines.push(member.name + ": " + simpleAttackText(member.counts, includeBreakdown));
                 });
-        });
+        }
 
+        if (includeAttackers) {
+            addGap();
+            lines.push("Attacking players:");
+            getSortedAttackers().forEach(attacker => {
+                lines.push(attacker.name + ": " + simpleAttackText(attacker.counts, includeBreakdown));
+            });
+        }
+
+        if (includeDetails) {
+            addGap();
+            lines.push("Origin -> target:");
+            getSortedAttackers().forEach(attacker => {
+                lines.push(attacker.name + ":");
+                Array.from(attacker.byTarget.values())
+                    .sort((a, b) => b.counts.attacks - a.counts.attacks || a.name.localeCompare(b.name))
+                    .forEach(target => {
+                        lines.push("  " + target.name + ": " + simpleAttackText(target.counts, includeBreakdown));
+                    });
+            });
+        }
+
+        while (lines.length && lines[lines.length - 1] === "") lines.pop();
         return lines.join("\n");
+    }
+
+    function getCopyOptions() {
+        const read = (id, fallback) => {
+            const el = document.getElementById(id);
+            return el ? !!el.checked : fallback;
+        };
+
+        return {
+            includeHeader: read("ttia-copy-header", true),
+            includeTargets: read("ttia-copy-targets", true),
+            includeAttackers: read("ttia-copy-attackers", true),
+            includeBreakdown: read("ttia-copy-breakdown", false),
+            includeDetails: read("ttia-copy-details", false),
+            includeZeroTargets: read("ttia-copy-zero", false)
+        };
+    }
+
+    function setCopyOptions(options) {
+        Object.keys(options).forEach(key => {
+            const idMap = {
+                includeHeader: "ttia-copy-header",
+                includeTargets: "ttia-copy-targets",
+                includeAttackers: "ttia-copy-attackers",
+                includeBreakdown: "ttia-copy-breakdown",
+                includeDetails: "ttia-copy-details",
+                includeZeroTargets: "ttia-copy-zero"
+            };
+            const el = document.getElementById(idMap[key]);
+            if (el) el.checked = !!options[key];
+        });
+    }
+
+    function applyCopyPreset(name) {
+        if (name === "full") {
+            setCopyOptions({
+                includeHeader: true,
+                includeTargets: true,
+                includeAttackers: true,
+                includeBreakdown: true,
+                includeDetails: true,
+                includeZeroTargets: true
+            });
+        } else {
+            setCopyOptions({
+                includeHeader: true,
+                includeTargets: true,
+                includeAttackers: true,
+                includeBreakdown: false,
+                includeDetails: false,
+                includeZeroTargets: false
+            });
+        }
+    }
+
+    function toggleCopyPanel() {
+        const panel = document.getElementById("ttia-copy-panel");
+        if (!panel) return;
+        panel.hidden = !panel.hidden;
     }
 
     // ---------- UI ----------
@@ -1259,7 +1350,24 @@
                         <div class="ttia-section-title">Tribe members</div>
                         <div class="ttia-section-subtitle">Incoming attacks per target player</div>
                     </div>
-                    <button type="button" class="ttia-button" id="ttia-copy" disabled>Copy full report</button>
+                    <button type="button" class="ttia-button" id="ttia-copy" disabled>Copy report ▾</button>
+                </div>
+                <div class="ttia-copy-panel" id="ttia-copy-panel" hidden>
+                    <div class="ttia-copy-title">Choose what to copy</div>
+                    <div class="ttia-copy-grid">
+                        <label><input type="checkbox" id="ttia-copy-header" checked> Tribe total</label>
+                        <label><input type="checkbox" id="ttia-copy-targets" checked> Attacked players</label>
+                        <label><input type="checkbox" id="ttia-copy-attackers" checked> Attacking players</label>
+                        <label><input type="checkbox" id="ttia-copy-breakdown"> Small / Medium / Large</label>
+                        <label><input type="checkbox" id="ttia-copy-details"> Origin → target details</label>
+                        <label><input type="checkbox" id="ttia-copy-zero"> Include players with 0 attacks</label>
+                    </div>
+                    <div class="ttia-copy-actions">
+                        <button type="button" class="ttia-button ttia-button-secondary" id="ttia-copy-simple">Simple preset</button>
+                        <button type="button" class="ttia-button ttia-button-secondary" id="ttia-copy-full">Full preset</button>
+                        <button type="button" class="ttia-button" id="ttia-copy-selected">Copy selected</button>
+                    </div>
+                    <div class="ttia-copy-hint">Simple preset copies only tribe total, attacked players and attacking players — without attack-size or Origin → target details.</div>
                 </div>
                 <div class="ttia-table-wrap ttia-member-wrap">
                     <table class="ttia-table">
@@ -1341,6 +1449,15 @@
             #${BOX_ID} .ttia-section-subtitle { margin-top: 2px; font-size: 10px; opacity: .72; }
             #${BOX_ID} .ttia-button { padding: 5px 9px; border: 1px solid #7d510f; border-radius: 3px; background: #cfa95e; color: #2f1b00; font: inherit; font-weight: 700; cursor: pointer; }
             #${BOX_ID} .ttia-button:disabled { opacity: .5; cursor: default; }
+            #${BOX_ID} .ttia-button-secondary { background: #e6d3a5; }
+            #${BOX_ID} .ttia-copy-panel { margin: 0 0 9px; padding: 9px; border: 1px solid #bd9c5a; background: #fff8e7; }
+            #${BOX_ID} .ttia-copy-panel[hidden] { display: none; }
+            #${BOX_ID} .ttia-copy-title { margin-bottom: 7px; font-weight: 700; }
+            #${BOX_ID} .ttia-copy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; }
+            #${BOX_ID} .ttia-copy-grid label { display: flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
+            #${BOX_ID} .ttia-copy-grid input { margin: 0; }
+            #${BOX_ID} .ttia-copy-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+            #${BOX_ID} .ttia-copy-hint { margin-top: 7px; font-size: 10px; line-height: 1.35; opacity: .72; }
             #${BOX_ID} .ttia-table-wrap { overflow: auto; border: 1px solid #bd9c5a; background: #fff5da; }
             #${BOX_ID} .ttia-member-wrap { max-height: 255px; }
             #${BOX_ID} .ttia-attacker-wrap { max-height: 255px; }
@@ -1376,7 +1493,10 @@
         document.body.appendChild(box);
 
         box.querySelector(".ttia-close").addEventListener("click", closeWidget);
-        box.querySelector("#ttia-copy").addEventListener("click", copyFullReport);
+        box.querySelector("#ttia-copy").addEventListener("click", toggleCopyPanel);
+        box.querySelector("#ttia-copy-simple").addEventListener("click", () => applyCopyPreset("simple"));
+        box.querySelector("#ttia-copy-full").addEventListener("click", () => applyCopyPreset("full"));
+        box.querySelector("#ttia-copy-selected").addEventListener("click", copySelectedReport);
         makeDraggable(box, box.querySelector("#ttia-drag-handle"));
     }
 
@@ -1463,10 +1583,17 @@
         });
     }
 
-    async function copyFullReport() {
+    async function copySelectedReport() {
+        const options = getCopyOptions();
+        if (!options.includeHeader && !options.includeTargets && !options.includeAttackers && !options.includeDetails) {
+            notify("info", "Choose at least one report section to copy.");
+            return;
+        }
+
         try {
-            await copyText(buildCopyText());
-            notify("success", "Full tribe incoming report copied.");
+            const report = buildCopyText(options);
+            await copyText(report);
+            notify("success", "Selected tribe incoming report copied.");
         } catch (err) {
             notify("error", "Could not copy the report.");
         }
