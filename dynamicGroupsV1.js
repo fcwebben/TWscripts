@@ -4,17 +4,19 @@
  * License: MIT (Twactics modifications; original-source credits retained below)
  *
  * Twactics Dynamic Group Manager
- * Version: v1.0.0
+ * Version: v1.1.0
  *
  * Import and export Tribal Wars dynamic-group filters, including complete
  * nested Filter Combinations (AND / OR custom logic).
  *
  * This script:
- * - Reads the currently open dynamic-group filter form
- * - Exports active filter configuration and custom filter combinations
- * - Imports filter configuration into the currently selected dynamic group
- * - Restores the complete nested AND / OR combination tree
+ * - Discovers dynamic groups available on the current account
+ * - Exports one or many selected groups in a single portable copy/paste package
+ * - Imports selected groups sequentially, creating missing groups by name
+ * - Can optionally update existing groups with the same name
+ * - Preserves complete nested Filter Combinations (AND / OR custom logic)
  * - Keeps account/session-specific group_id and CSRF values local
+ * - Supports the original single-group query-string format for compatibility
  * - Uses only same-origin Tribal Wars page functionality
  *
  * This script does NOT:
@@ -30,7 +32,8 @@
  *   https://forum.tribalwars.net/index.php?threads/import-export-dynamic-groups.288897/
  * - Original mod credit: JawJaw
  * - Twactics adaptation: UI, complete Filter Combination import support,
- *   validation, safer state handling, and Twactics packaging.
+ *   multi-group package export/import, validation, safer state handling,
+ *   and Twactics packaging.
  *
  * MIT License
  *
@@ -74,7 +77,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'twacticsDynamicGroupManager',
         name: 'Twactics Dynamic Group Manager',
-        version: 'v1.0.0',
+        version: 'v1.1.0',
         author: 'Twactics (zidrox)',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -1950,46 +1953,49 @@ window.twSDK = {
 };
 
 (async function () {
-    // Initialize Library
+    'use strict';
+
     await twSDK.init(scriptConfig);
+
     const scriptInfo = twSDK.scriptInfo();
     const isValidScreen = twSDK.checkValidLocation('screen');
     const isValidMode = twSDK.checkValidLocation('mode');
     const groupsType = twSDK.getParameterByName('type');
     const { isPA } = twSDK.getGameFeatures();
 
-    // Entry Point
-    (function () {
-        if (!isPA) {
-            UI.ErrorMessage(
-                twSDK.tt('This script requires Premium Account to be active!')
-            );
-        } else {
-            if (isValidScreen && isValidMode && groupsType === 'dynamic') {
-                try {
-                    // build user interface
-                    buildUI();
+    const BOX_ID = 'twactics-dynamic-group-manager';
+    const STYLE_ID = 'twactics-dynamic-group-manager-style';
+    const PACKAGE_FORMAT = 'twactics-dynamic-group-package';
+    const PACKAGE_VERSION = 1;
 
-                    // handle user actions
-                    handleImportGroup();
-                    handleExportGroup();
-                    handleUpdatePreview();
-                } catch (error) {
-                    UI.ErrorMessage(twSDK.tt('There was an error!'));
-                    console.error(`${scriptInfo} Error:`, error);
-                }
-            } else {
-                UI.InfoMessage(twSDK.tt('Redirecting...'));
-                twSDK.redirectTo('overview_villages&&mode=groups&type=dynamic');
-            }
-        }
-    })();
+    const state = {
+        groups: [],
+        importPackage: null,
+        busy: false,
+    };
 
-    // Render: Twactics-style user interface
+    if (!isPA) {
+        UI.ErrorMessage(twSDK.tt('This script requires Premium Account to be active!'));
+        return;
+    }
+
+    if (!(isValidScreen && isValidMode && groupsType === 'dynamic')) {
+        UI.InfoMessage(twSDK.tt('Redirecting...'));
+        twSDK.redirectTo('overview_villages&&mode=groups&type=dynamic');
+        return;
+    }
+
+    try {
+        buildUI();
+        bindUI();
+        state.groups = discoverDynamicGroups(document);
+        renderExportGroups();
+    } catch (error) {
+        UI.ErrorMessage(twSDK.tt('There was an error!'));
+        console.error(`${scriptInfo} Error:`, error);
+    }
+
     function buildUI() {
-        const BOX_ID = 'twactics-dynamic-group-manager';
-        const STYLE_ID = 'twactics-dynamic-group-manager-style';
-
         const existing = document.getElementById(BOX_ID);
         if (existing) existing.remove();
         const existingStyle = document.getElementById(STYLE_ID);
@@ -2001,39 +2007,95 @@ window.twSDK = {
             <div class="tdgm-header" id="tdgm-drag-handle">
                 <div>
                     <div class="tdgm-title">Twactics Dynamic Group Manager</div>
-                    <div class="tdgm-version">v1.0.0</div>
+                    <div class="tdgm-version">v1.1.0</div>
                 </div>
                 <button type="button" class="tdgm-close" title="Close">×</button>
             </div>
             <div class="tdgm-body">
                 <div class="tdgm-intro">
-                    Import or export the current dynamic group's complete configuration, including nested <strong>Filter Combinations</strong> (AND / OR logic).
+                    Export or import <strong>multiple Dynamic Groups</strong> in one copy/paste package. Complete nested <strong>Filter Combinations</strong> are preserved.
                 </div>
 
                 <div class="tdgm-grid">
                     <section class="tdgm-panel">
-                        <div class="tdgm-section-title">Import configuration</div>
-                        <div class="tdgm-section-subtitle">Paste a previously exported configuration. The current group's ID and session token are never imported.</div>
-                        <textarea class="tdgm-textarea" id="raImportGroupConfig" spellcheck="false" placeholder="Paste exported group configuration here..."></textarea>
-                        <div class="tdgm-buttons">
-                            <button type="button" id="raImportGroupBtn" class="tdgm-button">Import group</button>
-                            <button type="button" id="raUpdatePreviewBtn" class="tdgm-button tdgm-secondary btn-disabled">Update preview</button>
+                        <div class="tdgm-section-head">
+                            <div>
+                                <div class="tdgm-section-title">Export groups</div>
+                                <div class="tdgm-section-subtitle">Select any Dynamic Groups and export them together.</div>
+                            </div>
+                            <button type="button" id="tdgmRefreshGroups" class="tdgm-mini-button">Refresh</button>
                         </div>
+                        <div class="tdgm-list-tools">
+                            <button type="button" id="tdgmExportAll" class="tdgm-link-button">Select all</button>
+                            <button type="button" id="tdgmExportNone" class="tdgm-link-button">Select none</button>
+                            <span id="tdgmExportCount" class="tdgm-count"></span>
+                        </div>
+                        <div id="tdgmExportGroupList" class="tdgm-group-list"></div>
+                        <div class="tdgm-buttons">
+                            <button type="button" id="tdgmExportSelected" class="tdgm-button">Export selected</button>
+                            <button type="button" id="tdgmCopyPackage" class="tdgm-button tdgm-secondary">Copy export</button>
+                        </div>
+                        <textarea class="tdgm-textarea tdgm-package-textarea" id="tdgmExportPackage" spellcheck="false" readonly placeholder="Selected groups will be exported here..."></textarea>
                     </section>
 
                     <section class="tdgm-panel">
-                        <div class="tdgm-section-title">Export configuration</div>
-                        <div class="tdgm-section-subtitle">Exports filters plus the exact custom combination tree from the currently selected dynamic group.</div>
-                        <textarea class="tdgm-textarea" id="raExportGroupConfig" spellcheck="false" readonly placeholder="Click Export group..."></textarea>
+                        <div class="tdgm-section-title">Import groups</div>
+                        <div class="tdgm-section-subtitle">Paste a Twactics multi-group package, choose which groups to import, then import them sequentially.</div>
+                        <textarea class="tdgm-textarea tdgm-package-textarea" id="tdgmImportPackage" spellcheck="false" placeholder="Paste a Twactics group package here..."></textarea>
                         <div class="tdgm-buttons">
-                            <button type="button" id="raExportGroupBtn" class="tdgm-button">Export group</button>
-                            <button type="button" id="tdgmCopyExportBtn" class="tdgm-button tdgm-secondary">Copy export</button>
+                            <button type="button" id="tdgmLoadImport" class="tdgm-button">Load package</button>
+                            <button type="button" id="tdgmClearImport" class="tdgm-button tdgm-secondary">Clear</button>
+                        </div>
+                        <div id="tdgmImportArea" class="tdgm-import-area tdgm-hidden">
+                            <div class="tdgm-list-tools">
+                                <button type="button" id="tdgmImportAll" class="tdgm-link-button">Select all</button>
+                                <button type="button" id="tdgmImportNone" class="tdgm-link-button">Select none</button>
+                                <span id="tdgmImportCount" class="tdgm-count"></span>
+                            </div>
+                            <div id="tdgmImportGroupList" class="tdgm-group-list"></div>
+                            <label class="tdgm-option">
+                                <input type="checkbox" id="tdgmOverwriteExisting">
+                                Update an existing Dynamic Group when the same group name already exists
+                            </label>
+                            <div class="tdgm-buttons">
+                                <button type="button" id="tdgmImportSelected" class="tdgm-button">Import selected</button>
+                            </div>
                         </div>
                     </section>
                 </div>
 
+                <div id="tdgmProgress" class="tdgm-progress tdgm-hidden">
+                    <div class="tdgm-progress-top"><span id="tdgmProgressLabel">Working...</span><strong id="tdgmProgressText">0/0</strong></div>
+                    <div class="tdgm-progress-track"><div id="tdgmProgressBar"></div></div>
+                    <div id="tdgmProgressLog" class="tdgm-progress-log"></div>
+                </div>
+
+                <details class="tdgm-details">
+                    <summary>Legacy / current-group tools</summary>
+                    <div class="tdgm-legacy-grid">
+                        <div>
+                            <div class="tdgm-section-title">Import to current group</div>
+                            <div class="tdgm-section-subtitle">Supports the original single-group query-string format. Applies to the group currently open on the page; use Tribal Wars' Save group button afterwards.</div>
+                            <textarea class="tdgm-textarea" id="raImportGroupConfig" spellcheck="false" placeholder="Paste legacy group configuration..."></textarea>
+                            <div class="tdgm-buttons">
+                                <button type="button" id="raImportGroupBtn" class="tdgm-button">Apply to current group</button>
+                                <button type="button" id="raUpdatePreviewBtn" class="tdgm-button tdgm-secondary btn-disabled">Update preview</button>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="tdgm-section-title">Export current group</div>
+                            <div class="tdgm-section-subtitle">Exports the currently open group in the original query-string format.</div>
+                            <textarea class="tdgm-textarea" id="raExportGroupConfig" spellcheck="false" readonly placeholder="Click Export current..."></textarea>
+                            <div class="tdgm-buttons">
+                                <button type="button" id="raExportGroupBtn" class="tdgm-button">Export current</button>
+                                <button type="button" id="tdgmCopyLegacy" class="tdgm-button tdgm-secondary">Copy</button>
+                            </div>
+                        </div>
+                    </div>
+                </details>
+
                 <div class="tdgm-note">
-                    <strong>Safe scope:</strong> this tool only changes the filter form on the current Dynamic Groups page. Review the result and use Tribal Wars' own <strong>Save group</strong> button when ready.
+                    <strong>Import behavior:</strong> missing groups are created automatically. Existing same-name groups are skipped unless the update option is enabled. Imports are saved one group at a time through Tribal Wars' own Dynamic Group endpoint. Manual-group filters still contain account-specific manual group IDs, exactly like the original tool.
                 </div>
 
                 <div class="tdgm-footer"><span>MIT</span><span>Created by Twactics (zidrox) · Original script by RedAlert · Mod credit: JawJaw</span></div>
@@ -2044,7 +2106,7 @@ window.twSDK = {
         style.id = STYLE_ID;
         style.textContent = `
             #${BOX_ID} {
-                position: fixed; top: 70px; right: 30px; width: 720px;
+                position: fixed; top: 55px; right: 24px; width: 920px;
                 max-width: calc(100vw - 24px); max-height: calc(100vh - 24px);
                 z-index: 999999; overflow: hidden; background: #f4e4bc;
                 border: 2px solid #7d510f; border-radius: 7px;
@@ -2065,17 +2127,41 @@ window.twSDK = {
                 background: #e6d3a5; color: #2f1b00; font-size: 20px; line-height: 22px;
                 font-weight: 700; cursor: pointer;
             }
-            #${BOX_ID} .tdgm-body { padding: 12px; overflow: auto; max-height: calc(100vh - 94px); }
+            #${BOX_ID} .tdgm-body { padding: 12px; overflow: auto; max-height: calc(100vh - 79px); }
             #${BOX_ID} .tdgm-intro { margin-bottom: 10px; padding: 8px 9px; border: 1px solid #bd9c5a; background: #fff5da; line-height: 1.45; }
             #${BOX_ID} .tdgm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-            #${BOX_ID} .tdgm-panel { padding: 9px; border: 1px solid #bd9c5a; background: #fff5da; }
+            #${BOX_ID} .tdgm-panel { min-width: 0; padding: 9px; border: 1px solid #bd9c5a; background: #fff5da; }
+            #${BOX_ID} .tdgm-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
             #${BOX_ID} .tdgm-section-title { font-weight: 700; font-size: 13px; }
-            #${BOX_ID} .tdgm-section-subtitle { min-height: 42px; margin-top: 3px; font-size: 10px; line-height: 1.4; opacity: .74; }
+            #${BOX_ID} .tdgm-section-subtitle { margin-top: 3px; font-size: 10px; line-height: 1.4; opacity: .74; }
+            #${BOX_ID} .tdgm-mini-button, #${BOX_ID} .tdgm-link-button {
+                border: 0; padding: 0; background: transparent; color: #603000; text-decoration: underline; cursor: pointer; font: inherit;
+            }
+            #${BOX_ID} .tdgm-mini-button { white-space: nowrap; }
+            #${BOX_ID} .tdgm-list-tools { display: flex; align-items: center; gap: 9px; margin: 9px 0 5px; font-size: 10px; }
+            #${BOX_ID} .tdgm-count { margin-left: auto; opacity: .72; }
+            #${BOX_ID} .tdgm-group-list {
+                height: 190px; overflow: auto; border: 1px solid #bd9c5a; background: #fffaf0;
+            }
+            #${BOX_ID} .tdgm-group-row {
+                display: flex; align-items: center; gap: 7px; min-height: 30px; padding: 5px 7px;
+                border-bottom: 1px solid #e0c99a;
+            }
+            #${BOX_ID} .tdgm-group-row:last-child { border-bottom: 0; }
+            #${BOX_ID} .tdgm-group-row:nth-child(even) { background: #f0e2be; }
+            #${BOX_ID} .tdgm-group-row:hover { background: #ead49f; }
+            #${BOX_ID} .tdgm-group-row label { flex: 1; min-width: 0; cursor: pointer; }
+            #${BOX_ID} .tdgm-group-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            #${BOX_ID} .tdgm-group-meta { margin-top: 2px; font-size: 9px; opacity: .66; }
+            #${BOX_ID} .tdgm-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #bd9c5a; background: #fff5da; font-size: 9px; }
+            #${BOX_ID} .tdgm-badge-exists { background: #f4dfb8; border-color: #a56c2a; }
+            #${BOX_ID} .tdgm-empty { padding: 16px; text-align: center; opacity: .7; }
             #${BOX_ID} .tdgm-textarea {
-                display: block; width: 100%; height: 150px; margin-top: 7px; padding: 7px;
+                display: block; width: 100%; height: 125px; margin-top: 7px; padding: 7px;
                 resize: vertical; border: 1px solid #8f6a2b; background: #fffaf0; color: #2f1b00;
                 font: 11px Consolas, "Courier New", monospace;
             }
+            #${BOX_ID} .tdgm-package-textarea { height: 132px; }
             #${BOX_ID} .tdgm-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
             #${BOX_ID} .tdgm-button {
                 padding: 5px 9px; border: 1px solid #7d510f; border-radius: 3px;
@@ -2083,172 +2169,595 @@ window.twSDK = {
             }
             #${BOX_ID} .tdgm-button:hover { background: #d9b66b; }
             #${BOX_ID} .tdgm-button.tdgm-secondary { background: #e6d3a5; }
-            #${BOX_ID} .tdgm-button.btn-disabled { opacity: .5; }
+            #${BOX_ID} .tdgm-button:disabled, #${BOX_ID} .tdgm-button.btn-disabled { opacity: .5; cursor: default; }
+            #${BOX_ID} .tdgm-import-area { margin-top: 9px; }
+            #${BOX_ID} .tdgm-option { display: block; margin-top: 8px; padding: 7px; border: 1px solid #d5bd87; background: #fff8e7; font-size: 10px; line-height: 1.35; }
+            #${BOX_ID} .tdgm-progress { margin-top: 10px; padding: 8px; border: 1px solid #bd9c5a; background: #fff5da; }
+            #${BOX_ID} .tdgm-progress-top { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+            #${BOX_ID} .tdgm-progress-track { width: 100%; height: 10px; overflow: hidden; border: 1px solid #8f6a2b; background: #e7d6ac; }
+            #${BOX_ID} #tdgmProgressBar { width: 0%; height: 100%; background: #8ea85a; transition: width .12s ease; }
+            #${BOX_ID} .tdgm-progress-log { max-height: 105px; overflow: auto; margin-top: 7px; padding: 6px; border: 1px solid #d5bd87; background: #fffaf0; font: 10px Consolas, "Courier New", monospace; white-space: pre-wrap; }
+            #${BOX_ID} .tdgm-details { margin-top: 10px; border: 1px solid #bd9c5a; background: #fff5da; }
+            #${BOX_ID} .tdgm-details summary { padding: 8px 9px; cursor: pointer; font-weight: 700; background: #ead49f; }
+            #${BOX_ID} .tdgm-legacy-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 9px; }
             #${BOX_ID} .tdgm-note { margin-top: 10px; padding: 7px 8px; border: 1px solid #d5bd87; background: #fff8e7; font-size: 10px; line-height: 1.45; }
             #${BOX_ID} .tdgm-footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 10px; padding-top: 8px; border-top: 1px solid #bd9c5a; font-size: 10px; opacity: .72; }
-            @media (max-width: 760px) {
+            #${BOX_ID} .tdgm-hidden { display: none !important; }
+            @media (max-width: 850px) {
                 #${BOX_ID} { left: 8px !important; right: 8px !important; top: 8px !important; width: auto; max-width: none; }
-                #${BOX_ID} .tdgm-grid { grid-template-columns: 1fr; }
-                #${BOX_ID} .tdgm-section-subtitle { min-height: 0; }
+                #${BOX_ID} .tdgm-grid, #${BOX_ID} .tdgm-legacy-grid { grid-template-columns: 1fr; }
             }
         `;
 
         document.head.appendChild(style);
         document.body.appendChild(box);
+        makeTwacticsDraggable(box, box.querySelector('#tdgm-drag-handle'));
 
-        const close = () => {
-            box.remove();
-            style.remove();
-            if (window.twacticsDynamicGroupManager) delete window.twacticsDynamicGroupManager;
+        window.twacticsDynamicGroupManager = {
+            destroy: destroy,
+            state: state,
+        };
+    }
+
+    function bindUI() {
+        const box = document.getElementById(BOX_ID);
+        box.querySelector('.tdgm-close').addEventListener('click', destroy);
+
+        box.querySelector('#tdgmRefreshGroups').addEventListener('click', async function () {
+            await refreshGroups();
+            UI.SuccessMessage(`Found ${state.groups.length} Dynamic Group${state.groups.length === 1 ? '' : 's'}.`);
+        });
+
+        box.querySelector('#tdgmExportAll').addEventListener('click', function () {
+            setChecks('#tdgmExportGroupList input[type="checkbox"]', true);
+            updateSelectionCounts();
+        });
+        box.querySelector('#tdgmExportNone').addEventListener('click', function () {
+            setChecks('#tdgmExportGroupList input[type="checkbox"]', false);
+            updateSelectionCounts();
+        });
+        box.querySelector('#tdgmExportGroupList').addEventListener('change', updateSelectionCounts);
+        box.querySelector('#tdgmExportSelected').addEventListener('click', exportSelectedGroups);
+        box.querySelector('#tdgmCopyPackage').addEventListener('click', function () {
+            copyTextarea('tdgmExportPackage', 'Export copied to clipboard!');
+        });
+
+        box.querySelector('#tdgmLoadImport').addEventListener('click', loadImportPackage);
+        box.querySelector('#tdgmClearImport').addEventListener('click', clearImportPackage);
+        box.querySelector('#tdgmImportAll').addEventListener('click', function () {
+            setChecks('#tdgmImportGroupList input[type="checkbox"]', true);
+            updateSelectionCounts();
+        });
+        box.querySelector('#tdgmImportNone').addEventListener('click', function () {
+            setChecks('#tdgmImportGroupList input[type="checkbox"]', false);
+            updateSelectionCounts();
+        });
+        box.querySelector('#tdgmImportGroupList').addEventListener('change', updateSelectionCounts);
+        box.querySelector('#tdgmImportSelected').addEventListener('click', importSelectedGroups);
+
+        box.querySelector('#raImportGroupBtn').addEventListener('click', legacyImportCurrent);
+        box.querySelector('#raExportGroupBtn').addEventListener('click', function () {
+            document.getElementById('raExportGroupConfig').value = serializeCurrentForm();
+        });
+        box.querySelector('#tdgmCopyLegacy').addEventListener('click', function () {
+            copyTextarea('raExportGroupConfig', 'Export copied to clipboard!');
+        });
+        box.querySelector('#raUpdatePreviewBtn').addEventListener('click', function () {
+            updatePreview();
+            UI.SuccessMessage(twSDK.tt('Preview has been updated!'));
+        });
+    }
+
+    function destroy() {
+        const box = document.getElementById(BOX_ID);
+        if (box) box.remove();
+        const style = document.getElementById(STYLE_ID);
+        if (style) style.remove();
+        delete window.twacticsDynamicGroupManager;
+    }
+
+    async function refreshGroups() {
+        const latest = await fetchCurrentDynamicGroupsPage();
+        state.groups = discoverDynamicGroups(latest.doc, latest.url);
+        renderExportGroups();
+        if (state.importPackage) renderImportGroups();
+    }
+
+    function renderExportGroups() {
+        const container = document.getElementById('tdgmExportGroupList');
+        if (!state.groups.length) {
+            container.innerHTML = '<div class="tdgm-empty">No Dynamic Groups could be discovered on this page.</div>';
+            updateSelectionCounts();
+            return;
+        }
+
+        container.innerHTML = state.groups.map((group, index) => `
+            <div class="tdgm-group-row">
+                <input type="checkbox" id="tdgm-exp-${index}" data-group-id="${escapeHtml(group.id)}" checked>
+                <label for="tdgm-exp-${index}">
+                    <div class="tdgm-group-name">${escapeHtml(group.name)}</div>
+                    <div class="tdgm-group-meta">Group ID ${escapeHtml(group.id)}${group.isCurrent ? ' · currently open' : ''}</div>
+                </label>
+            </div>
+        `).join('');
+        updateSelectionCounts();
+    }
+
+    function renderImportGroups() {
+        const area = document.getElementById('tdgmImportArea');
+        const container = document.getElementById('tdgmImportGroupList');
+        if (!state.importPackage || !state.importPackage.groups.length) {
+            area.classList.add('tdgm-hidden');
+            container.innerHTML = '';
+            return;
+        }
+
+        const existingByName = buildExistingNameMap();
+        container.innerHTML = state.importPackage.groups.map((group, index) => {
+            const existing = existingByName.get(normalizeName(group.name));
+            return `
+                <div class="tdgm-group-row">
+                    <input type="checkbox" id="tdgm-imp-${index}" data-import-index="${index}" checked>
+                    <label for="tdgm-imp-${index}">
+                        <div class="tdgm-group-name">${escapeHtml(group.name)}</div>
+                        <div class="tdgm-group-meta">${countActiveFilters(group.config)} active filter${countActiveFilters(group.config) === 1 ? '' : 's'}${groupUsesCustomLogic(group.config) ? ' · custom combinations' : ''}</div>
+                    </label>
+                    ${existing ? '<span class="tdgm-badge tdgm-badge-exists">Already exists</span>' : '<span class="tdgm-badge">New</span>'}
+                </div>
+            `;
+        }).join('');
+        area.classList.remove('tdgm-hidden');
+        updateSelectionCounts();
+    }
+
+    function updateSelectionCounts() {
+        const exp = document.querySelectorAll('#tdgmExportGroupList input[type="checkbox"]:checked').length;
+        const expTotal = document.querySelectorAll('#tdgmExportGroupList input[type="checkbox"]').length;
+        const imp = document.querySelectorAll('#tdgmImportGroupList input[type="checkbox"]:checked').length;
+        const impTotal = document.querySelectorAll('#tdgmImportGroupList input[type="checkbox"]').length;
+        const expLabel = document.getElementById('tdgmExportCount');
+        const impLabel = document.getElementById('tdgmImportCount');
+        if (expLabel) expLabel.textContent = `${exp}/${expTotal} selected`;
+        if (impLabel) impLabel.textContent = `${imp}/${impTotal} selected`;
+    }
+
+    function setChecks(selector, checked) {
+        document.querySelectorAll(selector).forEach((input) => { input.checked = checked; });
+    }
+
+    async function exportSelectedGroups() {
+        if (state.busy) return;
+        const selectedIds = Array.from(document.querySelectorAll('#tdgmExportGroupList input[type="checkbox"]:checked')).map((input) => input.dataset.groupId);
+        if (!selectedIds.length) {
+            UI.ErrorMessage('Select at least one group to export.');
+            return;
+        }
+
+        const selectedGroups = selectedIds.map((id) => state.groups.find((g) => g.id === id)).filter(Boolean);
+        setBusy(true);
+        startProgress('Exporting groups', selectedGroups.length);
+
+        const outputGroups = [];
+        try {
+            for (let i = 0; i < selectedGroups.length; i++) {
+                const group = selectedGroups[i];
+                updateProgress(i, selectedGroups.length, `Reading ${group.name}...`);
+                try {
+                    const config = await exportOneGroup(group);
+                    outputGroups.push({
+                        name: group.name,
+                        source_group_id: group.id,
+                        config: stripLocalFields(config),
+                    });
+                    appendProgress(`✓ ${group.name}`);
+                } catch (error) {
+                    appendProgress(`✗ ${group.name}: ${error.message}`);
+                    console.error(`${scriptInfo} Export failed for ${group.name}`, error);
+                }
+            }
+
+            updateProgress(selectedGroups.length, selectedGroups.length, 'Export complete');
+            const pkg = {
+                format: PACKAGE_FORMAT,
+                version: PACKAGE_VERSION,
+                created_at: new Date().toISOString(),
+                groups: outputGroups,
+            };
+            document.getElementById('tdgmExportPackage').value = JSON.stringify(pkg, null, 2);
+
+            if (outputGroups.length) {
+                UI.SuccessMessage(`Exported ${outputGroups.length} group${outputGroups.length === 1 ? '' : 's'}.`);
+            } else {
+                UI.ErrorMessage('No groups could be exported.');
+            }
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function exportOneGroup(group) {
+        const currentId = getCurrentGroupId(document);
+        if (group.isCurrent || group.id === currentId) {
+            return serializeCurrentForm();
+        }
+
+        const url = group.url || buildGroupUrl(group.id);
+        const response = await fetch(url, {
+            method: 'GET',
+            credentials: 'same-origin',
+            headers: { Accept: 'text/html,application/xhtml+xml' },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const html = await response.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const form = doc.querySelector('#filter_config');
+        if (!form) throw new Error('filter form not found');
+        return serializeForm(form);
+    }
+
+    function loadImportPackage() {
+        const raw = document.getElementById('tdgmImportPackage').value.trim();
+        if (!raw) {
+            UI.ErrorMessage('Paste an export package first.');
+            return;
+        }
+
+        try {
+            const parsed = parseImportPackage(raw);
+            state.importPackage = parsed;
+            renderImportGroups();
+            UI.SuccessMessage(`Loaded ${parsed.groups.length} group${parsed.groups.length === 1 ? '' : 's'}.`);
+        } catch (error) {
+            console.error(`${scriptInfo} Import package error`, error);
+            UI.ErrorMessage(`Invalid import package: ${error.message}`);
+        }
+    }
+
+    function clearImportPackage() {
+        document.getElementById('tdgmImportPackage').value = '';
+        state.importPackage = null;
+        renderImportGroups();
+    }
+
+    function parseImportPackage(raw) {
+        if (raw.startsWith('{')) {
+            const pkg = JSON.parse(raw);
+            if (pkg.format !== PACKAGE_FORMAT) throw new Error('not a Twactics Dynamic Group package');
+            if (!Array.isArray(pkg.groups) || !pkg.groups.length) throw new Error('package contains no groups');
+
+            const groups = pkg.groups.map((group, index) => {
+                if (!group || typeof group.name !== 'string' || !group.name.trim()) throw new Error(`group ${index + 1} has no name`);
+                if (typeof group.config !== 'string' || !group.config.trim()) throw new Error(`group ${group.name} has no configuration`);
+                validatePortableConfig(group.config);
+                return {
+                    name: group.name.trim(),
+                    source_group_id: group.source_group_id ? String(group.source_group_id) : '',
+                    config: stripLocalFields(group.config),
+                };
+            });
+
+            return { format: PACKAGE_FORMAT, version: pkg.version || 1, groups };
+        }
+
+        // Backwards compatibility: a raw old-style query string becomes one package item.
+        validatePortableConfig(raw);
+        return {
+            format: PACKAGE_FORMAT,
+            version: 1,
+            groups: [{ name: 'Imported Dynamic Group', source_group_id: '', config: stripLocalFields(raw) }],
+        };
+    }
+
+    async function importSelectedGroups() {
+        if (state.busy) return;
+        if (!state.importPackage) {
+            UI.ErrorMessage('Load an import package first.');
+            return;
+        }
+
+        const indexes = Array.from(document.querySelectorAll('#tdgmImportGroupList input[type="checkbox"]:checked')).map((input) => Number(input.dataset.importIndex));
+        if (!indexes.length) {
+            UI.ErrorMessage('Select at least one group to import.');
+            return;
+        }
+
+        const groups = indexes.map((index) => state.importPackage.groups[index]).filter(Boolean);
+        const overwrite = document.getElementById('tdgmOverwriteExisting').checked;
+
+        setBusy(true);
+        startProgress('Importing groups', groups.length);
+        let imported = 0;
+        let skipped = 0;
+        let failed = 0;
+
+        try {
+            await refreshGroups();
+            let existingByName = buildExistingNameMap();
+
+            for (let i = 0; i < groups.length; i++) {
+                const group = groups[i];
+                updateProgress(i, groups.length, `Importing ${group.name}...`);
+                try {
+                    let target = existingByName.get(normalizeName(group.name));
+                    if (target && !overwrite) {
+                        skipped++;
+                        appendProgress(`– ${group.name}: skipped (already exists)`);
+                        continue;
+                    }
+
+                    if (!target) {
+                        appendProgress(`+ Creating ${group.name}...`);
+                        await createDynamicGroup(group.name);
+                        const refreshed = await fetchCurrentDynamicGroupsPage();
+                        state.groups = discoverDynamicGroups(refreshed.doc, refreshed.url);
+                        existingByName = buildExistingNameMap();
+                        target = existingByName.get(normalizeName(group.name));
+                        if (!target) throw new Error('group was created but its new ID could not be found');
+                    }
+
+                    await saveGroupConfiguration(target.id, group.config);
+                    imported++;
+                    appendProgress(`✓ ${group.name}${target ? '' : ''}`);
+                } catch (error) {
+                    failed++;
+                    appendProgress(`✗ ${group.name}: ${error.message}`);
+                    console.error(`${scriptInfo} Import failed for ${group.name}`, error);
+                }
+            }
+
+            updateProgress(groups.length, groups.length, 'Import complete');
+            await refreshGroups();
+
+            if (failed) {
+                UI.ErrorMessage(`Import finished: ${imported} imported, ${skipped} skipped, ${failed} failed.`);
+            } else {
+                UI.SuccessMessage(`Import finished: ${imported} imported${skipped ? `, ${skipped} skipped` : ''}.`);
+            }
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function createDynamicGroup(name) {
+        const token = getCsrfToken();
+        if (!token) throw new Error('CSRF token not found');
+
+        const url = new URL('/game.php', window.location.origin);
+        addSessionContext(url);
+        url.searchParams.set('screen', 'overview_villages');
+        url.searchParams.set('mode', 'groups');
+        url.searchParams.set('type', 'dynamic');
+        url.searchParams.set('action', 'create_dynamic');
+
+        const body = new URLSearchParams();
+        body.set('group_name', name);
+        body.set('h', token);
+
+        const response = await fetch(url.toString(), {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+            body: body.toString(),
+        });
+        if (!response.ok) throw new Error(`create failed (HTTP ${response.status})`);
+    }
+
+    async function saveGroupConfiguration(groupId, portableConfig) {
+        validatePortableConfig(portableConfig);
+        const token = getCsrfToken();
+        if (!token) throw new Error('CSRF token not found');
+
+        const url = new URL('/game.php', window.location.origin);
+        addSessionContext(url);
+        url.searchParams.set('screen', 'overview_villages');
+        url.searchParams.set('mode', 'groups');
+        url.searchParams.set('type', 'dynamic');
+        url.searchParams.set('action', 'set_filters');
+
+        const body = new URLSearchParams(stripLocalFields(portableConfig));
+        body.set('group_id', groupId);
+        body.set('h', token);
+
+        const response = await fetch(url.toString(), {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+            body: body.toString(),
+        });
+        if (!response.ok) throw new Error(`save failed (HTTP ${response.status})`);
+    }
+
+    async function fetchCurrentDynamicGroupsPage() {
+        const url = new URL('/game.php', window.location.origin);
+        addSessionContext(url);
+        url.searchParams.set('screen', 'overview_villages');
+        url.searchParams.set('mode', 'groups');
+        url.searchParams.set('type', 'dynamic');
+
+        const response = await fetch(url.toString(), {
+            method: 'GET',
+            credentials: 'same-origin',
+            headers: { Accept: 'text/html,application/xhtml+xml' },
+        });
+        if (!response.ok) throw new Error(`Could not refresh groups (HTTP ${response.status})`);
+        const html = await response.text();
+        return { doc: new DOMParser().parseFromString(html, 'text/html'), url: response.url || url.toString() };
+    }
+
+    function discoverDynamicGroups(doc, baseUrl) {
+        const map = new Map();
+        const base = baseUrl || window.location.href;
+
+        const add = (id, name, url) => {
+            id = String(id || '').trim();
+            name = cleanText(name);
+            if (!/^\d+$/.test(id) || !name) return;
+            if (!map.has(id)) {
+                map.set(id, {
+                    id,
+                    name,
+                    url: url || buildGroupUrl(id),
+                    isCurrent: id === getCurrentGroupId(document),
+                });
+            } else if (name.length > map.get(id).name.length) {
+                map.get(id).name = name;
+            }
         };
 
-        box.querySelector('.tdgm-close').addEventListener('click', close);
-        box.querySelector('#tdgmCopyExportBtn').addEventListener('click', async function () {
-            const value = jQuery('#raExportGroupConfig').val();
-            if (!value) {
-                UI.ErrorMessage('Export the group first.');
-                return;
-            }
+        doc.querySelectorAll('a[href]').forEach((anchor) => {
             try {
-                await navigator.clipboard.writeText(value);
-                UI.SuccessMessage('Export copied to clipboard!');
-            } catch (error) {
-                const textarea = box.querySelector('#raExportGroupConfig');
-                textarea.focus();
-                textarea.select();
-                document.execCommand('copy');
-                UI.SuccessMessage('Export copied to clipboard!');
-            }
+                const url = new URL(anchor.getAttribute('href'), base);
+                if (url.searchParams.get('type') && url.searchParams.get('type') !== 'dynamic') return;
+                const id = url.searchParams.get('group') || url.searchParams.get('group_id');
+                if (!id) return;
+                const name = cleanText(anchor.textContent) || cleanText(anchor.getAttribute('title'));
+                add(id, name, url.toString());
+            } catch (error) {}
         });
 
-        makeTwacticsDraggable(box, box.querySelector('#tdgm-drag-handle'));
-        window.twacticsDynamicGroupManager = { destroy: close };
+        doc.querySelectorAll('option[value]').forEach((option) => {
+            const value = option.value || '';
+            try {
+                const url = new URL(value, base);
+                const id = url.searchParams.get('group') || url.searchParams.get('group_id');
+                if (id) add(id, cleanText(option.textContent), url.toString());
+            } catch (error) {}
+        });
+
+        // The currently open group is always recoverable from the form even if the navigation markup changes.
+        const currentForm = doc.querySelector('#filter_config');
+        const currentIdInput = currentForm ? currentForm.querySelector('input[name="group_id"]') : null;
+        const currentNameEl = doc.querySelector('#dynamic_group_name');
+        if (currentIdInput && currentIdInput.value) {
+            add(currentIdInput.value, cleanText(currentNameEl ? currentNameEl.textContent : '') || `Group ${currentIdInput.value}`, buildGroupUrl(currentIdInput.value));
+        }
+
+        return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
     }
 
-    function makeTwacticsDraggable(box, handle) {
-        let dragging = false;
-        let offsetX = 0;
-        let offsetY = 0;
-
-        handle.addEventListener('mousedown', function (event) {
-            if (event.target.closest('button, input, textarea, select, a')) return;
-            dragging = true;
-            const rect = box.getBoundingClientRect();
-            offsetX = event.clientX - rect.left;
-            offsetY = event.clientY - rect.top;
-            box.style.right = 'auto';
-            document.body.style.userSelect = 'none';
+    function buildExistingNameMap() {
+        const map = new Map();
+        state.groups.forEach((group) => {
+            const key = normalizeName(group.name);
+            if (!map.has(key)) map.set(key, group);
         });
-
-        document.addEventListener('mousemove', function (event) {
-            if (!dragging) return;
-            const maxLeft = Math.max(0, window.innerWidth - box.offsetWidth);
-            const maxTop = Math.max(0, window.innerHeight - 40);
-            box.style.left = Math.max(0, Math.min(maxLeft, event.clientX - offsetX)) + 'px';
-            box.style.top = Math.max(0, Math.min(maxTop, event.clientY - offsetY)) + 'px';
-        });
-
-        document.addEventListener('mouseup', function () {
-            if (!dragging) return;
-            dragging = false;
-            document.body.style.userSelect = '';
-        });
+        return map;
     }
 
-    // Action Handler: Import dynamic group settings
-    // v1.0.4: imports both filter definitions and custom AND/OR combinations.
-    function handleImportGroup() {
-        jQuery('#raImportGroupBtn').on('click', async function (e) {
-            e.preventDefault();
+    function buildGroupUrl(groupId) {
+        const url = new URL('/game.php', window.location.origin);
+        addSessionContext(url);
+        url.searchParams.set('screen', 'overview_villages');
+        url.searchParams.set('mode', 'groups');
+        url.searchParams.set('type', 'dynamic');
+        url.searchParams.set('group', String(groupId));
+        return url.toString();
+    }
 
-            const importedString = jQuery('#raImportGroupConfig').val().trim();
-            const currentFormDataString = jQuery('#filter_config').serialize();
+    function addSessionContext(url) {
+        const villageId = game_data && game_data.village ? game_data.village.id : null;
+        if (villageId) url.searchParams.set('village', String(villageId));
+        if (game_data && game_data.player && game_data.player.sitter > 0) {
+            url.searchParams.set('t', String(game_data.player.id));
+        }
+    }
 
-            if (importedString.length === 0) {
-                UI.ErrorMessage(
-                    twSDK.tt('Import a group configuration then try again!')
-                );
-                return;
+    function getCurrentGroupId(doc) {
+        const input = doc.querySelector('#filter_config input[name="group_id"]');
+        return input ? String(input.value || '') : '';
+    }
+
+    function getCsrfToken() {
+        if (typeof csrf_token !== 'undefined' && csrf_token) return String(csrf_token);
+        const input = document.querySelector('#filter_config input[name="h"], form[action*="create_dynamic"] input[name="h"]');
+        return input ? String(input.value || '') : '';
+    }
+
+    function serializeCurrentForm() {
+        const form = document.querySelector('#filter_config');
+        if (!form) throw new Error('Current filter form not found');
+        return serializeForm(form);
+    }
+
+    function serializeForm(form) {
+        const params = new URLSearchParams();
+        const elements = Array.from(form.elements || []);
+        elements.forEach((element) => {
+            if (!element.name || element.disabled) return;
+            const type = String(element.type || '').toLowerCase();
+            if ((type === 'checkbox' || type === 'radio') && !element.checked) return;
+            if (type === 'submit' || type === 'button' || type === 'file') return;
+            if (element.tagName === 'SELECT' && element.multiple) {
+                Array.from(element.selectedOptions).forEach((option) => params.append(element.name, option.value));
+            } else {
+                params.append(element.name, element.value);
             }
+        });
+        return params.toString();
+    }
 
+    function stripLocalFields(config) {
+        const params = new URLSearchParams(String(config || '').replace(/^\?/, ''));
+        params.delete('group_id');
+        params.delete('h');
+        return params.toString();
+    }
+
+    function validatePortableConfig(config) {
+        const params = new URLSearchParams(String(config || '').replace(/^\?/, ''));
+        if (!String(config || '').trim()) throw new Error('configuration is empty');
+
+        if (params.get('use_custom_logic') === '1') {
+            const raw = params.get('custom_logic');
+            if (!raw) throw new Error('custom filter combinations are enabled but custom_logic is missing');
+            const data = {};
+            params.forEach((value, key) => { data[key] = value; });
+            validateCustomLogicTree(JSON.parse(raw), data);
+        }
+        return true;
+    }
+
+    function countActiveFilters(config) {
+        const params = new URLSearchParams(config);
+        let count = 0;
+        params.forEach((value, key) => { if (key.startsWith('active_') && value === 'on') count++; });
+        return count;
+    }
+
+    function groupUsesCustomLogic(config) {
+        return new URLSearchParams(config).get('use_custom_logic') === '1';
+    }
+
+    async function legacyImportCurrent() {
+        const importedString = document.getElementById('raImportGroupConfig').value.trim();
+        if (!importedString) {
+            UI.ErrorMessage(twSDK.tt('Import a group configuration then try again!'));
+            return;
+        }
+
+        try {
+            validatePortableConfig(importedString);
             const importedFormData = deparam(importedString);
-            const currentFormData = deparam(currentFormDataString);
-
-            // group_id and h are account/session specific and must never be imported.
-            // custom_logic/use_custom_logic ARE part of the portable configuration.
+            const importedFilterData = filterFilterControlData(importedFormData);
+            const currentFormData = deparam(serializeCurrentForm());
             const comparableImportedData = filterNonNeededFormData(importedFormData);
             const comparableCurrentData = filterNonNeededFormData(currentFormData);
 
-            // Apply normal filter controls separately from the custom logic tree.
-            const importedFilterData = filterFilterControlData(importedFormData);
-            const importedCustomLogic = importedFormData.custom_logic;
-            const importedUseCustomLogic = importedFormData.use_custom_logic ?? '0';
-
-            const jsonStringImportedData = JSON.stringify(comparableImportedData);
-            const jsonStringCurrentData = JSON.stringify(comparableCurrentData);
-
-            if (DEBUG) {
-                console.debug(`${scriptInfo} importedString`, importedString);
-                console.debug(`${scriptInfo} importedFormData`, importedFormData);
-                console.debug(`${scriptInfo} comparableImportedData`, comparableImportedData);
-                console.debug(`${scriptInfo} comparableCurrentData`, comparableCurrentData);
-                console.debug(`${scriptInfo} importedCustomLogic`, importedCustomLogic);
-                console.debug(`${scriptInfo} importedUseCustomLogic`, importedUseCustomLogic);
-            }
-
-            if (Object.entries(importedFilterData).length < 1) {
-                UI.ErrorMessage(twSDK.tt('Invalid input!'));
-                return;
-            }
-
-            if (jsonStringImportedData === jsonStringCurrentData) {
+            if (JSON.stringify(comparableImportedData) === JSON.stringify(comparableCurrentData)) {
                 UI.ErrorMessage(twSDK.tt('Filters have already been applied!'));
                 return;
             }
 
-            // Validate custom logic before touching the current group.
-            if (String(importedUseCustomLogic) === '1') {
-                if (!importedCustomLogic) {
-                    UI.ErrorMessage('Invalid input: custom filter combinations are enabled but custom_logic is missing.');
-                    return;
-                }
+            const importedCustomLogic = importedFormData.custom_logic;
+            const importedUseCustomLogic = importedFormData.use_custom_logic ?? '0';
 
-                try {
-                    const parsedLogic = JSON.parse(importedCustomLogic);
-                    validateCustomLogicTree(parsedLogic, importedFilterData);
-                } catch (error) {
-                    console.error(`${scriptInfo} Invalid custom_logic`, error);
-                    UI.ErrorMessage(`Invalid filter combinations: ${error.message}`);
-                    return;
-                }
-            }
-
-            jQuery('#raUpdatePreviewBtn').removeClass('btn-disabled');
-            jQuery('html,body').animate(
-                {
-                    scrollTop: jQuery('#filter_config').offset().top - 100,
-                },
-                'slow'
-            );
-
-            // Prevent the game's automatic preview call while many controls are changed.
             VillageFilters.previewResults = () => {};
 
-            // 1) Disable currently active filters that are not active in the imported config.
-            const importedActiveKeys = new Set(
-                Object.keys(importedFilterData).filter((key) =>
-                    key.startsWith('active_') && importedFilterData[key] === 'on'
-                )
-            );
-
+            const importedActiveKeys = new Set(Object.keys(importedFilterData).filter((key) => key.startsWith('active_') && importedFilterData[key] === 'on'));
             jQuery('#filter_config input[type="checkbox"][name^="active_"]:checked').each(function () {
-                const name = this.name;
-                if (!importedActiveKeys.has(name)) {
-                    jQuery(this).trigger('click');
-                }
+                if (!importedActiveKeys.has(this.name)) jQuery(this).trigger('click');
             });
 
-            // 2) Enable all filters required by the imported config.
             for (const key of importedActiveKeys) {
                 const $input = jQuery(`[name="${key}"]`);
                 if ($input.length && !$input.is(':checked')) {
@@ -2257,206 +2766,191 @@ window.twSDK = {
                 }
             }
 
-            // 3) Apply every imported filter value.
-            // Active checkboxes were handled above; group_id/h/custom logic are handled separately.
             for (const [key, value] of Object.entries(importedFilterData)) {
                 if (key.startsWith('active_')) continue;
-
                 const $input = jQuery(`[name="${key}"]`);
-                if (!$input.length) {
-                    if (DEBUG) console.warn(`${scriptInfo} Missing input while importing: ${key}`);
-                    continue;
-                }
-
+                if (!$input.length) continue;
                 if ($input.is(':radio')) {
                     $input.filter(`[value="${cssEscapeAttributeValue(value)}"]`).prop('checked', true).trigger('change');
                 } else if ($input.is(':checkbox')) {
                     $input.prop('checked', value === 'on' || value === '1').trigger('change');
                 } else {
                     $input.val(value);
-                    if ($input.is('select')) {
-                        $input.trigger('change');
-                    }
+                    if ($input.is('select')) $input.trigger('change');
                 }
-
                 await wait(15);
             }
 
-            // 4) Apply the complete combination tree after all referenced filters exist and are configured.
             applyImportedCustomLogic(importedCustomLogic, importedUseCustomLogic);
-
+            document.getElementById('raUpdatePreviewBtn').classList.remove('btn-disabled');
             UI.SuccessMessage('Filters and filter combinations have been applied!');
-        });
+        } catch (error) {
+            console.error(`${scriptInfo} Legacy import failed`, error);
+            UI.ErrorMessage(`Invalid configuration: ${error.message}`);
+        }
     }
 
-    // Action Handler: Export dynamic group settings
-    function handleExportGroup() {
-        jQuery('#raExportGroupBtn').on('click', function (e) {
-            e.preventDefault();
-
-            const serializedFormData = jQuery('#filter_config').serialize();
-            jQuery('#raExportGroupConfig').val(serializedFormData.trim());
-        });
-    }
-
-    // Action Handler: Update preview after filters have been applied
-    function handleUpdatePreview() {
-        jQuery('#raUpdatePreviewBtn').on('click', function (e) {
-            e.preventDefault();
-
-            updatePreview();
-            UI.SuccessMessage(twSDK.tt('Preview has been updated!'));
-        });
-    }
-
-    // Helper: Deserialize exported group settings
-    // Credits to: https://stackoverflow.com/a/16215183
     function deparam(query) {
-        var pairs,
-            i,
-            keyValuePair,
-            key,
-            value,
-            map = {};
-        if (query.slice(0, 1) === '?') {
-            query = query.slice(1);
-        }
-        if (query !== '') {
-            pairs = query.split('&');
-            for (i = 0; i < pairs.length; i += 1) {
-                keyValuePair = pairs[i].split('=');
-                key = decodeURIComponent(keyValuePair[0]);
-                value =
-                    keyValuePair.length > 1
-                        ? decodeURIComponent(keyValuePair[1])
-                        : undefined;
-                map[key] = value;
-            }
-        }
+        const map = {};
+        const params = new URLSearchParams(String(query || '').replace(/^\?/, ''));
+        params.forEach((value, key) => { map[key] = value; });
         return map;
     }
 
-    // Helper: Remove only account/session-specific values.
-    // custom_logic and use_custom_logic intentionally remain here so comparisons
-    // also detect a change that only affects Filter Combinations.
     function filterNonNeededFormData(formData) {
-        const DISALLOWED_FORM_DATA = ['group_id', 'h'];
-        let filteredFormData = {};
-
-        for (let [key, value] of Object.entries(formData)) {
-            if (!DISALLOWED_FORM_DATA.includes(key)) {
-                filteredFormData = {
-                    ...filteredFormData,
-                    [key]: value,
-                };
-            }
-        }
-
-        return filteredFormData;
+        const filtered = {};
+        Object.entries(formData).forEach(([key, value]) => {
+            if (key !== 'group_id' && key !== 'h') filtered[key] = value;
+        });
+        return filtered;
     }
 
-    // Helper: Data that belongs to visible filter controls only.
     function filterFilterControlData(formData) {
-        const DISALLOWED_FORM_DATA = [
-            'group_id',
-            'h',
-            'custom_logic',
-            'use_custom_logic',
-        ];
-        let filteredFormData = {};
-
-        for (let [key, value] of Object.entries(formData)) {
-            if (!DISALLOWED_FORM_DATA.includes(key)) {
-                filteredFormData[key] = value;
-            }
-        }
-
-        return filteredFormData;
+        const filtered = {};
+        Object.entries(formData).forEach(([key, value]) => {
+            if (!['group_id', 'h', 'custom_logic', 'use_custom_logic'].includes(key)) filtered[key] = value;
+        });
+        return filtered;
     }
 
-    // Helper: Set the exact custom AND/OR tree exported by Tribal Wars.
     function applyImportedCustomLogic(customLogic, useCustomLogic) {
-        const enabled = String(useCustomLogic) === '1';
         const defaultLogic = JSON.stringify({ operator: 'AND', filters_in: [] });
-
         jQuery('#custom_logic').val(customLogic || defaultLogic);
-        jQuery('#use_custom_logic').val(enabled ? '1' : '0');
-
-        if (DEBUG) {
-            console.debug(`${scriptInfo} Applied custom_logic`, jQuery('#custom_logic').val());
-            console.debug(`${scriptInfo} Applied use_custom_logic`, jQuery('#use_custom_logic').val());
-        }
+        jQuery('#use_custom_logic').val(String(useCustomLogic) === '1' ? '1' : '0');
     }
 
-    // Helper: Validate that the imported logic is a valid nested AND/OR tree and
-    // that every referenced leaf exists as an active filter in the imported config.
-    function validateCustomLogicTree(node, importedFilterData) {
-        const activeFilterKeys = new Set(
-            Object.keys(importedFilterData)
-                .filter((key) => key.startsWith('active_') && importedFilterData[key] === 'on')
-                .map((key) => key.substring('active_'.length))
-        );
+    function validateCustomLogicTree(node, importedData) {
+        const activeFilterKeys = new Set(Object.keys(importedData)
+            .filter((key) => key.startsWith('active_') && importedData[key] === 'on')
+            .map((key) => key.substring('active_'.length)));
 
         function walk(current) {
-            if (!current || typeof current !== 'object' || Array.isArray(current)) {
-                throw new Error('custom_logic contains an invalid combination node');
-            }
-
-            if (!['AND', 'OR'].includes(current.operator)) {
-                throw new Error(`Unsupported combination operator: ${current.operator}`);
-            }
-
-            if (!Array.isArray(current.filters_in)) {
-                throw new Error('A combination is missing filters_in');
-            }
-
+            if (!current || typeof current !== 'object' || Array.isArray(current)) throw new Error('custom_logic contains an invalid combination node');
+            if (!['AND', 'OR'].includes(current.operator)) throw new Error(`Unsupported combination operator: ${current.operator}`);
+            if (!Array.isArray(current.filters_in)) throw new Error('A combination is missing filters_in');
             current.filters_in.forEach((child) => {
                 if (typeof child === 'string') {
-                    if (!activeFilterKeys.has(child)) {
-                        throw new Error(`Combination references an inactive or missing filter: ${child}`);
-                    }
+                    if (!activeFilterKeys.has(child)) throw new Error(`Combination references an inactive or missing filter: ${child}`);
                 } else {
                     walk(child);
                 }
             });
         }
-
         walk(node);
         return true;
     }
 
-    // Helper: Small delay so Tribal Wars can process controls that dynamically
-    // update dependent form fields before the next imported value is applied.
-    function wait(ms) {
-        return new Promise((resolve) => setTimeout(resolve, ms));
-    }
-
-    // Helper: Safe value for a jQuery attribute selector used with radio values.
-    function cssEscapeAttributeValue(value) {
-        if (window.CSS && typeof window.CSS.escape === 'function') {
-            return window.CSS.escape(String(value));
-        }
-        return String(value).replace(/(["\\])/g, '\\$1');
-    }
-
-    // Helper: Update preview of villages filtered
-    // Cloned from: VillageFilters.previewResults()
     function updatePreview() {
-        if (mobile) {
-            return;
-        }
-
+        if (twSDK.isMobile) return;
         TribalWars.post(
             'overview_villages',
-            {
-                mode: 'groups',
-                ajax: 'preview_filters',
-            },
+            { mode: 'groups', ajax: 'preview_filters' },
             $('#filter_config').serializeArray(),
             function (response) {
                 $('#results_preview').html(response.preview_contents);
                 VillageFilters.warnConflict(response.conflict);
             }
         );
+    }
+
+    function normalizeName(value) {
+        return cleanText(value).toLocaleLowerCase();
+    }
+
+    function cleanText(value) {
+        return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function escapeHtml(value) {
+        return String(value === undefined || value === null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function wait(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function cssEscapeAttributeValue(value) {
+        return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    }
+
+    function setBusy(busy) {
+        state.busy = busy;
+        document.querySelectorAll(`#${BOX_ID} button`).forEach((button) => {
+            if (!button.classList.contains('tdgm-close')) button.disabled = busy;
+        });
+    }
+
+    function startProgress(label, total) {
+        const wrap = document.getElementById('tdgmProgress');
+        wrap.classList.remove('tdgm-hidden');
+        document.getElementById('tdgmProgressLabel').textContent = label;
+        document.getElementById('tdgmProgressText').textContent = `0/${total}`;
+        document.getElementById('tdgmProgressBar').style.width = '0%';
+        document.getElementById('tdgmProgressLog').textContent = '';
+    }
+
+    function updateProgress(current, total, label) {
+        if (label) document.getElementById('tdgmProgressLabel').textContent = label;
+        document.getElementById('tdgmProgressText').textContent = `${current}/${total}`;
+        document.getElementById('tdgmProgressBar').style.width = `${total ? (current / total) * 100 : 0}%`;
+    }
+
+    function appendProgress(line) {
+        const log = document.getElementById('tdgmProgressLog');
+        log.textContent += (log.textContent ? '\n' : '') + line;
+        log.scrollTop = log.scrollHeight;
+    }
+
+    async function copyTextarea(id, successMessage) {
+        const textarea = document.getElementById(id);
+        if (!textarea || !textarea.value) {
+            UI.ErrorMessage('Nothing to copy yet.');
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(textarea.value);
+        } catch (error) {
+            textarea.focus();
+            textarea.select();
+            document.execCommand('copy');
+        }
+        UI.SuccessMessage(successMessage);
+    }
+
+    function makeTwacticsDraggable(box, handle) {
+        let dragging = false;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        handle.addEventListener('mousedown', function (event) {
+            if (event.button !== 0 || event.target.closest('button')) return;
+            const rect = box.getBoundingClientRect();
+            dragging = true;
+            offsetX = event.clientX - rect.left;
+            offsetY = event.clientY - rect.top;
+            box.style.right = 'auto';
+            box.style.bottom = 'auto';
+            document.body.style.userSelect = 'none';
+            event.preventDefault();
+        });
+
+        document.addEventListener('mousemove', function (event) {
+            if (!dragging) return;
+            const maxLeft = Math.max(0, window.innerWidth - box.offsetWidth);
+            const maxTop = Math.max(0, window.innerHeight - 40);
+            box.style.left = `${Math.max(0, Math.min(maxLeft, event.clientX - offsetX))}px`;
+            box.style.top = `${Math.max(0, Math.min(maxTop, event.clientY - offsetY))}px`;
+        });
+
+        document.addEventListener('mouseup', function () {
+            if (!dragging) return;
+            dragging = false;
+            document.body.style.userSelect = '';
+        });
     }
 })();
