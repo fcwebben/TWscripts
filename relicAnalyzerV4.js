@@ -19,6 +19,13 @@
  * - Suggests what to keep, upgrade, reroll, use as material, or discard
  * - Does not perform any game action; analysis starts after a manual script run
  *
+ * v1.4.0:
+ * - Always opens Treasury -> Relic Inventory before running the analyzer.
+ * - Adds in-inventory focus mode for upgrade targets and their material relics.
+ * - Focus matching uses relic ID when available, then quality + family + substats as fallback.
+ * - Adds all relic categories to the Category filter.
+ * - Adds a visible tier legend and an in-script Help dialog.
+ *
  * v1.3.0:
  * - Rebuilt classification around relic category + exact substat desirability.
  * - Rare no longer makes an irrelevant/mismatched combat stat Legendary.
@@ -68,7 +75,7 @@
     try { window.__TW_RELIC_ANALYZER_V1__.destroy(); } catch (e) {}
   }
 
-  const VERSION = '1.3.0';
+  const VERSION = '1.4.0';
   const STAT_CAP = 20;
 
   // ------------------------------------------------------------
@@ -1141,6 +1148,255 @@
   }
 
   // ------------------------------------------------------------
+  // INVENTORY PAGE / VISUAL FOCUS HELPERS
+  // ------------------------------------------------------------
+
+  const FOCUS_STYLE_ID = 'twra-inventory-focus-style';
+  const FOCUS_BAR_ID = 'twra-inventory-focus-bar';
+
+  function isRelicInventoryPage() {
+    return getParam('screen') === 'relic_system' && getParam('mode') === 'inventory';
+  }
+
+  function ensureRelicInventoryPage() {
+    if (isRelicInventoryPage()) return true;
+    window.location.href = buildGameUrl({ screen:'relic_system', mode:'inventory' });
+    return false;
+  }
+
+  function normalizeMatchText(s) {
+    return lower(s).replace(/[^a-z0-9%+.-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function statMatchTokens(stat) {
+    if (!stat) return [];
+    const tokens = [];
+    const label = normalizeMatchText(stat.text || INTERNAL_LABELS[stat.internalKey] || stat.internalKey || '');
+    if (label) tokens.push(label.replace(/[+-]?\d+(?:[.,]\d+)?\s*%/g, '').trim());
+    if (stat.internalKey && INTERNAL_LABELS[stat.internalKey]) tokens.push(normalizeMatchText(INTERNAL_LABELS[stat.internalKey]));
+    return Array.from(new Set(tokens.filter(Boolean)));
+  }
+
+  function inventoryCardCandidates() {
+    const selector = [
+      '[data-relic-id]', '[data-item-id]', '[data-id]',
+      '.relic', '.relic-item', '.relic-card', '.inventory-item', '.item-card',
+      '.relic_inventory_item', '.relic-item-wrapper', '.item'
+    ].join(',');
+    const all = Array.from(document.querySelectorAll(selector))
+      .filter(el => !el.closest('#' + UI_ID) && !el.closest('#' + FOCUS_BAR_ID));
+
+    // Prefer leaf-ish wrappers to avoid hiding large inventory containers.
+    return all.filter(el => {
+      const txt = norm(el.textContent || '');
+      if (!txt || txt.length > 1800) return false;
+      return !all.some(other => other !== el && el.contains(other) && norm(other.textContent || '').length >= 8);
+    });
+  }
+
+  function scoreInventoryElementForRelic(el, relic) {
+    if (!el || !relic) return -1;
+    const html = lower(el.outerHTML || '');
+    const text = normalizeMatchText(el.textContent || '');
+    let score = 0;
+
+    const id = String(relic.id || '');
+    if (id && (
+      String(el.dataset?.relicId || '') === id ||
+      String(el.dataset?.itemId || '') === id ||
+      String(el.dataset?.id || '') === id ||
+      html.includes('"' + id + '"') || html.includes("'" + id + "'") ||
+      html.includes('relic_id=' + id) || html.includes('relicid=' + id)
+    )) score += 100;
+
+    const family = normalizeMatchText(relic.familyName || relic.family || '');
+    const rarity = normalizeMatchText(relic.rarityName || relic.rarity || '');
+    if (family && text.includes(family)) score += 20;
+    if (rarity && text.includes(rarity)) score += 14;
+
+    (relic.substats || []).forEach(stat => {
+      const tokens = statMatchTokens(stat);
+      if (tokens.some(t => t && text.includes(t))) score += 18;
+      if (stat.value != null && text.includes(String(Math.abs(stat.value)))) score += 2;
+    });
+
+    return score;
+  }
+
+  function findInventoryElementForRelic(relic, candidates) {
+    const pool = candidates || inventoryCardCandidates();
+    let best = null;
+    let bestScore = -1;
+    pool.forEach(el => {
+      const score = scoreInventoryElementForRelic(el, relic);
+      if (score > bestScore) { best = el; bestScore = score; }
+    });
+    // ID match is decisive. Fallback requires quality/family plus at least one useful text match.
+    return bestScore >= 48 ? best : null;
+  }
+
+  function findOptionValue(select, needles) {
+    const wanted = (needles || []).map(normalizeMatchText).filter(Boolean);
+    if (!wanted.length) return null;
+    const options = Array.from(select.options || []);
+    let best = null;
+    let bestScore = 0;
+    options.forEach(opt => {
+      const text = normalizeMatchText(opt.textContent || opt.label || opt.value || '');
+      let score = 0;
+      wanted.forEach(n => {
+        if (text === n) score = Math.max(score, 100);
+        else if (text.includes(n) || n.includes(text)) score = Math.max(score, 65);
+      });
+      if (score > bestScore) { best = opt; bestScore = score; }
+    });
+    return bestScore >= 65 && best ? best.value : null;
+  }
+
+  function applyNativeInventoryFilters(relic) {
+    // Best-effort integration with the game's own inventory filters. We do not
+    // assume fixed field names: controls are detected from their option text.
+    const selects = Array.from(document.querySelectorAll('select'))
+      .filter(sel => !sel.closest('#' + UI_ID) && !sel.closest('#' + FOCUS_BAR_ID));
+    const used = new Set();
+    const applied = [];
+
+    function setFirstMatching(needles, label) {
+      for (const sel of selects) {
+        if (used.has(sel)) continue;
+        const value = findOptionValue(sel, needles);
+        if (value == null) continue;
+        sel.value = value;
+        used.add(sel);
+        applied.push(label);
+        return sel;
+      }
+      return null;
+    }
+
+    const changed = [];
+    const quality = setFirstMatching([relic.rarityName, relic.rarity], 'quality');
+    if (quality) changed.push(quality);
+    const type = setFirstMatching([relic.familyName, relic.family], 'type');
+    if (type) changed.push(type);
+
+    (relic.substats || []).forEach((stat, idx) => {
+      const labels = statMatchTokens(stat);
+      const sel = setFirstMatching(labels, 'substat ' + (idx + 1));
+      if (sel) changed.push(sel);
+    });
+
+    // Dispatch after all values are set so client-side filters can recalculate once.
+    changed.forEach(sel => {
+      sel.dispatchEvent(new Event('input', { bubbles:true }));
+      sel.dispatchEvent(new Event('change', { bubbles:true }));
+    });
+
+    return { applied, count:applied.length };
+  }
+
+  function waitForInventoryRefresh(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms || 450));
+  }
+
+  function clearInventoryFocus() {
+    document.getElementById(FOCUS_STYLE_ID)?.remove();
+    document.getElementById(FOCUS_BAR_ID)?.remove();
+    document.querySelectorAll('[data-twra-hidden="1"]').forEach(el => {
+      el.style.removeProperty('display');
+      delete el.dataset.twraHidden;
+    });
+    document.querySelectorAll('[data-twra-focus]').forEach(el => {
+      delete el.dataset.twraFocus;
+      el.classList.remove('twra-inv-target', 'twra-inv-material');
+    });
+  }
+
+  function installInventoryFocusStyle() {
+    if (document.getElementById(FOCUS_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = FOCUS_STYLE_ID;
+    style.textContent = `
+      .twra-inv-target {
+        outline: 5px solid #38a34a !important;
+        outline-offset: -2px !important;
+        box-shadow: 0 0 0 4px rgba(56,163,74,.28), 0 0 22px rgba(56,163,74,.75) !important;
+        position: relative !important;
+        z-index: 8 !important;
+      }
+      .twra-inv-material {
+        outline: 5px solid #d18a00 !important;
+        outline-offset: -2px !important;
+        box-shadow: 0 0 0 4px rgba(209,138,0,.24), 0 0 22px rgba(209,138,0,.65) !important;
+        position: relative !important;
+        z-index: 7 !important;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function createFocusBar(target, materials, foundTarget, foundMaterials, nativeFilters) {
+    document.getElementById(FOCUS_BAR_ID)?.remove();
+    const bar = document.createElement('div');
+    bar.id = FOCUS_BAR_ID;
+    bar.style.cssText = 'position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:2147483647;background:#f4e4bc;border:2px solid #7d510f;box-shadow:0 6px 22px rgba(0,0,0,.45);padding:9px 12px;font:12px Arial;color:#2c1908;max-width:min(900px,calc(100vw - 30px));';
+    const materialText = materials.length ? materials.map(x => x.name).join(', ') : 'none';
+    bar.innerHTML = `
+      <b>Upgrade focus:</b> <span style="color:#237532;font-weight:bold">TARGET: ${cssEscape(target.name)}</span>
+      &nbsp; | &nbsp;<span style="color:#9a6500;font-weight:bold">MATERIAL: ${cssEscape(materialText)}</span>
+      &nbsp; | &nbsp;Found ${foundTarget ? 'target' : 'no target'} + ${foundMaterials}/${materials.length} material
+      &nbsp; | &nbsp;Native filters: ${cssEscape((nativeFilters?.applied || []).join(', ') || 'not detected')}
+      &nbsp;<button type="button" data-twra-clear-focus style="font:inherit;border:1px solid #7d510f;background:#f7edd4;padding:3px 7px;cursor:pointer">Show all relics</button>
+    `;
+    document.body.appendChild(bar);
+    bar.querySelector('[data-twra-clear-focus]').addEventListener('click', clearInventoryFocus);
+  }
+
+  function focusUpgradeSet(target, allRelics, nativeFilters) {
+    clearInventoryFocus();
+    if (!target) return { targetFound:false, materialFound:0 };
+
+    const materialIds = new Set((target.recommendation?.materialIds || []).map(String));
+    const materials = (allRelics || []).filter(r => materialIds.has(String(r.id)));
+    const wanted = [target].concat(materials);
+    const candidates = inventoryCardCandidates();
+    const matched = new Map();
+
+    wanted.forEach(relic => {
+      const el = findInventoryElementForRelic(relic, candidates.filter(x => !Array.from(matched.values()).includes(x)));
+      if (el) matched.set(String(relic.id), el);
+    });
+
+    installInventoryFocusStyle();
+
+    // Hide unrelated relic cards. This is deliberately DOM-only: no game action is performed.
+    candidates.forEach(el => {
+      if (!Array.from(matched.values()).includes(el)) {
+        el.dataset.twraHidden = '1';
+        el.style.setProperty('display', 'none', 'important');
+      }
+    });
+
+    const targetEl = matched.get(String(target.id));
+    if (targetEl) {
+      targetEl.dataset.twraFocus = 'target';
+      targetEl.classList.add('twra-inv-target');
+      targetEl.scrollIntoView({ behavior:'smooth', block:'center' });
+    }
+    materials.forEach(m => {
+      const el = matched.get(String(m.id));
+      if (el) {
+        el.dataset.twraFocus = 'material';
+        el.classList.add('twra-inv-material');
+      }
+    });
+
+    const foundMaterials = materials.filter(m => matched.has(String(m.id))).length;
+    createFocusBar(target, materials, !!targetEl, foundMaterials, nativeFilters);
+    return { targetFound:!!targetEl, materialFound:foundMaterials, materialTotal:materials.length };
+  }
+
+  // ------------------------------------------------------------
   // UI
   // ------------------------------------------------------------
 
@@ -1266,6 +1522,16 @@
         #${UI_ID} .twra-empty { padding: 16px; line-height: 1.55; }
         #${UI_ID} .twra-side { font-weight: bold; }
         #${UI_ID} .twra-stat { white-space: normal; }
+        #${UI_ID} .twra-legend { padding:7px 10px; border-bottom:1px solid #b68c4b; background:#f1dfba; display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+        #${UI_ID} .twra-legend-label { font-weight:bold; margin-right:3px; }
+        #${UI_ID} .twra-help-overlay { position:absolute; inset:0; z-index:20; background:rgba(0,0,0,.45); display:flex; align-items:flex-start; justify-content:center; padding:34px 20px; overflow:auto; }
+        #${UI_ID} .twra-help-dialog { width:min(900px,100%); background:#f7edda; border:2px solid #7d510f; box-shadow:0 8px 30px rgba(0,0,0,.5); }
+        #${UI_ID} .twra-help-head { display:flex; gap:8px; align-items:center; padding:9px 11px; background:#d9bd83; border-bottom:1px solid #7d510f; }
+        #${UI_ID} .twra-help-title { font-weight:bold; font-size:14px; flex:1; }
+        #${UI_ID} .twra-help-body { padding:12px 14px; max-height:70vh; overflow:auto; line-height:1.5; }
+        #${UI_ID} .twra-help-body h3 { margin:12px 0 5px; }
+        #${UI_ID} .twra-help-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 18px; }
+        #${UI_ID} .twra-locate { margin-top:4px; white-space:nowrap; }
         #${UI_ID} .twra-foot {
           border-top: 1px solid #b68c4b;
           background: #ead4a8;
@@ -1275,15 +1541,19 @@
       </style>
       <div class="twra-head">
         <div class="twra-title">Twactics Relic Analyzer v${VERSION}</div>
+        <button type="button" data-action="help">Help</button>
         <button type="button" data-action="rescan">Rescan</button>
         <button type="button" data-action="close">×</button>
       </div>
       <div class="twra-toolbar">
-        <label>Side</label>
+        <label>Category</label>
         <select data-filter="side">
           <option value="ALL">ALL</option>
           <option value="DEF">DEF</option>
           <option value="OFF">OFF</option>
+          <option value="RECRUITMENT_SPEED">Recruitment Speed</option>
+          <option value="RECRUITMENT_COST">Recruitment Cost</option>
+          <option value="RESOURCES">Resources</option>
         </select>
         <label>Sort</label>
         <select data-filter="sort">
@@ -1297,6 +1567,10 @@
           <input type="checkbox" data-filter="pp" ${CONFIG.recommendations.allowPPUpgrades ? 'checked' : ''}> PP upgrade Shoddy/Sturdy
         </label>
         <span class="twra-muted" data-role="count"></span>
+      </div>
+      <div class="twra-legend">
+        <span class="twra-legend-label">Tiers:</span>
+        ${['MONEY','FUCK','LEGENDARY','S','A','B','C','D','E','F'].map(t => `<span class="twra-tier ${tierClass(t)}">${cssEscape(TIER_LABELS[t])}</span>`).join(' ')}
       </div>
       <div class="twra-body" data-role="body"></div>
       <div class="twra-foot">
@@ -1376,7 +1650,10 @@
                 <td class="twra-stat">${formatStat(r.substats[0])}</td>
                 <td class="twra-stat">${formatStat(r.substats[1])}</td>
                 <td>${r.fitScore.toFixed(1)}<br><span class="twra-muted">${r.rawRelevantValue}% rolled</span></td>
-                <td><span class="twra-action twra-action-${String(r.recommendation?.action || 'review').toLowerCase()}">${cssEscape(recommendationText(r))}</span></td>
+                <td>
+                  <span class="twra-action twra-action-${String(r.recommendation?.action || 'review').toLowerCase()}">${cssEscape(recommendationText(r))}</span>
+                  ${(r.recommendation?.action === 'UPGRADE' || r.recommendation?.action === 'MATERIAL') ? `<br><button type="button" class="twra-locate" data-action="focus-set" data-relic-id="${cssEscape(r.recommendation?.action === 'MATERIAL' ? r.recommendation.targetId : r.id)}">Show in inventory</button>` : ''}
+                </td>
                 <td class="twra-reason">${cssEscape(r.recommendation?.reason || '')}</td>
               </tr>
             `).join('')}
@@ -1394,6 +1671,53 @@
       return `<span class="${cls}">${s.rare ? '★ ' : ''}${cssEscape(s.text)}</span>${tag}`;
     }
 
+    function showHelp() {
+      root.querySelector('.twra-help-overlay')?.remove();
+      const overlay = document.createElement('div');
+      overlay.className = 'twra-help-overlay';
+      overlay.innerHTML = `
+        <div class="twra-help-dialog">
+          <div class="twra-help-head">
+            <div class="twra-help-title">How Twactics Relic Analyzer ranks relics</div>
+            <button type="button" data-action="close-help">×</button>
+          </div>
+          <div class="twra-help-body">
+            <b>Core rule:</b> a rare stat is only valuable when the stat itself fits the relic. Rare does not turn a bad or mismatched stat into a top-tier relic.
+
+            <h3>Relic categories</h3>
+            <div class="twra-help-grid">
+              <div><b>DEF — best category</b><br>Halberd, Longsword, Longbow, Banner = BEST.</div>
+              <div><b>OFF — best category</b><br>Greataxe & Shortspear = BEST; Shortbow & Morningstar = GOOD; Bonfire = OK.</div>
+              <div><b>Recruitment Speed — best category</b><br>Dummy & Horseshoe = BEST; Wheel = OK.</div>
+              <div><b>Recruitment Cost — weak category</b><br>Handsaw = WORST; Saddle & Backpack = BAD.</div>
+              <div><b>Resources — bad/OK overall</b><br>Chisel, Axe and Pickaxe are the best relics inside this category; mainly useful early game.</div>
+            </div>
+
+            <h3>Best matching substats</h3>
+            <b>DEF BEST:</b> Spear defense, Sword defense, Heavy cavalry defense, Archer defense.<br>
+            <b>DEF GOOD:</b> the corresponding offense+defense stats.<br><br>
+            <b>OFF BEST:</b> Axeman attack, Light cavalry offense+defense, Mounted archer attack.<br>
+            <b>OFF GOOD:</b> Axeman offense+defense, Mounted archer offense+defense, Ram building damage, Ram attack.<br>
+            <b>OFF OK:</b> Catapult building damage and Catapult attack.<br><br>
+            <b>Recruitment BEST:</b> Barracks and Stable recruit speed. <b>GOOD:</b> Barracks/Stable recruit costs. <b>OK:</b> Workshop speed/cost. Academy speed and noble recruit cost are low value.<br>
+            <b>Resources BEST:</b> Clay, wood and iron production.
+
+            <h3>Cross-category rules</h3>
+            OFF relic + DEF substat, or DEF relic + OFF substat, is normally a mismatch. It is only specially preserved when the cross-combat stat is rare. Recruitment/Resource relics may still be worth keeping when they roll a BEST combat stat, or a rare BEST/GOOD combat stat. General utility only helps Recruitment/Resource relics, not OFF/DEF relics.
+
+            <h3>Tiers</h3>
+            <b>Quadruple Oil Money / Fuck Me In The Ass / Legendary</b> require genuinely strong matching rolls; rare alone is not enough. S through F then descend by total fit score and number/quality of useful matching substats. Family quality nudges useful scores but cannot rescue a bad stat.
+
+            <h3>Upgrade focus</h3>
+            For an UPGRADE recommendation, click <b>Show in inventory</b>. The target is highlighted in green, material relics in amber, and unrelated visible relic cards are hidden. Twactics first tries to set the game's own quality, type and substat dropdown filters when those controls can be detected from their option text. Matching then uses the game's relic ID if exposed in HTML and otherwise falls back to quality + type + substats. Use <b>Show all relics</b> to restore the inventory.
+          </div>
+        </div>`;
+      root.appendChild(overlay);
+      overlay.addEventListener('click', e => {
+        if (e.target.matches('[data-action="close-help"]') || e.target === overlay) overlay.remove();
+      });
+    }
+
     root.addEventListener('change', e => {
       if (e.target.matches('[data-filter]')) redraw();
     });
@@ -1402,6 +1726,20 @@
       const btn = e.target.closest('button[data-action]');
       if (!btn) return;
 
+      if (btn.dataset.action === 'help') { showHelp(); return; }
+      if (btn.dataset.action === 'focus-set') {
+        const targetId = String(btn.dataset.relicId || '');
+        const target = state.relics.find(r => String(r.id) === targetId);
+        if (target) {
+          const nativeFilters = applyNativeInventoryFilters(target);
+          await waitForInventoryRefresh(550);
+          const result = focusUpgradeSet(target, state.relics, nativeFilters);
+          if (!result.targetFound) {
+            alert('Twactics could not identify the target relic card after applying any detectable game filters. Matching uses ID first and quality/type/substats second. If the game uses a different custom filter UI on your world, send me the inventory HTML/Inspect snippet and I can wire that exact control in.');
+          }
+        }
+        return;
+      }
       if (btn.dataset.action === 'close') root.remove();
       if (btn.dataset.action === 'rescan') {
         btn.disabled = true;
@@ -1453,12 +1791,13 @@
 
   async function start() {
     try {
+      if (!ensureRelicInventoryPage()) return;
       const relics = await scanRelics();
       const ui = render(relics);
 
       window.__TW_RELIC_ANALYZER_V1__ = {
         version: VERSION, relics, config: CONFIG, scan: scanRelics, calculateTier,
-        buildInventoryRecommendations, recommendationText,
+        buildInventoryRecommendations, recommendationText, focusUpgradeSet, clearInventoryFocus,
         evaluateAgainstCurrentStats, effectiveUnitAttack, effectiveUnitDefense,
         inventoryMethod: 'RelicSystem.Inventory.init JSON',
         destroy() {
