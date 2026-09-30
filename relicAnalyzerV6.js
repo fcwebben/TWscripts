@@ -19,6 +19,12 @@
  * - Suggests what to keep, upgrade, reroll, use as material, or discard
  * - Does not perform any game action; analysis starts after a manual script run
  *
+ * v1.6.0:
+ * - Equipped relics now also show active lock/cooldown time when present.
+ * - Adds an Action filter, including an UPGRADE-only view.
+ * - Reworks the table into a compact 6-column layout with grouped stats and concise actions.
+ * - Replaces the raw Help text with structured cards, badges and compact rule sections.
+ *
  * v1.5.0:
  * - Detects Available / Currently equipped / Locked relic availability from inventory JSON.
  * - Shows remaining lock time when an inactivity/lock timestamp is available.
@@ -81,7 +87,7 @@
     try { window.__TW_RELIC_ANALYZER_V1__.destroy(); } catch (e) {}
   }
 
-  const VERSION = '1.5.0';
+  const VERSION = '1.6.0';
   const STAT_CAP = 20;
 
   // ------------------------------------------------------------
@@ -660,42 +666,62 @@
     const now = Date.now();
     const locked = !!(lockRaw && (!lockUntilMs || lockUntilMs > now));
 
-    if (equipped) {
-      return {
-        state:'EQUIPPED', available:false,
-        label:'Currently equipped',
-        detail:'Unequip this relic before it can be upgraded or used as material.',
-        villageId: raw.village_id ? String(raw.village_id) : '',
-        equippedAt: raw.equipped_at || null,
-        lockRaw, lockUntilMs
-      };
-    }
-    if (locked) {
-      return {
-        state:'LOCKED', available:false,
-        label:'Locked',
-        detail: lockUntilMs ? ('Available in ' + formatRemainingMs(lockUntilMs - now)) : ('Locked until ' + String(lockRaw)),
-        villageId:'', equippedAt:null, lockRaw, lockUntilMs
-      };
-    }
     return {
-      state:'AVAILABLE', available:true,
-      label:'Available', detail:'Available for upgrade/material use.',
-      villageId:'', equippedAt:null, lockRaw:null, lockUntilMs:null
+      state: equipped ? 'EQUIPPED' : locked ? 'LOCKED' : 'AVAILABLE',
+      available: !equipped && !locked,
+      equipped: equipped,
+      locked: locked,
+      label: equipped ? 'Equipped' : locked ? 'Locked' : 'Available',
+      detail: equipped
+        ? 'Unequip this relic before it can be upgraded or used as material.'
+        : locked
+          ? (lockUntilMs ? ('Available in ' + formatRemainingMs(lockUntilMs - now)) : ('Locked until ' + String(lockRaw)))
+          : 'Available for upgrade/material use.',
+      villageId: raw.village_id ? String(raw.village_id) : '',
+      equippedAt: raw.equipped_at || null,
+      lockRaw: lockRaw,
+      lockUntilMs: lockUntilMs
     };
   }
 
   function availabilityText(relic) {
     const a = relic && relic.availability;
     if (!a) return 'Available';
-    if (a.state === 'LOCKED' && a.lockUntilMs) {
-      return 'Locked · ' + formatRemainingMs(a.lockUntilMs - Date.now()) + ' left';
+    if (a.equipped && a.locked) {
+      return a.lockUntilMs
+        ? 'Equipped · Locked ' + formatRemainingMs(a.lockUntilMs - Date.now())
+        : 'Equipped · Locked';
     }
+    if (a.equipped) return 'Equipped';
+    if (a.locked && a.lockUntilMs) return 'Locked · ' + formatRemainingMs(a.lockUntilMs - Date.now());
     return a.label || a.state || 'Available';
+  }
+
+  function availabilityHtml(relic) {
+    const a = relic && relic.availability;
+    if (!a) return '<span class="twra-status twra-status-available">Available</span>';
+    const chunks = [];
+    if (a.equipped) chunks.push('<span class="twra-status twra-status-equipped">Equipped</span>');
+    if (a.locked) {
+      const text = a.lockUntilMs ? ('Locked · ' + formatRemainingMs(a.lockUntilMs - Date.now())) : 'Locked';
+      chunks.push('<span class="twra-status twra-status-locked">' + cssEscape(text) + '</span>');
+    }
+    if (!a.equipped && !a.locked) chunks.push('<span class="twra-status twra-status-available">Available</span>');
+    return chunks.join('<br>');
   }
 
   function isRelicOperationallyAvailable(relic) {
     return !!(relic && relic.availability && relic.availability.available);
+  }
+
+  function canFocusRecommendation(relic, relics) {
+    if (!relic || !relic.recommendation) return false;
+    if (relic.recommendation.action === 'UPGRADE') return isRelicOperationallyAvailable(relic);
+    if (relic.recommendation.action === 'MATERIAL') {
+      const target = (relics || []).find(r => String(r.id) === String(relic.recommendation.targetId || ''));
+      return !!target && isRelicOperationallyAvailable(target);
+    }
+    return false;
   }
 
   function normalizeInventoryRelic(raw, index) {
@@ -1160,17 +1186,28 @@
   function recommendationText(relic) {
     const rec = relic && relic.recommendation;
     if (!rec) return 'Review';
-    if (rec.action === 'UPGRADE') {
-      const mats = (rec.materialIds || []).map(id => '#' + id).join(', ');
-      return 'Upgrade to ' + titleCase(rec.nextQuality || '') +
-        (mats ? ' using ' + mats : '') +
-        (rec.ppAssisted ? ' + PP' : '');
-    }
-    if (rec.action === 'MATERIAL') return 'Material for #' + (rec.targetId || '?');
+    if (rec.action === 'UPGRADE') return 'Upgrade';
+    if (rec.action === 'MATERIAL') return 'Material';
     if (rec.action === 'REROLL') return 'Reroll';
     if (rec.action === 'KEEP') return 'Keep';
-    if (rec.action === 'TRASH') return 'Trash / spare material';
+    if (rec.action === 'TRASH') return 'Trash';
     return 'Review';
+  }
+
+  function recommendationHtml(relic) {
+    const rec = relic && relic.recommendation;
+    if (!rec) return '<span class="twra-action twra-action-review">Review</span>';
+    const cls = 'twra-action twra-action-' + String(rec.action || 'review').toLowerCase();
+    const title = cssEscape(rec.reason || '');
+    if (rec.action === 'UPGRADE') {
+      const materialLines = (rec.materialIds || []).map(id => '<div class="twra-material-id">#' + cssEscape(id) + '</div>').join('');
+      const ppLine = rec.ppAssisted ? '<div class="twra-material-id">+ PP</div>' : '';
+      return '<div class="twra-upgrade-using" title="' + title + '"><b>Upgrade using:</b>' + materialLines + ppLine + '</div>';
+    }
+    if (rec.action === 'MATERIAL') {
+      return '<span class="' + cls + '" title="' + title + '">Material</span><div class="twra-action-sub">for #' + cssEscape(rec.targetId || '?') + '</div>';
+    }
+    return '<span class="' + cls + '" title="' + title + '">' + cssEscape(recommendationText(relic)) + '</span>';
   }
 
   // ------------------------------------------------------------
@@ -1511,7 +1548,7 @@
           position: fixed;
           top: 18px;
           right: 18px;
-          width: min(1180px, calc(100vw - 36px));
+          width: min(1080px, calc(100vw - 36px));
           max-height: calc(100vh - 36px);
           z-index: 2147483647;
           background: #f4e4bc;
@@ -1599,12 +1636,17 @@
         #${UI_ID} .twra-action-material { background:#d5dce6; }
         #${UI_ID} .twra-action-trash { background:#e1c4c4; }
         #${UI_ID} .twra-action-review { background:#eee; }
-        #${UI_ID} .twra-availability { display:inline-block; padding:2px 5px; border:1px solid rgba(0,0,0,.22); border-radius:2px; font-weight:bold; white-space:nowrap; }
-        #${UI_ID} .twra-availability-available { background:#d8ef99; }
-        #${UI_ID} .twra-availability-equipped { background:#ffd6a3; }
-        #${UI_ID} .twra-availability-locked { background:#e2c6ef; }
-        #${UI_ID} .twra-availability-detail { margin-top:3px; max-width:190px; line-height:1.3; }
-        #${UI_ID} .twra-reason { max-width:260px; line-height:1.35; }
+        #${UI_ID} .twra-status { display:inline-block; padding:2px 5px; margin:1px 0; border:1px solid rgba(0,0,0,.22); border-radius:2px; font-weight:bold; white-space:nowrap; }
+        #${UI_ID} .twra-status-available { background:#d8ef99; }
+        #${UI_ID} .twra-status-equipped { background:#ffd6a3; }
+        #${UI_ID} .twra-status-locked { background:#e2c6ef; }
+        #${UI_ID} .twra-action-sub { margin-top:3px; font-size:11px; opacity:.72; white-space:nowrap; }
+        #${UI_ID} .twra-upgrade-using { margin-top:4px; line-height:1.3; }
+        #${UI_ID} .twra-material-id { white-space:nowrap; font-family:monospace; }
+        #${UI_ID} .twra-stat-line { display:flex; gap:5px; line-height:1.3; margin:1px 0; }
+        #${UI_ID} .twra-stat-key { width:24px; flex:0 0 24px; font-weight:bold; opacity:.6; }
+        #${UI_ID} .twra-stat-value { min-width:0; }
+        #${UI_ID} .twra-score { font-size:11px; opacity:.7; margin-top:3px; }
         #${UI_ID} .twra-rare { color: #762da8; font-weight: bold; }
         #${UI_ID} .twra-muted { opacity: .68; }
         #${UI_ID} .twra-empty { padding: 16px; line-height: 1.55; }
@@ -1613,12 +1655,20 @@
         #${UI_ID} .twra-legend { padding:7px 10px; border-bottom:1px solid #b68c4b; background:#f1dfba; display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
         #${UI_ID} .twra-legend-label { font-weight:bold; margin-right:3px; }
         #${UI_ID} .twra-help-overlay { position:absolute; inset:0; z-index:20; background:rgba(0,0,0,.45); display:flex; align-items:flex-start; justify-content:center; padding:34px 20px; overflow:auto; }
-        #${UI_ID} .twra-help-dialog { width:min(900px,100%); background:#f7edda; border:2px solid #7d510f; box-shadow:0 8px 30px rgba(0,0,0,.5); }
-        #${UI_ID} .twra-help-head { display:flex; gap:8px; align-items:center; padding:9px 11px; background:#d9bd83; border-bottom:1px solid #7d510f; }
-        #${UI_ID} .twra-help-title { font-weight:bold; font-size:14px; flex:1; }
-        #${UI_ID} .twra-help-body { padding:12px 14px; max-height:70vh; overflow:auto; line-height:1.5; }
-        #${UI_ID} .twra-help-body h3 { margin:12px 0 5px; }
-        #${UI_ID} .twra-help-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 18px; }
+        #${UI_ID} .twra-help-dialog { width:min(920px,100%); background:#f7edda; border:2px solid #7d510f; box-shadow:0 8px 30px rgba(0,0,0,.5); border-radius:4px; overflow:hidden; }
+        #${UI_ID} .twra-help-head { display:flex; gap:8px; align-items:center; padding:11px 13px; background:linear-gradient(#dfc58f,#cfa65f); border-bottom:1px solid #7d510f; }
+        #${UI_ID} .twra-help-title { font-weight:bold; font-size:15px; flex:1; }
+        #${UI_ID} .twra-help-body { padding:14px; max-height:72vh; overflow:auto; line-height:1.45; background:#f8efdd; }
+        #${UI_ID} .twra-help-intro { padding:10px 12px; background:#fff7e8; border:1px solid #d9bd83; border-radius:4px; margin-bottom:12px; }
+        #${UI_ID} .twra-help-section { margin:12px 0 0; padding:11px 12px; background:#fffaf0; border:1px solid #d8c49b; border-radius:4px; }
+        #${UI_ID} .twra-help-section h3 { margin:0 0 8px; font-size:13px; }
+        #${UI_ID} .twra-help-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+        #${UI_ID} .twra-help-card { padding:9px 10px; background:#f4e4bc; border:1px solid #d1b77f; border-radius:4px; }
+        #${UI_ID} .twra-help-card b { display:block; margin-bottom:3px; }
+        #${UI_ID} .twra-help-row { display:grid; grid-template-columns:120px 1fr; gap:8px; padding:5px 0; border-top:1px solid #ead8b6; }
+        #${UI_ID} .twra-help-row:first-child { border-top:0; padding-top:0; }
+        #${UI_ID} .twra-help-badge { display:inline-block; padding:1px 5px; border:1px solid rgba(0,0,0,.2); border-radius:2px; background:#ead4a8; font-weight:bold; margin-right:4px; }
+        #${UI_ID} .twra-help-note { margin-top:8px; font-size:11px; opacity:.78; }
         #${UI_ID} .twra-locate { margin-top:4px; white-space:nowrap; }
         #${UI_ID} .twra-foot {
           border-top: 1px solid #b68c4b;
@@ -1642,6 +1692,15 @@
           <option value="RECRUITMENT_SPEED">Recruitment Speed</option>
           <option value="RECRUITMENT_COST">Recruitment Cost</option>
           <option value="RESOURCES">Resources</option>
+        </select>
+        <label>Action</label>
+        <select data-filter="action">
+          <option value="ALL">ALL</option>
+          <option value="UPGRADE">Upgrade only</option>
+          <option value="KEEP">Keep</option>
+          <option value="REROLL">Reroll</option>
+          <option value="MATERIAL">Material</option>
+          <option value="TRASH">Trash</option>
         </select>
         <label>Sort</label>
         <select data-filter="sort">
@@ -1673,6 +1732,7 @@
 
     function redraw() {
       const side = root.querySelector('[data-filter="side"]').value;
+      const action = root.querySelector('[data-filter="action"]').value;
       const sort = root.querySelector('[data-filter="sort"]').value;
       const ppBox = root.querySelector('[data-filter="pp"]');
       CONFIG.recommendations.allowPPUpgrades = !!(ppBox && ppBox.checked);
@@ -1680,6 +1740,7 @@
       let rows = state.relics.slice();
 
       if (side !== 'ALL') rows = rows.filter(r => r.category === side);
+      if (action !== 'ALL') rows = rows.filter(r => r.recommendation?.action === action);
 
       rows.sort((a, b) => {
         if (sort === 'tier') {
@@ -1717,38 +1778,29 @@
               <th>Tier</th>
               <th>Category</th>
               <th>Relic</th>
-              <th>Main stat</th>
-              <th>Substat 1</th>
-              <th>Substat 2</th>
-              <th>Fit score</th>
-              <th>Availability</th>
-              <th>Recommendation</th>
-              <th>Why</th>
+              <th>Stats</th>
+              <th>Status</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
             ${rows.map((r, idx) => `
               <tr data-row="${idx}">
-                <td><span class="twra-tier ${tierClass(r.tier)}">${cssEscape(r.tierLabel)}</span></td>
+                <td>
+                  <span class="twra-tier ${tierClass(r.tier)}">${cssEscape(r.tierLabel)}</span>
+                  <div class="twra-score">Fit ${r.fitScore.toFixed(1)} · ${r.rawRelevantValue}%</div>
+                </td>
                 <td class="twra-side">${cssEscape(r.categoryLabel)}</td>
                 <td>
                   <b>${cssEscape(r.name)}</b><br>
-                  <span class="twra-muted">${cssEscape(r.id)}</span>
+                  <span class="twra-muted">#${cssEscape(r.id)}</span>
                 </td>
-                <td class="twra-stat">${formatStat(r.mainStat)}</td>
-                <td class="twra-stat">${formatStat(r.substats[0])}</td>
-                <td class="twra-stat">${formatStat(r.substats[1])}</td>
-                <td>${r.fitScore.toFixed(1)}<br><span class="twra-muted">${r.rawRelevantValue}% rolled</span></td>
+                <td class="twra-stat">${formatStatsCompact(r)}</td>
+                <td>${availabilityHtml(r)}</td>
                 <td>
-                  <span class="twra-availability twra-availability-${String(r.availability?.state || 'available').toLowerCase()}">${cssEscape(availabilityText(r))}</span>
-                  ${r.availability?.state === 'EQUIPPED' ? `<div class="twra-availability-detail twra-muted">Unequip before upgrade/material use.</div>` : ''}
-                  ${r.availability?.state === 'LOCKED' && !r.availability?.lockUntilMs ? `<div class="twra-availability-detail twra-muted">${cssEscape(r.availability?.detail || '')}</div>` : ''}
+                  ${recommendationHtml(r)}
+                  ${canFocusRecommendation(r, state.relics) ? `<br><button type="button" class="twra-locate" data-action="focus-set" data-relic-id="${cssEscape(r.recommendation?.action === 'MATERIAL' ? r.recommendation.targetId : r.id)}">Show</button>` : ''}
                 </td>
-                <td>
-                  <span class="twra-action twra-action-${String(r.recommendation?.action || 'review').toLowerCase()}">${cssEscape(recommendationText(r))}</span>
-                  ${(r.recommendation?.action === 'UPGRADE' || r.recommendation?.action === 'MATERIAL') && isRelicOperationallyAvailable(r) ? `<br><button type="button" class="twra-locate" data-action="focus-set" data-relic-id="${cssEscape(r.recommendation?.action === 'MATERIAL' ? r.recommendation.targetId : r.id)}">Show in inventory</button>` : ''}
-                </td>
-                <td class="twra-reason">${cssEscape(r.recommendation?.reason || '')}</td>
               </tr>
             `).join('')}
           </tbody>
@@ -1765,6 +1817,18 @@
       return `<span class="${cls}">${s.rare ? '★ ' : ''}${cssEscape(s.text)}</span>${tag}`;
     }
 
+    function formatStatsCompact(r) {
+      const items = [
+        ['M', r.mainStat],
+        ['S1', r.substats?.[0]],
+        ['S2', r.substats?.[1]]
+      ];
+      return items.map(([label, stat]) =>
+        `<div class="twra-stat-line"><span class="twra-stat-key">${label}</span><span class="twra-stat-value">${formatStat(stat)}</span></div>`
+      ).join('');
+    }
+
+
     function showHelp() {
       root.querySelector('.twra-help-overlay')?.remove();
       const overlay = document.createElement('div');
@@ -1772,41 +1836,57 @@
       overlay.innerHTML = `
         <div class="twra-help-dialog">
           <div class="twra-help-head">
-            <div class="twra-help-title">How Twactics Relic Analyzer ranks relics</div>
+            <div class="twra-help-title">Twactics Relic Analyzer — Guide</div>
             <button type="button" data-action="close-help">×</button>
           </div>
           <div class="twra-help-body">
-            <b>Core rule:</b> a rare stat is only valuable when the stat itself fits the relic. Rare does not turn a bad or mismatched stat into a top-tier relic.
+            <div class="twra-help-intro"><b>Core rule</b><br>A rare roll only improves a relic when the stat itself is useful. Rare never turns a bad or mismatched stat into a top-tier roll.</div>
 
-            <h3>Relic categories</h3>
-            <div class="twra-help-grid">
-              <div><b>DEF — best category</b><br>Halberd, Longsword, Longbow, Banner = BEST.</div>
-              <div><b>OFF — best category</b><br>Greataxe & Shortspear = BEST; Shortbow & Morningstar = GOOD; Bonfire = OK.</div>
-              <div><b>Recruitment Speed — best category</b><br>Dummy & Horseshoe = BEST; Wheel = OK.</div>
-              <div><b>Recruitment Cost — weak category</b><br>Handsaw = WORST; Saddle & Backpack = BAD.</div>
-              <div><b>Resources — bad/OK overall</b><br>Chisel, Axe and Pickaxe are the best relics inside this category; mainly useful early game.</div>
+            <div class="twra-help-section">
+              <h3>Relic categories</h3>
+              <div class="twra-help-grid">
+                <div class="twra-help-card"><b>DEF · BEST</b>Halberd, Longsword, Longbow, Banner</div>
+                <div class="twra-help-card"><b>OFF · BEST</b>Greataxe & Shortspear<br><span class="twra-muted">Shortbow/Morningstar = GOOD · Bonfire = OK</span></div>
+                <div class="twra-help-card"><b>Recruitment Speed · BEST</b>Dummy & Horseshoe<br><span class="twra-muted">Wheel = OK</span></div>
+                <div class="twra-help-card"><b>Recruitment Cost · WEAK</b>Handsaw = WORST<br><span class="twra-muted">Saddle & Backpack = BAD</span></div>
+                <div class="twra-help-card"><b>Resources · BAD/OK</b>Chisel, Axe, Pickaxe<br><span class="twra-muted">Mainly useful early game</span></div>
+              </div>
             </div>
 
-            <h3>Best matching substats</h3>
-            <b>DEF BEST:</b> Spear defense, Sword defense, Heavy cavalry defense, Archer defense.<br>
-            <b>DEF GOOD:</b> the corresponding offense+defense stats.<br><br>
-            <b>OFF BEST:</b> Axeman attack, Light cavalry offense+defense, Mounted archer attack.<br>
-            <b>OFF GOOD:</b> Axeman offense+defense, Mounted archer offense+defense, Ram building damage, Ram attack.<br>
-            <b>OFF OK:</b> Catapult building damage and Catapult attack.<br><br>
-            <b>Recruitment BEST:</b> Barracks and Stable recruit speed. <b>GOOD:</b> Barracks/Stable recruit costs. <b>OK:</b> Workshop speed/cost. Academy speed and noble recruit cost are low value.<br>
-            <b>Resources BEST:</b> Clay, wood and iron production.
+            <div class="twra-help-section">
+              <h3>Substat priorities</h3>
+              <div class="twra-help-row"><div><span class="twra-help-badge">DEF BEST</span></div><div>Spear, Sword, Heavy cavalry and Archer defense.</div></div>
+              <div class="twra-help-row"><div><span class="twra-help-badge">DEF GOOD</span></div><div>The corresponding offense + defense stats.</div></div>
+              <div class="twra-help-row"><div><span class="twra-help-badge">OFF BEST</span></div><div>Axeman attack, Light cavalry off/def, Mounted archer attack.</div></div>
+              <div class="twra-help-row"><div><span class="twra-help-badge">OFF GOOD</span></div><div>Axeman off/def, Mounted archer off/def, Ram building damage, Ram attack.</div></div>
+              <div class="twra-help-row"><div><span class="twra-help-badge">OFF OK</span></div><div>Catapult building damage and Catapult attack.</div></div>
+              <div class="twra-help-row"><div><span class="twra-help-badge">Recruitment</span></div><div>Barracks/Stable speed = BEST · Barracks/Stable cost = GOOD · Workshop speed/cost = OK.</div></div>
+              <div class="twra-help-row"><div><span class="twra-help-badge">Resources</span></div><div>Clay, wood and iron production = BEST.</div></div>
+            </div>
 
-            <h3>Cross-category rules</h3>
-            OFF relic + DEF substat, or DEF relic + OFF substat, is normally a mismatch. It is only specially preserved when the cross-combat stat is rare. Recruitment/Resource relics may still be worth keeping when they roll a BEST combat stat, or a rare BEST/GOOD combat stat. General utility only helps Recruitment/Resource relics, not OFF/DEF relics.
+            <div class="twra-help-section">
+              <h3>Cross-category rules</h3>
+              OFF + DEF or DEF + OFF is normally a mismatch. A rare opposing combat stat is preserved, but ranked below a matching roll. Recruitment/Resource relics can still be worth keeping with BEST combat rolls, or rare BEST/GOOD combat rolls. General utility helps Recruitment/Resources, not OFF/DEF.
+            </div>
 
-            <h3>Tiers</h3>
-            <b>Quadruple Oil Money / Fuck Me In The Ass / Legendary</b> require genuinely strong matching rolls; rare alone is not enough. S through F then descend by total fit score and number/quality of useful matching substats. Family quality nudges useful scores but cannot rescue a bad stat.
+            <div class="twra-help-section">
+              <h3>Tiers</h3>
+              <div>${['MONEY','FUCK','LEGENDARY','S','A','B','C','D','E','F'].map(t => `<span class="twra-tier ${tierClass(t)}">${cssEscape(TIER_LABELS[t])}</span>`).join(' ')}</div>
+              <div class="twra-help-note">Top named tiers require genuinely strong matching rolls. S–F then descend based on total fit, useful roll quality and family quality.</div>
+            </div>
 
-            <h3>Availability</h3>
-            <b>Available</b> relics can be used immediately. <b>Currently equipped</b> relics stay visible and keep their tier/recommendation, but must be unequipped before upgrade/material use. <b>Locked</b> relics also stay visible; when the game exposes <code>inactive_until</code> (or an equivalent lock timestamp), Twactics shows the remaining lock time. Locked/equipped relics are never auto-selected as upgrade material.
+            <div class="twra-help-section">
+              <h3>Status & upgrades</h3>
+              <div class="twra-help-row"><div><span class="twra-status twra-status-available">Available</span></div><div>Can be used immediately.</div></div>
+              <div class="twra-help-row"><div><span class="twra-status twra-status-equipped">Equipped</span></div><div>Still ranked, but must be unequipped before upgrade/material use.</div></div>
+              <div class="twra-help-row"><div><span class="twra-status twra-status-locked">Locked</span></div><div>Still ranked. Remaining time is shown when the game exposes a lock timestamp. An equipped relic can also be locked, in which case both statuses are shown.</div></div>
+              <div class="twra-help-note">Available weak same-family + same-quality relics may be selected as material. Locked/equipped relics are never auto-selected as material.</div>
+            </div>
 
-            <h3>Upgrade focus</h3>
-            For an available UPGRADE/MATERIAL recommendation, click <b>Show in inventory</b>. The target is highlighted in green, material relics in amber, and unrelated visible relic cards are hidden. Twactics first tries to set the game's own quality, type and substat dropdown filters when those controls can be detected from their option text. Matching then uses the game's relic ID if exposed in HTML and otherwise falls back to quality + type + substats. Equipped/locked rows show their availability status instead of offering an unusable inventory-focus action. Use <b>Show all relics</b> to restore the inventory.
+            <div class="twra-help-section">
+              <h3>Inventory focus</h3>
+              For available Upgrade/Material rows, click <b>Show</b>. The upgrade target is highlighted in green, material in amber, and unrelated inventory cards are hidden. Use <b>Show all relics</b> to restore the inventory.
+            </div>
           </div>
         </div>`;
       root.appendChild(overlay);
