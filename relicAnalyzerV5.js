@@ -19,6 +19,12 @@
  * - Suggests what to keep, upgrade, reroll, use as material, or discard
  * - Does not perform any game action; analysis starts after a manual script run
  *
+ * v1.5.0:
+ * - Detects Available / Currently equipped / Locked relic availability from inventory JSON.
+ * - Shows remaining lock time when an inactivity/lock timestamp is available.
+ * - Equipped/locked relics remain ranked and visible but do not offer unusable inventory-focus actions.
+ * - Locked/equipped relics are excluded from automatic material selection.
+ *
  * v1.4.0:
  * - Always opens Treasury -> Relic Inventory before running the analyzer.
  * - Adds in-inventory focus mode for upgrade targets and their material relics.
@@ -75,7 +81,7 @@
     try { window.__TW_RELIC_ANALYZER_V1__.destroy(); } catch (e) {}
   }
 
-  const VERSION = '1.4.0';
+  const VERSION = '1.5.0';
   const STAT_CAP = 20;
 
   // ------------------------------------------------------------
@@ -619,6 +625,79 @@
     };
   }
 
+  function parseAvailabilityTimestamp(value) {
+    if (value === undefined || value === null || value === '' || value === false) return null;
+    if (typeof value === 'number' || /^\d+(?:\.\d+)?$/.test(String(value).trim())) {
+      let n = Number(value);
+      if (!isFinite(n) || n <= 0) return null;
+      if (n < 1e12) n *= 1000;
+      return n;
+    }
+    const parsed = Date.parse(String(value));
+    return isNaN(parsed) ? null : parsed;
+  }
+
+  function formatRemainingMs(ms) {
+    ms = Math.max(0, Number(ms || 0));
+    const totalSeconds = Math.ceil(ms / 1000);
+    const days = Math.floor(totalSeconds / 86400);
+    const hours = Math.floor((totalSeconds % 86400) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const parts = [];
+    if (days) parts.push(days + 'd');
+    if (hours || days) parts.push(hours + 'h');
+    if (minutes || hours || days) parts.push(minutes + 'm');
+    if (!days && !hours) parts.push(seconds + 's');
+    return parts.join(' ');
+  }
+
+  function getRelicAvailability(raw) {
+    raw = raw || {};
+    const equipped = !!(raw.village_id || raw.equipped_at);
+    const lockRaw = raw.inactive_until ?? raw.locked_until ?? raw.lock_until ?? raw.cooldown_until ?? null;
+    const lockUntilMs = parseAvailabilityTimestamp(lockRaw);
+    const now = Date.now();
+    const locked = !!(lockRaw && (!lockUntilMs || lockUntilMs > now));
+
+    if (equipped) {
+      return {
+        state:'EQUIPPED', available:false,
+        label:'Currently equipped',
+        detail:'Unequip this relic before it can be upgraded or used as material.',
+        villageId: raw.village_id ? String(raw.village_id) : '',
+        equippedAt: raw.equipped_at || null,
+        lockRaw, lockUntilMs
+      };
+    }
+    if (locked) {
+      return {
+        state:'LOCKED', available:false,
+        label:'Locked',
+        detail: lockUntilMs ? ('Available in ' + formatRemainingMs(lockUntilMs - now)) : ('Locked until ' + String(lockRaw)),
+        villageId:'', equippedAt:null, lockRaw, lockUntilMs
+      };
+    }
+    return {
+      state:'AVAILABLE', available:true,
+      label:'Available', detail:'Available for upgrade/material use.',
+      villageId:'', equippedAt:null, lockRaw:null, lockUntilMs:null
+    };
+  }
+
+  function availabilityText(relic) {
+    const a = relic && relic.availability;
+    if (!a) return 'Available';
+    if (a.state === 'LOCKED' && a.lockUntilMs) {
+      return 'Locked · ' + formatRemainingMs(a.lockUntilMs - Date.now()) + ' left';
+    }
+    return a.label || a.state || 'Available';
+  }
+
+  function isRelicOperationallyAvailable(relic) {
+    return !!(relic && relic.availability && relic.availability.available);
+  }
+
   function normalizeInventoryRelic(raw, index) {
     if (!raw || raw.id === undefined || raw.id === null) return null;
     const family = familyCanonical(raw.type || raw.name || '');
@@ -640,6 +719,7 @@
       side: side, mainStat: mainStat, substats: substats,
       allStats: [mainStat].concat(substats).filter(Boolean), tier:'UNKNOWN',
       tierLabel:TIER_LABELS.UNKNOWN, rawRelevantValue:0, fitScore:0, raw:raw,
+      availability:getRelicAvailability(raw),
       rawText: JSON.stringify(raw),
       future: {
         canUpgrade: rarity ? ['shoddy','sturdy','enhanced','superior'].includes(rarity) : null,
@@ -1042,6 +1122,7 @@
 
       const candidateMaterials = group
         .filter(r => r.id !== target.id)
+        .filter(r => isRelicOperationallyAvailable(r))
         .filter(r => tierAtLeastAsBad(r.tier, CONFIG.recommendations.materialFromTier))
         .sort(compareWorstFirst);
 
@@ -1051,7 +1132,9 @@
       const nextQuality = QUALITY_NEXT[target.rarity];
       target.recommendation = {
         action:'UPGRADE',
-        reason:'Strong roll with enough clearly weaker same-family/same-quality relics available as material.',
+        reason:(isRelicOperationallyAvailable(target)
+          ? 'Strong roll with enough clearly weaker same-family/same-quality relics available as material.'
+          : 'Strong upgrade candidate, but it is currently ' + availabilityText(target).toLowerCase() + '. Make it available before upgrading.'),
         nextQuality:nextQuality,
         materialIds:chosen.map(r => r.id),
         materialNames:chosen.map(r => r.name),
@@ -1516,6 +1599,11 @@
         #${UI_ID} .twra-action-material { background:#d5dce6; }
         #${UI_ID} .twra-action-trash { background:#e1c4c4; }
         #${UI_ID} .twra-action-review { background:#eee; }
+        #${UI_ID} .twra-availability { display:inline-block; padding:2px 5px; border:1px solid rgba(0,0,0,.22); border-radius:2px; font-weight:bold; white-space:nowrap; }
+        #${UI_ID} .twra-availability-available { background:#d8ef99; }
+        #${UI_ID} .twra-availability-equipped { background:#ffd6a3; }
+        #${UI_ID} .twra-availability-locked { background:#e2c6ef; }
+        #${UI_ID} .twra-availability-detail { margin-top:3px; max-width:190px; line-height:1.3; }
         #${UI_ID} .twra-reason { max-width:260px; line-height:1.35; }
         #${UI_ID} .twra-rare { color: #762da8; font-weight: bold; }
         #${UI_ID} .twra-muted { opacity: .68; }
@@ -1633,6 +1721,7 @@
               <th>Substat 1</th>
               <th>Substat 2</th>
               <th>Fit score</th>
+              <th>Availability</th>
               <th>Recommendation</th>
               <th>Why</th>
             </tr>
@@ -1651,8 +1740,13 @@
                 <td class="twra-stat">${formatStat(r.substats[1])}</td>
                 <td>${r.fitScore.toFixed(1)}<br><span class="twra-muted">${r.rawRelevantValue}% rolled</span></td>
                 <td>
+                  <span class="twra-availability twra-availability-${String(r.availability?.state || 'available').toLowerCase()}">${cssEscape(availabilityText(r))}</span>
+                  ${r.availability?.state === 'EQUIPPED' ? `<div class="twra-availability-detail twra-muted">Unequip before upgrade/material use.</div>` : ''}
+                  ${r.availability?.state === 'LOCKED' && !r.availability?.lockUntilMs ? `<div class="twra-availability-detail twra-muted">${cssEscape(r.availability?.detail || '')}</div>` : ''}
+                </td>
+                <td>
                   <span class="twra-action twra-action-${String(r.recommendation?.action || 'review').toLowerCase()}">${cssEscape(recommendationText(r))}</span>
-                  ${(r.recommendation?.action === 'UPGRADE' || r.recommendation?.action === 'MATERIAL') ? `<br><button type="button" class="twra-locate" data-action="focus-set" data-relic-id="${cssEscape(r.recommendation?.action === 'MATERIAL' ? r.recommendation.targetId : r.id)}">Show in inventory</button>` : ''}
+                  ${(r.recommendation?.action === 'UPGRADE' || r.recommendation?.action === 'MATERIAL') && isRelicOperationallyAvailable(r) ? `<br><button type="button" class="twra-locate" data-action="focus-set" data-relic-id="${cssEscape(r.recommendation?.action === 'MATERIAL' ? r.recommendation.targetId : r.id)}">Show in inventory</button>` : ''}
                 </td>
                 <td class="twra-reason">${cssEscape(r.recommendation?.reason || '')}</td>
               </tr>
@@ -1708,8 +1802,11 @@
             <h3>Tiers</h3>
             <b>Quadruple Oil Money / Fuck Me In The Ass / Legendary</b> require genuinely strong matching rolls; rare alone is not enough. S through F then descend by total fit score and number/quality of useful matching substats. Family quality nudges useful scores but cannot rescue a bad stat.
 
+            <h3>Availability</h3>
+            <b>Available</b> relics can be used immediately. <b>Currently equipped</b> relics stay visible and keep their tier/recommendation, but must be unequipped before upgrade/material use. <b>Locked</b> relics also stay visible; when the game exposes <code>inactive_until</code> (or an equivalent lock timestamp), Twactics shows the remaining lock time. Locked/equipped relics are never auto-selected as upgrade material.
+
             <h3>Upgrade focus</h3>
-            For an UPGRADE recommendation, click <b>Show in inventory</b>. The target is highlighted in green, material relics in amber, and unrelated visible relic cards are hidden. Twactics first tries to set the game's own quality, type and substat dropdown filters when those controls can be detected from their option text. Matching then uses the game's relic ID if exposed in HTML and otherwise falls back to quality + type + substats. Use <b>Show all relics</b> to restore the inventory.
+            For an available UPGRADE/MATERIAL recommendation, click <b>Show in inventory</b>. The target is highlighted in green, material relics in amber, and unrelated visible relic cards are hidden. Twactics first tries to set the game's own quality, type and substat dropdown filters when those controls can be detected from their option text. Matching then uses the game's relic ID if exposed in HTML and otherwise falls back to quality + type + substats. Equipped/locked rows show their availability status instead of offering an unusable inventory-focus action. Use <b>Show all relics</b> to restore the inventory.
           </div>
         </div>`;
       root.appendChild(overlay);
