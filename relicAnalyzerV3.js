@@ -4,8 +4,8 @@
  *
  * Twactics Relic Analyzer
  *
- * Reads relic data from Treasury -> Inventory and classifies supported combat
- * relics into custom OFF/DEF tiers. Relic inventory is read from the structured
+ * Reads relic data from Treasury -> Inventory and classifies supported combat,
+ * recruitment and resource relics using category-aware custom tiers. Relic inventory is read from the structured
  * data passed to RelicSystem.Inventory.init(...), matching Twactics Relic Planner.
  *
  * This script:
@@ -18,6 +18,14 @@
  * - Keeps offense+defense, attack and defense as separate benefit buckets
  * - Suggests what to keep, upgrade, reroll, use as material, or discard
  * - Does not perform any game action; analysis starts after a manual script run
+ *
+ * v1.3.0:
+ * - Rebuilt classification around relic category + exact substat desirability.
+ * - Rare no longer makes an irrelevant/mismatched combat stat Legendary.
+ * - Adds Recruitment Speed, Recruitment Cost and Resources relic families.
+ * - Distinguishes BEST/BRA/OK/DALIG/SAMST substats and category fit.
+ * - Cross-category OFF/DEF stats are only preserved according to the explicit rules.
+ * - General utility stats only help Recruitment/Resource relics, not OFF/DEF relics.
  *
  * v1.2.0:
  * - Adds read-only Keep / Upgrade / Reroll / Material / Trash recommendations.
@@ -60,7 +68,7 @@
     try { window.__TW_RELIC_ANALYZER_V1__.destroy(); } catch (e) {}
   }
 
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
   const STAT_CAP = 20;
 
   // ------------------------------------------------------------
@@ -137,24 +145,51 @@
     }
   };
 
-  const DEF_RELICS = new Set([
-    'halberd',
-    'longsword',
-    'banner',
-    'longbow'
-  ]);
+  const RELIC_PROFILES = {
+    // DEF (category = BEST)
+    halberd:    { category:'DEF', familyGrade:'BEST' },
+    longsword:  { category:'DEF', familyGrade:'BEST' },
+    longbow:    { category:'DEF', familyGrade:'BEST' },
+    banner:     { category:'DEF', familyGrade:'BEST' },
 
-  const OFF_RELICS = new Set([
-    'greataxe',
-    'great axe',
-    'shortspear',
-    'short spear',
-    'bonfire',
-    'morningstar',
-    'morning star',
-    'shortbow',
-    'short bow'
-  ]);
+    // OFF (category = BEST)
+    greataxe:    { category:'OFF', familyGrade:'BEST' },
+    shortspear:  { category:'OFF', familyGrade:'BEST' },
+    shortbow:    { category:'OFF', familyGrade:'GOOD' },
+    morningstar: { category:'OFF', familyGrade:'GOOD' },
+    bonfire:     { category:'OFF', familyGrade:'OK', defFallbackGrade:'WORST' },
+
+    // RECRUITMENT SPEED (category = BEST)
+    dummy:      { category:'RECRUITMENT_SPEED', familyGrade:'BEST' },
+    horseshoe:  { category:'RECRUITMENT_SPEED', familyGrade:'BEST' },
+    wheel:      { category:'RECRUITMENT_SPEED', familyGrade:'OK' },
+
+    // RECRUITMENT COST (category = BAD)
+    handsaw:    { category:'RECRUITMENT_COST', familyGrade:'WORST' },
+    saddle:     { category:'RECRUITMENT_COST', familyGrade:'BAD' },
+    backpack:   { category:'RECRUITMENT_COST', familyGrade:'BAD' },
+
+    // RESOURCES (category = BAD/OK; useful mainly early game)
+    chisel:     { category:'RESOURCES', familyGrade:'BEST' },
+    axe:        { category:'RESOURCES', familyGrade:'BEST' },
+    pickaxe:    { category:'RESOURCES', familyGrade:'BEST' }
+  };
+
+  const CATEGORY_LABELS = {
+    DEF: 'DEF',
+    OFF: 'OFF',
+    RECRUITMENT_SPEED: 'Recruitment Speed',
+    RECRUITMENT_COST: 'Recruitment Cost',
+    RESOURCES: 'Resources'
+  };
+
+  const FAMILY_GRADE_MULTIPLIER = {
+    BEST: 1.00,
+    GOOD: 0.94,
+    OK: 0.88,
+    BAD: 0.80,
+    WORST: 0.72
+  };
 
   const RARITY_ORDER = {
     shoddy: 1,
@@ -234,36 +269,44 @@
       .replace(/\bgreat axe\b/g, 'greataxe')
       .replace(/\bshort spear\b/g, 'shortspear')
       .replace(/\bmorning star\b/g, 'morningstar')
-      .replace(/\bshort bow\b/g, 'shortbow');
+      .replace(/\bshort bow\b/g, 'shortbow')
+      .replace(/\bhand saw\b/g, 'handsaw');
 
+    // Longest/specific names first so resource Axe does not collide with Greataxe.
     const all = [
-      'halberd', 'longsword', 'banner', 'longbow',
-      'greataxe', 'shortspear', 'bonfire', 'morningstar', 'shortbow'
+      'morningstar', 'shortspear', 'greataxe', 'shortbow',
+      'halberd', 'longsword', 'longbow', 'banner', 'bonfire',
+      'horseshoe', 'handsaw', 'backpack', 'pickaxe', 'dummy',
+      'saddle', 'wheel', 'chisel', 'axe'
     ];
 
-    return all.find(x => n.includes(x)) || null;
+    return all.find(x => new RegExp('(?:^|\\s)' + x + '(?:$|\\s)').test(n)) ||
+      all.find(x => n.includes(x)) || null;
   }
 
   function prettyFamily(family) {
     const map = {
-      halberd: 'Halberd',
-      longsword: 'Longsword',
-      banner: 'Banner',
-      longbow: 'Longbow',
-      greataxe: 'Greataxe',
-      shortspear: 'Shortspear',
-      bonfire: 'Bonfire',
-      morningstar: 'Morningstar',
-      shortbow: 'Shortbow'
+      halberd:'Halberd', longsword:'Longsword', longbow:'Longbow', banner:'Banner',
+      greataxe:'Greataxe', shortspear:'Shortspear', shortbow:'Shortbow', morningstar:'Morningstar', bonfire:'Bonfire',
+      dummy:'Dummy', horseshoe:'Horseshoe', wheel:'Wheel',
+      handsaw:'Handsaw', saddle:'Saddle', backpack:'Backpack',
+      chisel:'Chisel', axe:'Axe', pickaxe:'Pickaxe'
     };
     return map[family] || titleCase(family || 'Unknown');
   }
 
+  function getRelicProfile(family) {
+    return RELIC_PROFILES[family] || null;
+  }
+
   function getSide(family) {
-    if (!family) return null;
-    if (DEF_RELICS.has(family)) return 'DEF';
-    if (OFF_RELICS.has(family)) return 'OFF';
-    return null;
+    const profile = getRelicProfile(family);
+    if (!profile) return null;
+    return profile.category === 'OFF' || profile.category === 'DEF' ? profile.category : null;
+  }
+
+  function getCategory(family) {
+    return getRelicProfile(family)?.category || null;
   }
 
   function parseRarity(text) {
@@ -402,7 +445,16 @@
     shortbow: 'marcher_offdef',
     banner: 'heavy_offdef',
     morningstar: 'ram_damage',
-    bonfire: 'catapult_damage'
+    bonfire: 'catapult_damage',
+    dummy: 'barracks_speed',
+    horseshoe: 'stable_speed',
+    wheel: 'workshop_speed',
+    handsaw: 'barracks_cost',
+    saddle: 'stable_cost',
+    backpack: 'workshop_cost',
+    chisel: 'clay_production',
+    axe: 'wood_production',
+    pickaxe: 'iron_production'
   };
 
   const INTERNAL_LABELS = {
@@ -525,7 +577,7 @@
     return { unit:null, bucket:'utility' };
   }
 
-  function normalizeStructuredStat(rawStat, relicFamily, side, source) {
+  function normalizeStructuredStat(rawStat, relicFamily, category, source) {
     if (!rawStat) return null;
     const rawText = rawStatText(rawStat);
     const value = parsePercent(rawText);
@@ -536,9 +588,8 @@
       key = MAIN_STAT_KEYS[relicFamily] || '';
     }
 
-    // Text fallback keeps the analyzer usable if InnoGames introduces a new ID.
     if (!key) {
-      const fallback = parseStatText(rawText, side);
+      const fallback = parseStatText(rawText, category === 'OFF' || category === 'DEF' ? category : null);
       if (!fallback) return null;
       fallback.rare = source === 'sub' && rawStat.perfect === true;
       fallback.perfect = fallback.rare;
@@ -547,21 +598,12 @@
     }
 
     const parts = internalStatParts(key);
-    let semantic = 'IRRELEVANT';
-    if (parts.bucket === 'both') semantic = 'BOTH';
-    else if (side === 'OFF' && (parts.bucket === 'attack' || parts.bucket === 'building_damage')) semantic = 'PRIMARY';
-    else if (side === 'DEF' && parts.bucket === 'defense') semantic = 'PRIMARY';
-    else if (parts.bucket === 'utility') {
-      const cfgKey = UTILITY_CONFIG_KEY_BY_INTERNAL[key];
-      if (cfgKey && CONFIG.utility[cfgKey]) semantic = 'UTILITY';
-    }
-
     return {
       text: rawText || ((INTERNAL_LABELS[key] || key) + (value != null ? ' +' + Math.abs(value) + '%' : '')),
       value: value == null ? 0 : Math.abs(value),
       unit: parts.unit,
       bucket: parts.bucket,
-      semantic: semantic,
+      semantic: 'UNRATED',
       utilityKey: UTILITY_CONFIG_KEY_BY_INTERNAL[key] || null,
       internalKey: key,
       rare: source === 'sub' && rawStat.perfect === true,
@@ -573,20 +615,24 @@
   function normalizeInventoryRelic(raw, index) {
     if (!raw || raw.id === undefined || raw.id === null) return null;
     const family = familyCanonical(raw.type || raw.name || '');
-    const side = getSide(family);
-    if (!family || !side) return null;
+    const profile = getRelicProfile(family);
+    if (!family || !profile) return null;
 
+    const category = profile.category;
+    const side = getSide(family);
     const rarity = parseRarity(String(raw.quality || '') + ' ' + String(raw.name || ''));
-    const mainStat = raw.main_stat ? normalizeStructuredStat(raw.main_stat, family, side, 'main') : null;
-    const substats = (raw.sub_stats || []).filter(Boolean).map(stat => normalizeStructuredStat(stat, family, side, 'sub')).filter(Boolean).slice(0, 2);
+    const mainStat = raw.main_stat ? normalizeStructuredStat(raw.main_stat, family, category, 'main') : null;
+    const substats = (raw.sub_stats || []).filter(Boolean).map(stat => normalizeStructuredStat(stat, family, category, 'sub')).filter(Boolean).slice(0, 2);
 
     const relic = {
       id: String(raw.id), index: index, family: family, familyName: prettyFamily(family),
+      profile: profile, category: category, categoryLabel: CATEGORY_LABELS[category] || category,
+      familyGrade: profile.familyGrade,
       rarity: rarity, rarityName: rarity ? titleCase(rarity) : (norm(raw.quality) || 'Unknown'),
       name: norm(raw.name) || ((rarity ? titleCase(rarity) + ' ' : '') + prettyFamily(family)),
       side: side, mainStat: mainStat, substats: substats,
       allStats: [mainStat].concat(substats).filter(Boolean), tier:'UNKNOWN',
-      tierLabel:TIER_LABELS.UNKNOWN, rawRelevantValue:0, raw:raw,
+      tierLabel:TIER_LABELS.UNKNOWN, rawRelevantValue:0, fitScore:0, raw:raw,
       rawText: JSON.stringify(raw),
       future: {
         canUpgrade: rarity ? ['shoddy','sturdy','enhanced','superior'].includes(rarity) : null,
@@ -595,9 +641,21 @@
         ppSingleMaterialEligible: rarity ? ['shoddy','sturdy'].includes(rarity) : null
       }
     };
+
+    relic.substats.forEach(stat => {
+      const rating = rateSubstatForRelic(relic, stat);
+      stat.domain = rating.domain;
+      stat.grade = rating.grade;
+      stat.fit = rating.fit;
+      stat.semantic = rating.semantic;
+      stat.score = rating.score;
+      stat.reason = rating.reason;
+    });
+
     relic.tier = calculateTier(relic);
     relic.tierLabel = TIER_LABELS[relic.tier] || relic.tier;
     relic.rawRelevantValue = calculateRawRelevantValue(relic);
+    relic.fitScore = calculateFitScore(relic);
     return relic;
   }
 
@@ -640,78 +698,203 @@
   }
 
   // ------------------------------------------------------------
-  // TIER ENGINE
+  // TIER ENGINE v1.3 - exact stat desirability + relic/category fit
   // ------------------------------------------------------------
+
+  const SUBSTAT_RULES = {
+    // DEF - BEST
+    spear_defense:  { domain:'DEF', grade:'BEST' },
+    sword_defense:  { domain:'DEF', grade:'BEST' },
+    heavy_defense:  { domain:'DEF', grade:'BEST' },
+    archer_defense: { domain:'DEF', grade:'BEST' },
+    // DEF - GOOD
+    spear_offdef:   { domain:'DEF', grade:'GOOD' },
+    sword_offdef:   { domain:'DEF', grade:'GOOD' },
+    heavy_offdef:   { domain:'DEF', grade:'GOOD' },
+    archer_offdef:  { domain:'DEF', grade:'GOOD' },
+
+    // OFF - BEST
+    axe_attack:      { domain:'OFF', grade:'BEST' },
+    light_offdef:    { domain:'OFF', grade:'BEST' },
+    marcher_attack:  { domain:'OFF', grade:'BEST' },
+    // OFF - GOOD
+    axe_offdef:      { domain:'OFF', grade:'GOOD' },
+    marcher_offdef:  { domain:'OFF', grade:'GOOD' },
+    ram_damage:      { domain:'OFF', grade:'GOOD' },
+    ram_attack:      { domain:'OFF', grade:'GOOD' },
+    // OFF - OK
+    catapult_damage: { domain:'OFF', grade:'OK' },
+    catapult_attack: { domain:'OFF', grade:'OK' },
+
+    // RECRUITMENT
+    barracks_speed:  { domain:'RECRUITMENT', grade:'BEST' },
+    stable_speed:    { domain:'RECRUITMENT', grade:'BEST' },
+    barracks_cost:   { domain:'RECRUITMENT', grade:'GOOD' },
+    stable_cost:     { domain:'RECRUITMENT', grade:'GOOD' },
+    workshop_speed:  { domain:'RECRUITMENT', grade:'OK' },
+    workshop_cost:   { domain:'RECRUITMENT', grade:'OK' },
+    academy_speed:   { domain:'RECRUITMENT', grade:'BAD_OK' },
+    noble_refund:    { domain:'RECRUITMENT', grade:'BAD_OK' },
+
+    // RESOURCES
+    clay_production: { domain:'RESOURCES', grade:'BEST' },
+    wood_production: { domain:'RESOURCES', grade:'BEST' },
+    iron_production: { domain:'RESOURCES', grade:'BEST' },
+
+    // GENERAL USEFUL
+    construction_speed:     { domain:'GENERAL', grade:'GOOD' },
+    merchant_travel_speed:  { domain:'GENERAL', grade:'OK' },
+    merchant_capacity:      { domain:'GENERAL', grade:'OK' },
+
+    // GENERAL USELESS / BAD COMBAT STATS
+    spear_attack:       { domain:'USELESS', grade:'WORST' },
+    sword_attack:       { domain:'USELESS', grade:'WORST' },
+    heavy_attack:       { domain:'USELESS', grade:'BAD_OK' },
+    axe_defense:        { domain:'USELESS', grade:'WORST' },
+    light_defense:      { domain:'USELESS', grade:'BAD_OK' },
+    catapult_defense:   { domain:'USELESS', grade:'BAD_OK' },
+    ram_defense:        { domain:'USELESS', grade:'WORST' },
+    archer_attack:      { domain:'USELESS', grade:'WORST' },
+    marcher_defense:    { domain:'USELESS', grade:'BAD' },
+    haul_capacity:      { domain:'USELESS', grade:'BAD' },
+    light_attack:       { domain:'USELESS', grade:'WORST' }
+  };
+
+  const BASE_GRADE_SCORE = { BEST:6, GOOD:5, OK:4, BAD_OK:2.5, BAD:2, WORST:0 };
+
+  function inferRuleFromStat(stat) {
+    if (stat.internalKey && SUBSTAT_RULES[stat.internalKey]) return SUBSTAT_RULES[stat.internalKey];
+    const key = stat.internalKey || '';
+    if (SUBSTAT_RULES[key]) return SUBSTAT_RULES[key];
+    return { domain:'UNKNOWN', grade:'WORST' };
+  }
+
+  function isCombatDomain(domain) {
+    return domain === 'OFF' || domain === 'DEF';
+  }
+
+  function rateSubstatForRelic(relic, stat) {
+    const rule = inferRuleFromStat(stat);
+    const category = relic.category;
+    const domain = rule.domain;
+    const grade = rule.grade;
+    const base = BASE_GRADE_SCORE[grade] || 0;
+    const rare = !!stat.rare;
+    let score = 0;
+    let fit = 'IRRELEVANT';
+    let semantic = 'IRRELEVANT';
+    let reason = '';
+
+    if (domain === category ||
+        (domain === 'RECRUITMENT' && (category === 'RECRUITMENT_SPEED' || category === 'RECRUITMENT_COST'))) {
+      // Best case: relic and rolled substat serve the same job.
+      score = base;
+      fit = 'MATCH';
+      semantic = grade === 'BEST' ? 'PRIMARY' : 'RELEVANT';
+      reason = 'Substat matches the relic category.';
+    } else if ((category === 'OFF' || category === 'DEF') && isCombatDomain(domain)) {
+      // OFF with DEF or DEF with OFF is normally bad. Only a rare opposing combat
+      // roll is worth preserving, but it must never be promoted as a top-tier match.
+      if (domain !== category && rare) {
+        score = grade === 'BEST' ? 3.0 : grade === 'GOOD' ? 2.5 : 1.5;
+        fit = 'RARE_CROSS_COMBAT';
+        semantic = 'RARE CROSS';
+        reason = 'Rare opposing OFF/DEF stat: worth preserving, but mismatched to this combat relic.';
+      } else {
+        score = 0;
+        fit = 'MISMATCH';
+        semantic = 'IRRELEVANT';
+        reason = 'OFF/DEF mismatch for this combat relic.';
+      }
+    } else if ((category === 'RECRUITMENT_SPEED' || category === 'RECRUITMENT_COST' || category === 'RESOURCES') && isCombatDomain(domain)) {
+      // Recruitment/resource relics can still be useful with strong combat rolls,
+      // but are intentionally valued below a true OFF/DEF relic with the same rolls.
+      if (grade === 'BEST' || (rare && (grade === 'BEST' || grade === 'GOOD'))) {
+        score = grade === 'BEST' ? 3.5 : 2.75;
+        fit = rare ? 'RARE_CROSS_COMBAT' : 'CROSS_COMBAT';
+        semantic = 'CROSS USEFUL';
+        reason = 'Strong combat substat on a non-combat relic; useful, but weaker than the same roll on a matching combat relic.';
+      } else {
+        score = 0.75;
+        fit = 'WEAK_CROSS';
+        semantic = 'LOW VALUE';
+        reason = 'Combat substat is not strong enough to carry this non-combat relic.';
+      }
+    } else if (domain === 'GENERAL') {
+      if (category === 'RECRUITMENT_SPEED' || category === 'RECRUITMENT_COST' || category === 'RESOURCES') {
+        score = grade === 'GOOD' ? 2.0 : 1.5;
+        fit = 'UTILITY';
+        semantic = 'UTILITY';
+        reason = 'General utility is acceptable on recruitment/resource relics.';
+      } else {
+        score = 0;
+        fit = 'MISMATCH';
+        semantic = 'IRRELEVANT';
+        reason = 'General utility does not improve OFF/DEF relic quality.';
+      }
+    } else if (domain === 'RECRUITMENT' && category === 'RESOURCES') {
+      score = Math.min(2.25, base * 0.45);
+      fit = 'UTILITY';
+      semantic = 'UTILITY';
+      reason = 'Useful utility, but not the resource relic primary job.';
+    } else if (domain === 'RESOURCES' && (category === 'RECRUITMENT_SPEED' || category === 'RECRUITMENT_COST')) {
+      score = Math.min(2.25, base * 0.45);
+      fit = 'UTILITY';
+      semantic = 'UTILITY';
+      reason = 'Useful utility, but not the recruitment relic primary job.';
+    } else {
+      score = 0;
+      fit = domain === 'USELESS' ? 'USELESS' : 'IRRELEVANT';
+      semantic = 'IRRELEVANT';
+      reason = domain === 'USELESS' ? 'Explicitly low-value/useless substat.' : 'Does not meaningfully fit this relic.';
+    }
+
+    // Rare is a modifier, never a replacement for fit. Matching rare stats get a
+    // strong bonus; useful cross-category rares get a smaller bonus. Irrelevant
+    // or useless stats get no automatic tier promotion just because they are rare.
+    if (rare) {
+      if (fit === 'MATCH') score += 4.0;
+      else if (fit === 'CROSS_COMBAT') score += 1.5;
+      else if (fit === 'UTILITY') score += 0.75;
+    }
+
+    // Family quality only nudges useful scores. It cannot rescue a bad substat.
+    if (score > 0) {
+      score *= FAMILY_GRADE_MULTIPLIER[relic.familyGrade] || 1;
+    }
+
+    return { domain, grade, fit, semantic, score, reason };
+  }
+
+  function calculateFitScore(relic) {
+    return (relic.substats || []).reduce((sum, s) => sum + Number(s.score || 0), 0);
+  }
 
   function calculateTier(relic) {
     const stats = relic.substats || [];
+    const score = calculateFitScore(relic);
+    const matching = stats.filter(s => s.fit === 'MATCH');
+    const rareMatching = matching.filter(s => s.rare);
+    const useful = stats.filter(s => Number(s.score || 0) > 0);
 
-    const primary = stats.filter(x => x.semantic === 'PRIMARY');
-    const both = stats.filter(x => x.semantic === 'BOTH');
-    const utility = stats.filter(x => x.semantic === 'UTILITY');
+    // Named top tiers require genuinely matching rolls. This prevents a rare
+    // Spear attack (or any other mismatched stat) from making Greataxe Legendary.
+    if (rareMatching.length >= 2 && matching.length >= 2 && score >= 18) return 'MONEY';
+    if (rareMatching.length >= 1 && matching.length >= 2 && score >= 15) return 'FUCK';
+    if (rareMatching.length >= 1 && score >= 10) return 'LEGENDARY';
 
-    const rarePrimary = primary.filter(x => x.rare);
-    const rareBoth = both.filter(x => x.rare);
-
-    // Quadruple Oil Money:
-    // 2x rare primary OR rare primary + rare both
-    if (
-      rarePrimary.length >= 2 ||
-      (rarePrimary.length >= 1 && rareBoth.length >= 1)
-    ) return 'MONEY';
-
-    // Fuck Me In The Ass:
-    // rare primary + normal both OR 2x rare both
-    // (rare both paired with rare primary already caught above)
-    const normalBoth = both.filter(x => !x.rare);
-    if (
-      (rarePrimary.length >= 1 && normalBoth.length >= 1) ||
-      rareBoth.length >= 2
-    ) return 'FUCK';
-
-    // Legendary:
-    // 1x rare primary alone OR rare both + normal both
-    if (
-      rarePrimary.length >= 1 ||
-      (rareBoth.length >= 1 && normalBoth.length >= 1)
-    ) return 'LEGENDARY';
-
-    // S:
-    // 2x primary OR primary + both OR 1x rare both
-    if (
-      primary.length >= 2 ||
-      (primary.length >= 1 && both.length >= 1) ||
-      rareBoth.length >= 1
-    ) return 'S';
-
-    // A:
-    // 1x primary
-    if (primary.length >= 1) return 'A';
-
-    // B:
-    // 2x both
-    if (both.length >= 2) return 'B';
-
-    // C:
-    // 1x both + useful non-def/off utility stat
-    if (both.length >= 1 && utility.length >= 1) return 'C';
-
-    // D:
-    // 1x both and no other useful substat
-    if (both.length >= 1) return 'D';
-
-    // E:
-    // no combat-relevant substats but at least one useful utility
-    if (utility.length >= 1) return 'E';
-
+    if (matching.length >= 2 && score >= 10) return 'S';
+    if (score >= 8) return 'A';
+    if (score >= 6) return 'B';
+    if (score >= 4) return 'C';
+    if (score >= 2.5) return 'D';
+    if (useful.length >= 1 && score > 0) return 'E';
     return 'F';
   }
 
   function calculateRawRelevantValue(relic) {
     return (relic.substats || []).reduce((sum, s) => {
-      if (s.semantic === 'PRIMARY' || s.semantic === 'BOTH') {
-        return sum + Math.abs(s.value || 0);
-      }
+      if (Number(s.score || 0) > 0) return sum + Math.abs(s.value || 0);
       return sum;
     }, 0);
   }
@@ -753,12 +936,33 @@
     return 2;
   }
 
+  function hasProtectedCrossRoll(relic) {
+    return (relic.substats || []).some(s =>
+      s.fit === 'RARE_CROSS_COMBAT' ||
+      s.fit === 'CROSS_COMBAT'
+    );
+  }
+
   function baseRecommendation(relic) {
     const rarity = relic.rarity;
     const nextQuality = QUALITY_NEXT[rarity] || null;
 
     if (!rarity) {
       return { action:'REVIEW', reason:'Unknown quality; review manually.', nextQuality:null, materialIds:[] };
+    }
+
+    // Explicit preservation rules:
+    // - OFF/DEF relic + rare opposing combat stat: keep as-is.
+    // - Recruitment/resource relic + BEST combat stat, or rare BEST/GOOD combat stat: keep.
+    // These rolls may have a modest tier because the category is mismatched, but they
+    // are still too useful to reroll or feed as material automatically.
+    if (hasProtectedCrossRoll(relic)) {
+      return {
+        action:'KEEP',
+        reason:'Protected cross-category combat roll. Keep it even though the relic/category match is not ideal.',
+        nextQuality:nextQuality,
+        materialIds:[]
+      };
     }
 
     if (rarity === 'renowned') {
@@ -914,7 +1118,7 @@
     const relevantStats = [];
     if (relic.mainStat) relevantStats.push(relic.mainStat);
     relevantStats.push(...(relic.substats || []).filter(s =>
-      s.semantic === 'PRIMARY' || s.semantic === 'BOTH'
+      s.domain === 'OFF' || s.domain === 'DEF'
     ));
 
     for (const stat of relevantStats) {
@@ -1113,7 +1317,7 @@
       buildInventoryRecommendations(state.relics);
       let rows = state.relics.slice();
 
-      if (side !== 'ALL') rows = rows.filter(r => r.side === side);
+      if (side !== 'ALL') rows = rows.filter(r => r.category === side);
 
       rows.sort((a, b) => {
         if (sort === 'tier') {
@@ -1139,7 +1343,7 @@
           <div class="twra-empty">
             <b>No supported relics found.</b><br><br>
             The Treasury inventory was loaded, but no supported combat relics were found.<br>
-            Supported families: Halberd, Longsword, Banner, Longbow, Greataxe, Shortspear, Bonfire, Morningstar and Shortbow.
+            Supported families: DEF/OFF combat relics plus Dummy, Horseshoe, Wheel, Handsaw, Saddle, Backpack, Chisel, Axe and Pickaxe.
           </div>`;
         return;
       }
@@ -1149,12 +1353,12 @@
           <thead>
             <tr>
               <th>Tier</th>
-              <th>Side</th>
+              <th>Category</th>
               <th>Relic</th>
               <th>Main stat</th>
               <th>Substat 1</th>
               <th>Substat 2</th>
-              <th>Relevant</th>
+              <th>Fit score</th>
               <th>Recommendation</th>
               <th>Why</th>
             </tr>
@@ -1163,7 +1367,7 @@
             ${rows.map((r, idx) => `
               <tr data-row="${idx}">
                 <td><span class="twra-tier ${tierClass(r.tier)}">${cssEscape(r.tierLabel)}</span></td>
-                <td class="twra-side">${r.side}</td>
+                <td class="twra-side">${cssEscape(r.categoryLabel)}</td>
                 <td>
                   <b>${cssEscape(r.name)}</b><br>
                   <span class="twra-muted">${cssEscape(r.id)}</span>
@@ -1171,7 +1375,7 @@
                 <td class="twra-stat">${formatStat(r.mainStat)}</td>
                 <td class="twra-stat">${formatStat(r.substats[0])}</td>
                 <td class="twra-stat">${formatStat(r.substats[1])}</td>
-                <td>${r.rawRelevantValue}%</td>
+                <td>${r.fitScore.toFixed(1)}<br><span class="twra-muted">${r.rawRelevantValue}% rolled</span></td>
                 <td><span class="twra-action twra-action-${String(r.recommendation?.action || 'review').toLowerCase()}">${cssEscape(recommendationText(r))}</span></td>
                 <td class="twra-reason">${cssEscape(r.recommendation?.reason || '')}</td>
               </tr>
@@ -1183,7 +1387,10 @@
     function formatStat(s) {
       if (!s) return '<span class="twra-muted">—</span>';
       const cls = s.rare ? 'twra-rare' : '';
-      const tag = s.semantic !== 'IRRELEVANT' ? ` <span class="twra-muted">[${cssEscape(s.semantic)}]</span>` : '';
+      const tags = [];
+      if (s.grade) tags.push(s.grade.replace('_', '/'));
+      if (s.semantic && s.semantic !== 'IRRELEVANT') tags.push(s.semantic);
+      const tag = tags.length ? ` <span class="twra-muted">[${cssEscape(tags.join(' · '))}]</span>` : '';
       return `<span class="${cls}">${s.rare ? '★ ' : ''}${cssEscape(s.text)}</span>${tag}`;
     }
 
@@ -1260,7 +1467,7 @@
         },
         debug() {
           console.table(this.relics.map(r => ({
-            id:r.id, name:r.name, side:r.side, rarity:r.rarityName, tier:r.tierLabel,
+            id:r.id, name:r.name, category:r.categoryLabel, familyGrade:r.familyGrade, rarity:r.rarityName, tier:r.tierLabel, score:r.fitScore,
             main:r.mainStat?.text || '', sub1:r.substats[0]?.text || '',
             sub1Rare:!!r.substats[0]?.rare, sub2:r.substats[1]?.text || '',
             sub2Rare:!!r.substats[1]?.rare, recommendation:recommendationText(r)
