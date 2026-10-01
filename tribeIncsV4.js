@@ -14,10 +14,13 @@
  * - Loads each member's Player Info page and uses ajax=fetch_villages for members with more than 100 villages
  * - Scans only villages visibly marked as having incoming attacks
  * - Counts attacks per target tribe member
- * - Resolves Origin -> Player from command details when needed
+ * - Resolves Origin -> Player from command rows whenever possible
+ * - Recognizes own commands from the rename control without extra requests
+ * - Recognizes Tribemate/Friend commands from the built-in Player: Command label
+ * - Falls back to command details only when Origin still cannot be identified
  * - Aggregates attacks by Origin player across the whole tribe
  * - Builds Origin player -> target member breakdowns
- * - Uses a faster adaptive global request-start limiter (~14 req/s base)
+ * - Uses an adaptive global request-start limiter (~40 req/s base, ramping toward ~55.6/s)
  * - Uses retry/backoff and a shared per-tab command-origin cache
  * - Uses only same-origin Tribal Wars pages
  *
@@ -45,7 +48,7 @@
     "use strict";
 
     const SCRIPT_NAME = "Twactics Tribe Incoming Analyzer";
-    const SCRIPT_VERSION = "v1.4.0";
+    const SCRIPT_VERSION = "v1.5.0";
     const BOX_ID = "twactics-tribe-incoming-analyzer";
 
     // Read-only page requests use an adaptive turbo limiter. Start at ~40
@@ -89,6 +92,9 @@
         failedCommands: 0,
         unresolvedCommands: 0,
         directOriginHits: 0,
+        directPlayerLinkHits: 0,
+        ownCommandHits: 0,
+        friendlyLabelHits: 0,
         cacheHits: 0,
         networkCommandRequests: 0,
         cacheDirty: false,
@@ -842,6 +848,52 @@
         return candidates.length === 1 ? candidates[0] : null;
     }
 
+    function getCurrentAccountPlayer() {
+        if (typeof game_data === "undefined" || !game_data.player) return null;
+
+        const name = cleanText(game_data.player.name || game_data.player.name_encoded || "");
+        const id = String(game_data.player.id || "");
+        if (!name) return null;
+
+        return { id: id, name: name };
+    }
+
+    function isOwnCommandRow(row) {
+        // Tribal Wars only renders the rename control on commands the current
+        // account is allowed to rename. For incoming attacks this lets us identify
+        // our own commands without opening screen=info_command.
+        return !!row.querySelector(".rename-icon");
+    }
+
+    function isTribemateOrFriendCommand(row) {
+        return Array.from(row.querySelectorAll(".command_hover_details")).some(icon => {
+            return /tribemate\s*\/\s*friend command/i.test(cleanText(icon.getAttribute("data-icon-hint") || ""));
+        });
+    }
+
+    function getQuickeditLabel(row) {
+        const label = row.querySelector(".quickedit-label");
+        return cleanText(label ? label.textContent : "");
+    }
+
+    function getFriendlyOriginFromLabel(row) {
+        if (!isTribemateOrFriendCommand(row)) return null;
+
+        const label = getQuickeditLabel(row);
+        if (!label) return null;
+
+        // Tribal Wars formats visible friendly incoming commands as:
+        //   Player name: command/village label
+        // Only use this parser together with the explicit Tribemate/Friend hint.
+        const separator = label.indexOf(":");
+        if (separator <= 0) return null;
+
+        const name = cleanText(label.slice(0, separator));
+        if (!name) return null;
+
+        return { id: "", name: name };
+    }
+
     function getCommandDetails(row) {
         const links = Array.from(row.querySelectorAll('a[href*="screen=info_command"]'));
         const link = links.find(item => getParam("id", item.href || item.getAttribute("href") || "")) || links[0] || null;
@@ -942,14 +994,42 @@
                 targetName: village.targetName
             };
 
+            // Fast path 1: a real player link is already present in the command row.
             const direct = getOriginPlayerFromCommandRow(row, attack.targetId);
             if (direct) {
                 state.directOriginHits += 1;
+                state.directPlayerLinkHits += 1;
                 addAttackToAttacker(direct, attack);
                 if (attack.commandId) cacheAttacker(attack.commandId, direct);
                 return;
             }
 
+            // Fast path 2: commands with a rename icon belong to the current account.
+            // This is substantially cheaper than opening one command-detail page per
+            // fake/attack and does not depend on the editable quickedit label text.
+            if (isOwnCommandRow(row)) {
+                const ownPlayer = getCurrentAccountPlayer();
+                if (ownPlayer) {
+                    state.directOriginHits += 1;
+                    state.ownCommandHits += 1;
+                    addAttackToAttacker(ownPlayer, attack);
+                    if (attack.commandId) cacheAttacker(attack.commandId, ownPlayer);
+                    return;
+                }
+            }
+
+            // Fast path 3: Tribal Wars marks ally/friend commands explicitly and
+            // prefixes their visible label with the Origin player name.
+            const friendly = getFriendlyOriginFromLabel(row);
+            if (friendly) {
+                state.directOriginHits += 1;
+                state.friendlyLabelHits += 1;
+                addAttackToAttacker(friendly, attack);
+                if (attack.commandId) cacheAttacker(attack.commandId, friendly);
+                return;
+            }
+
+            // Fast path 4: command Origin was resolved during an earlier scan.
             const cached = getCachedAttacker(attack.commandId);
             if (cached) {
                 state.cacheHits += 1;
@@ -968,19 +1048,44 @@
     }
 
     function ensureAttacker(attacker) {
-        const key = attacker.id ? "id:" + attacker.id : "name:" + attacker.name.toLowerCase();
+        const normalizedName = cleanText(attacker.name).toLowerCase();
+        const idKey = attacker.id ? "id:" + attacker.id : "";
+        const nameKey = "name:" + normalizedName;
 
-        if (!state.attackers.has(key)) {
-            state.attackers.set(key, {
+        let entry = idKey ? state.attackers.get(idKey) : null;
+        if (!entry) entry = state.attackers.get(nameKey) || null;
+
+        // A friendly-label fast path may first discover a player by name only and
+        // a later command-detail response may include the numeric ID. Reuse the
+        // same aggregate instead of creating two rows for the same player.
+        if (!entry) {
+            for (const value of state.attackers.values()) {
+                if (cleanText(value.name).toLowerCase() === normalizedName) {
+                    entry = value;
+                    break;
+                }
+            }
+        }
+
+        if (!entry) {
+            entry = {
                 id: String(attacker.id || ""),
                 name: attacker.name,
                 counts: emptyCounts(),
                 byTarget: new Map(),
                 targetVillages: new Set()
-            });
+            };
+            state.attackers.set(idKey || nameKey, entry);
+            return entry;
         }
 
-        return state.attackers.get(key);
+        if (attacker.id && !entry.id) {
+            state.attackers.delete(nameKey);
+            entry.id = String(attacker.id);
+            state.attackers.set(idKey, entry);
+        }
+
+        return entry;
     }
 
     function addAttackToAttacker(attacker, attack) {
@@ -1398,7 +1503,7 @@
                 <div id="ttia-matrix" class="ttia-matrix">${buildMatrixHtml()}</div>
 
                 <div class="ttia-note" id="ttia-note">
-                    Read-only requests start at ~${(1000 / INITIAL_REQUEST_START_INTERVAL_MS).toFixed(1)}/s, can ramp to ~${(1000 / MIN_REQUEST_START_INTERVAL_MS).toFixed(1)}/s, and automatically back off if Tribal Wars throttles the scan. No game actions are performed.
+                    Own commands and recognizable Tribemate/Friend commands are resolved locally first. Remaining read-only requests start at ~${(1000 / INITIAL_REQUEST_START_INTERVAL_MS).toFixed(1)}/s, can ramp to ~${(1000 / MIN_REQUEST_START_INTERVAL_MS).toFixed(1)}/s, and automatically back off if Tribal Wars throttles the scan. No game actions are performed.
                 </div>
 
                 <div class="ttia-footer"><span>MIT</span><span>Created by Twactics (zidrox)</span></div>
@@ -1547,8 +1652,11 @@
                 note.textContent = "Scan complete. Every recognized incoming attack was matched to an Origin player. " +
                     state.networkCommandRequests + " command-detail request" + (state.networkCommandRequests === 1 ? "" : "s") +
                     " were needed; " + (state.directOriginHits + state.cacheHits) + " attack" + ((state.directOriginHits + state.cacheHits) === 1 ? "" : "s") +
-                    " were resolved without an extra command-detail request. Final request rate: ~" + getCurrentRequestRate().toFixed(1) +
-                    "/s" + (state.rateBackoffs ? " after " + state.rateBackoffs + " automatic backoff" + (state.rateBackoffs === 1 ? "" : "s") : " (no backoff needed)") + ".";
+                    " were resolved without an extra command-detail request (" +
+                    state.ownCommandHits + " own, " + state.friendlyLabelHits + " tribemate/friend label, " +
+                    state.directPlayerLinkHits + " direct player link, " + state.cacheHits + " cache). Final request rate: ~" +
+                    getCurrentRequestRate().toFixed(1) + "/s" +
+                    (state.rateBackoffs ? " after " + state.rateBackoffs + " automatic backoff" + (state.rateBackoffs === 1 ? "" : "s") : " (no backoff needed)") + ".";
             }
         }
     }
