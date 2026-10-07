@@ -85,12 +85,7 @@
 (async function twacticsSmartResourceSender() {
     'use strict';
 
-    if (window.twacticsSmartResourceSenderLoaded) {
-        console.log('Twactics Smart Resource Sender already loaded');
-        return;
-    }
-
-    window.twacticsSmartResourceSenderLoaded = true;
+    console.log('[Twactics Smart Resource Sender] Starting...');
 
     const SCRIPT_NAME = 'Twactics Smart Resource Sender';
     const SCRIPT_VERSION = '1.0.1';
@@ -133,7 +128,14 @@
     let resolvedTarget = null;
     let sendLocked = false;
     let enterKeyHeld = false;
-    let settings = loadSettings();
+    let settings;
+
+    try {
+        settings = loadSettings();
+    } catch (error) {
+        console.error('[Twactics Smart Resource Sender] Failed loading settings:', error);
+        settings = { ...DEFAULTS };
+    }
 
     function getWorldKey(name) {
         const world = typeof game_data !== 'undefined' && game_data.world ? game_data.world : 'world';
@@ -1526,9 +1528,36 @@
         }
     }
 
-    document.getElementById(SCRIPT_ID)?.remove();
-    document.getElementById(STYLE_ID)?.remove();
-    renderShell();
-    await refreshData(false);
-    console.log(SCRIPT_NAME + ' ' + SCRIPT_VERSION + ' loaded');
+    try {
+        document.getElementById(SCRIPT_ID)?.remove();
+        document.getElementById(STYLE_ID)?.remove();
+        document.querySelector('.twsr-info-overlay')?.remove();
+
+        window.twacticsSmartResourceSenderLoaded = false;
+
+        console.log('[Twactics Smart Resource Sender] Rendering UI...');
+        renderShell();
+        console.log('[Twactics Smart Resource Sender] UI rendered.');
+
+        window.twacticsSmartResourceSenderLoaded = true;
+
+        await refreshData(false);
+
+        console.log('[' + SCRIPT_NAME + '] ' + SCRIPT_VERSION + ' loaded successfully');
+    } catch (error) {
+        window.twacticsSmartResourceSenderLoaded = false;
+
+        console.error('[' + SCRIPT_NAME + '] Startup failed:', error);
+
+        const message =
+            SCRIPT_NAME +
+            ' failed to start: ' +
+            (error?.message || String(error));
+
+        if (window.UI?.ErrorMessage) {
+            UI.ErrorMessage(message);
+        } else {
+            alert(message);
+        }
+    }
 })();
