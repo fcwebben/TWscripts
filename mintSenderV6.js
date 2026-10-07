@@ -86,7 +86,7 @@
     'use strict';
 
     const SCRIPT_NAME = 'Twactics Smart Mint Resource Sender';
-    const SCRIPT_VERSION = '1.3.1';
+    const SCRIPT_VERSION = '1.3.2';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 2;
@@ -1192,20 +1192,6 @@
                 max-height: calc(88vh - 48px);
                 overflow-y: auto;
             }
-            #${SCRIPT_ID} .twsr-quick-help {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 6px;
-                margin-bottom: 10px;
-            }
-            #${SCRIPT_ID} .twsr-pill {
-                padding: 5px 8px;
-                background: #fff7e5;
-                border: 1px solid #d0ad6a;
-                border-radius: 999px;
-                color: #4b3318;
-                white-space: nowrap;
-            }
             #${SCRIPT_ID} .twsr-panel,
             #${SCRIPT_ID} .twsr-summary-panel {
                 background: #fff7e5;
@@ -1214,13 +1200,41 @@
                 padding: 10px;
                 margin-bottom: 10px;
             }
-            #${SCRIPT_ID} .twsr-resource-cards {
+            #${SCRIPT_ID} .twsr-settings-head {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                cursor: pointer;
+                user-select: none;
+            }
+            #${SCRIPT_ID} .twsr-settings-head strong {
+                font-size: 12px;
+            }
+            #${SCRIPT_ID} .twsr-settings-toggle {
+                width: 24px;
+                height: 22px;
+                padding: 0;
+                line-height: 18px;
+                font-weight: bold;
+            }
+            #${SCRIPT_ID} .twsr-settings-content {
+                margin-top: 9px;
+            }
+            #${SCRIPT_ID} .twsr-panel.twsr-collapsed {
+                padding-top: 7px;
+                padding-bottom: 7px;
+            }
+            #${SCRIPT_ID} .twsr-panel.twsr-collapsed .twsr-settings-content {
+                display: none;
+            }
+            #${SCRIPT_ID} .twsr-mint-cards {
                 display: grid;
-                grid-template-columns: repeat(3, minmax(0, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
                 gap: 8px;
                 margin-top: 8px;
             }
-            #${SCRIPT_ID} .twsr-resource-card {
+            #${SCRIPT_ID} .twsr-mint-card {
                 padding: 9px;
                 border: 1px solid #c8a765;
                 border-radius: 8px;
@@ -1228,50 +1242,68 @@
                 box-shadow: 0 1px 0 rgba(0,0,0,0.08);
                 min-width: 0;
             }
-            #${SCRIPT_ID} .twsr-resource-card-head {
+            #${SCRIPT_ID} .twsr-mint-card-head {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 8px;
+                padding-bottom: 7px;
+                margin-bottom: 3px;
+                border-bottom: 1px solid #ead8b3;
+            }
+            #${SCRIPT_ID} .twsr-mint-card-title {
+                font-size: 13px;
+                font-weight: bold;
+                line-height: 1.2;
+            }
+            #${SCRIPT_ID} .twsr-mint-card-meta {
+                font-size: 9px;
+                opacity: 0.68;
+                margin-top: 2px;
+            }
+            #${SCRIPT_ID} .twsr-mint-resource-row {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto;
+                gap: 8px;
+                align-items: center;
+                padding: 7px 0;
+                border-bottom: 1px solid #f0e1c2;
+            }
+            #${SCRIPT_ID} .twsr-mint-resource-row:last-child {
+                border-bottom: 0;
+                padding-bottom: 1px;
+            }
+            #${SCRIPT_ID} .twsr-mint-resource-main {
                 display: flex;
                 align-items: center;
-                gap: 6px;
-                margin-bottom: 7px;
-            }
-            #${SCRIPT_ID} .twsr-resource-card-head img {
-                width: 20px;
-                height: 20px;
-                flex: 0 0 auto;
-            }
-            #${SCRIPT_ID} .twsr-resource-card-name {
-                font-size: 12px;
-                font-weight: bold;
-            }
-            #${SCRIPT_ID} .twsr-resource-card-total {
-                font-size: 18px;
-                font-weight: bold;
-                line-height: 1.1;
-                margin-bottom: 7px;
-            }
-            #${SCRIPT_ID} .twsr-resource-card-split {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 6px;
-            }
-            #${SCRIPT_ID} .twsr-resource-card-metric {
-                padding: 5px 6px;
-                border: 1px solid #ead8b3;
-                border-radius: 6px;
-                background: rgba(255,255,255,0.55);
+                gap: 5px;
                 min-width: 0;
             }
-            #${SCRIPT_ID} .twsr-resource-card-label {
-                font-size: 9px;
-                text-transform: uppercase;
-                letter-spacing: 0.04em;
-                opacity: 0.68;
-                margin-bottom: 2px;
+            #${SCRIPT_ID} .twsr-mint-resource-main img {
+                width: 16px;
+                height: 16px;
+                flex: 0 0 auto;
             }
-            #${SCRIPT_ID} .twsr-resource-card-value {
+            #${SCRIPT_ID} .twsr-mint-resource-name {
+                font-weight: bold;
+                font-size: 11px;
+            }
+            #${SCRIPT_ID} .twsr-mint-resource-total {
                 font-weight: bold;
                 font-size: 12px;
-                overflow-wrap: anywhere;
+                margin-left: auto;
+            }
+            #${SCRIPT_ID} .twsr-mint-resource-split {
+                display: flex;
+                gap: 5px;
+                font-size: 9px;
+                white-space: nowrap;
+            }
+            #${SCRIPT_ID} .twsr-mint-resource-split span {
+                padding: 3px 5px;
+                border: 1px solid #ead8b3;
+                border-radius: 5px;
+                background: rgba(255,255,255,0.55);
             }
             #${SCRIPT_ID} .twsr-rerun-card {
                 display: flex;
@@ -1562,7 +1594,7 @@
             }
             @media (max-width: 560px) {
                 #${SCRIPT_ID} .twsr-grid { grid-template-columns: 1fr; }
-                #${SCRIPT_ID} .twsr-resource-cards { grid-template-columns: 1fr; }
+                #${SCRIPT_ID} .twsr-mint-cards { grid-template-columns: 1fr; }
                 #${SCRIPT_ID} .twsr-rerun-card { align-items: flex-start; flex-direction: column; }
                 #${SCRIPT_ID} .twsr-rerun-checkpoints { justify-content: flex-start; }
             }
@@ -1775,6 +1807,22 @@
         }
     }
 
+    function setSettingsCollapsed(collapsed) {
+        const panel = document.querySelector('#strr-settings-panel');
+        const toggle = document.querySelector('#strr-settings-toggle');
+        if (!panel || !toggle) return;
+
+        panel.classList.toggle('twsr-collapsed', Boolean(collapsed));
+        toggle.textContent = collapsed ? '+' : '−';
+        toggle.setAttribute('aria-label', collapsed ? 'Expand settings' : 'Collapse settings');
+    }
+
+    function toggleSettingsCollapsed() {
+        const panel = document.querySelector('#strr-settings-panel');
+        if (!panel) return;
+        setSettingsCollapsed(!panel.classList.contains('twsr-collapsed'));
+    }
+
     function renderShell() {
         mergeVillageGroupsFromDocument(document);
         document.getElementById(SCRIPT_ID)?.remove();
@@ -1806,16 +1854,12 @@
                 <button type="button" class="twsr-close">x</button>
             </div>
             <div class="twsr-body">
-                <div class="twsr-quick-help">
-                    <span class="twsr-pill">Single or multiple mint targets</span>
-                    <span class="twsr-pill">WH% = fullest resource</span>
-                    <span class="twsr-pill">Relays always move resources closer</span>
-                    <span class="twsr-pill">Direct ratio 28 / 30 / 25</span>
-                    <span class="twsr-pill">Minimum 900 resources / send</span>
-                    <span class="twsr-pill">One manual request per target</span>
-                </div>
-
-                <div class="twsr-panel">
+                <div id="strr-settings-panel" class="twsr-panel">
+                    <div id="strr-settings-head" class="twsr-settings-head">
+                        <strong>Settings</strong>
+                        <button id="strr-settings-toggle" type="button" class="btn twsr-settings-toggle" aria-label="Collapse settings">−</button>
+                    </div>
+                    <div id="strr-settings-content" class="twsr-settings-content">
                     <div class="twsr-mode-panel">
                         <div class="twsr-mode-row">
                             <label>
@@ -1857,6 +1901,7 @@
                     <div class="twsr-scriptdata-note">
                         <strong>User data:</strong> Supports <code>TribalWars.scriptData</code>. Settings are also saved locally per world. The expected JSON format is documented at the top of the script.
                     </div>
+                    </div>
                 </div>
 
                 <div id="twsr-status" class="twsr-status">Loading village data...</div>
@@ -1867,6 +1912,10 @@
 
         document.body.appendChild(box);
         box.querySelector('.twsr-close').addEventListener('click', closeDialog);
+        box.querySelector('#strr-settings-head').addEventListener('click', event => {
+            event.preventDefault();
+            toggleSettingsCollapsed();
+        });
         box.querySelector('#strr-build').addEventListener('click', generateFromUi);
         box.querySelector('#strr-refresh').addEventListener('click', () => refreshData(true));
 
@@ -2077,6 +2126,7 @@
                 await ensureWorldSpeed();
             }
 
+            setSettingsCollapsed(true);
             renderPlan();
 
             const targetCount = settings.multiMintEnabled ? multiMintTargets.length : 1;
@@ -2105,50 +2155,95 @@
         return summary;
     }
 
-    function buildResourceSplit(sentOnly = false) {
+    function getMintTargetDefinitions() {
+        if (settings.multiMintEnabled) {
+            return multiMintTargets.map(item => ({
+                id: item.target.id,
+                coord: item.target.coord,
+                name: item.target.name,
+                groupId: item.groupId,
+                groupName: item.groupName
+            }));
+        }
+
+        if (!resolvedTarget) return [];
+        return [{
+            id: resolvedTarget.id,
+            coord: resolvedTarget.coord,
+            name: resolvedTarget.name,
+            groupId: '',
+            groupName: ''
+        }];
+    }
+
+    function transferBelongsToMint(transfer, target) {
+        if (!settings.multiMintEnabled) return true;
+
+        if (transfer.finalTargetId !== undefined && transfer.finalTargetId !== null) {
+            return String(transfer.finalTargetId) === String(target.id);
+        }
+
+        return String(transfer.finalTargetCoord || '') === String(target.coord);
+    }
+
+    function buildMintResourceSplit(target, sentOnly = false) {
         const direct = emptyResourceSummary();
         const relay = emptyResourceSummary();
 
         plan.forEach(transfer => {
             if (sentOnly && !transfer.sent) return;
+            if (!transferBelongsToMint(transfer, target)) return;
             addTransferToResourceSummary(transfer.kind === 'relay' ? relay : direct, transfer);
         });
 
         return { direct, relay };
     }
 
-    function resourceMetricCardHtml(key, label, image, split) {
+    function mintResourceRowHtml(key, label, image, split) {
         const direct = Math.max(0, Number(split.direct[key]) || 0);
         const relay = Math.max(0, Number(split.relay[key]) || 0);
         const total = direct + relay;
 
         return `
-            <div class="twsr-resource-card">
-                <div class="twsr-resource-card-head">
+            <div class="twsr-mint-resource-row">
+                <div class="twsr-mint-resource-main">
                     <img src="${image}" alt="${escapeHtml(label)}">
-                    <span class="twsr-resource-card-name">${escapeHtml(label)}</span>
+                    <span class="twsr-mint-resource-name">${escapeHtml(label)}</span>
+                    <span class="twsr-mint-resource-total">${fmt(total)}</span>
                 </div>
-                <div class="twsr-resource-card-total">${fmt(total)}</div>
-                <div class="twsr-resource-card-split">
-                    <div class="twsr-resource-card-metric">
-                        <div class="twsr-resource-card-label">Direct</div>
-                        <div class="twsr-resource-card-value">${fmt(direct)}</div>
-                    </div>
-                    <div class="twsr-resource-card-metric">
-                        <div class="twsr-resource-card-label">Relay</div>
-                        <div class="twsr-resource-card-value">${fmt(relay)}</div>
-                    </div>
+                <div class="twsr-mint-resource-split">
+                    <span title="Direct to mint">Direct ${fmt(direct)}</span>
+                    <span title="Sent to relay villages first">Relay ${fmt(relay)}</span>
                 </div>
             </div>
         `;
     }
 
-    function resourceCardsHtml(sentOnly = false) {
-        const split = buildResourceSplit(sentOnly);
-        return '<div class="twsr-resource-cards">' +
-            resourceMetricCardHtml('wood', 'Wood', '/graphic/holz.png', split) +
-            resourceMetricCardHtml('stone', 'Clay', '/graphic/lehm.png', split) +
-            resourceMetricCardHtml('iron', 'Iron', '/graphic/eisen.png', split) +
+    function mintVillageCardsHtml(sentOnly = false) {
+        const targets = getMintTargetDefinitions();
+
+        return '<div class="twsr-mint-cards">' +
+            targets.map((target, index) => {
+                const split = buildMintResourceSplit(target, sentOnly);
+                const meta = target.groupName
+                    ? escapeHtml(target.groupName)
+                    : escapeHtml(target.name || 'Mint village');
+
+                return `
+                    <div class="twsr-mint-card">
+                        <div class="twsr-mint-card-head">
+                            <div>
+                                <div class="twsr-mint-card-title">${escapeHtml(target.coord)}</div>
+                                <div class="twsr-mint-card-meta">${meta}</div>
+                            </div>
+                            ${targets.length > 1 ? '<div class="twsr-small">#' + (index + 1) + '</div>' : ''}
+                        </div>
+                        ${mintResourceRowHtml('wood', 'Wood', '/graphic/holz.png', split)}
+                        ${mintResourceRowHtml('stone', 'Clay', '/graphic/lehm.png', split)}
+                        ${mintResourceRowHtml('iron', 'Iron', '/graphic/eisen.png', split)}
+                    </div>
+                `;
+            }).join('') +
         '</div>';
     }
 
@@ -2182,7 +2277,7 @@
         if (!checkpoints.length) {
             return `
                 <div class="twsr-rerun-card">
-                    <div class="twsr-rerun-label">Run again</div>
+                    <div class="twsr-rerun-label">Run again <span class="twsr-small">· server time</span></div>
                     <div class="twsr-small">No relay step needed</div>
                 </div>
             `;
@@ -2190,7 +2285,7 @@
 
         return `
             <div class="twsr-rerun-card">
-                <div class="twsr-rerun-label">Run again</div>
+                <div class="twsr-rerun-label">Run again <span class="twsr-small">· server time</span></div>
                 <div class="twsr-rerun-checkpoints">
                     ${checkpoints.map(item =>
                         '<span class="twsr-rerun-pill" title="Estimated relay arrival based on world speed">' +
@@ -2212,7 +2307,7 @@
                 <div class="twsr-finished-title">Finished sending</div>
             </div>
             <div class="twsr-summary-panel">
-                ${resourceCardsHtml(true)}
+                ${mintVillageCardsHtml(true)}
                 ${rerunScheduleHtml(true)}
             </div>
         `;
@@ -2304,17 +2399,10 @@
         const uniqueSources = new Set(plan.map(item => item.sourceId)).size;
         const requestGroups = groupTransfersByTarget(plan);
 
-        const targetSummaryHtml = settings.multiMintEnabled
-            ? '<strong>' + multiMintTargets.length + ' mint villages</strong>'
-            : '<strong>' + escapeHtml(resolvedTarget.coord) + '</strong> ' + escapeHtml(resolvedTarget.name);
-
         let html = `
             <div class="twsr-summary-panel">
-                <div>
-                    ${targetSummaryHtml}
-                    <span class="twsr-small"> &middot; ${uniqueSources} origins &middot; ${requestGroups.length} requests</span>
-                </div>
-                ${resourceCardsHtml(false)}
+                <div class="twsr-small">${uniqueSources} origins &middot; ${requestGroups.length} requests</div>
+                ${mintVillageCardsHtml(false)}
                 ${rerunScheduleHtml(false)}
             </div>
         `;
