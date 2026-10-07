@@ -86,7 +86,7 @@
     'use strict';
 
     const SCRIPT_NAME = 'Twactics Smart Mint Resource Sender';
-    const SCRIPT_VERSION = '1.3.0';
+    const SCRIPT_VERSION = '1.3.1';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 2;
@@ -95,7 +95,7 @@
     const RESOURCE_KEYS = ['wood', 'stone', 'iron'];
     const MERCHANT_CAPACITY = 1000;
     const MIN_TRANSFER_TOTAL = 900;
-    const MERCHANT_MINUTES_PER_FIELD = 10;
+    const MERCHANT_MINUTES_PER_FIELD = 6;
     const WORLD_CONFIG_CACHE_MS = 60 * 60 * 1000;
     const WORLD_CONFIG_STORAGE_KEY = 'twacticsSmartMintResourceSenderWorldConfig';
 
