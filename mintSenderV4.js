@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Twactics
  * License: MIT
  *
- * Twactics Smart Resource Sender
+ * Twactics Smart Mint Resource Sender
  *
  * Creates manual resource transfer plans toward one final target village, or
  * toward multiple saved mint villages mapped to separate Tribal Wars village groups.
@@ -13,7 +13,7 @@
  * - Reads wood, clay, iron, warehouse capacity and available merchants
  * - Resolves one user-entered final target coordinate
  * - Sends villages inside the configured direct radius straight to that target
- * - Uses P1-P10 routing logic for villages outside the direct radius
+ * - Uses distance, warehouse fullness, merchant availability and receiver balance to choose direct sends or relays
  * - Requires every relay village to be closer to the final target than its origin
  * - Uses the configured field radius as the maximum relay-hop distance
  * - Determines warehouse fullness from the fullest individual resource, not an average
@@ -25,19 +25,12 @@
  * - Supports TribalWars.scriptData settings input when enabled in the Script Library
  *
  * Routing overview:
- * - <= direct radius: always DIRECT to final target
- * - Side rule: outside direct radius, if a hypothetical direct send leaves <50% WH, try P5-P10 relay first, then DIRECT fallback
- * - P1: >70% WH, <=18 fields, hypothetical direct leaves <70% -> DIRECT
- * - P2: >70% WH, <=18 fields, hypothetical direct leaves >=70% -> P5/P6 relay, else DIRECT
- * - P3: >70% WH, 18-24 fields, hypothetical direct leaves 50-70% -> P5/P6 relay, else DIRECT
- * - P4: >70% WH, 18-24 fields, hypothetical direct leaves >=70% -> P5/P6 relay, else DIRECT
- * - Other outside-radius origins use P5-P10
- * - P5: receiver <70% WH + merchants at home
- * - P6: receiver <70% WH
- * - P7: resource-imbalanced receiver + merchants at home
- * - P8: resource-imbalanced receiver
- * - P9: receiver with safe warehouse room + merchants at home
- * - P10: receiver with safe warehouse room
+ * - Villages inside the direct radius send straight to the configured mint village
+ * - Villages farther away first try to move resources through a useful village closer to the mint
+ * - High/full origins favor relay receivers with warehouse room, with available merchants preferred
+ * - Resource-imbalanced receivers can be used when they have useful room for the origin's fullest resources
+ * - A relay receiver must stay below the configured safe warehouse ceiling
+ * - If no useful relay is available, the remaining resources may be requested directly to the mint village
  *
  * Important warehouse rule:
  *   WH% = max(wood, clay, iron) / warehouse capacity.
@@ -92,10 +85,8 @@
 (async function twacticsSmartResourceSender() {
     'use strict';
 
-    console.log('[Twactics Smart Resource Sender v1.1.0] Starting...');
-
-    const SCRIPT_NAME = 'Twactics Smart Resource Sender';
-    const SCRIPT_VERSION = '1.1.0';
+    const SCRIPT_NAME = 'Twactics Smart Mint Resource Sender';
+    const SCRIPT_VERSION = '1.2.0';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 2;
@@ -147,7 +138,6 @@
     try {
         settings = loadSettings();
     } catch (error) {
-        console.error('[Twactics Smart Resource Sender] Failed loading settings:', error);
         settings = { ...DEFAULTS };
     }
 
@@ -178,7 +168,6 @@
             try {
                 return JSON.parse(TribalWars.scriptData);
             } catch (error) {
-                console.warn(SCRIPT_NAME + ' could not parse TribalWars.scriptData:', error);
                 return null;
             }
         }
@@ -196,7 +185,6 @@
                 localSettings = parsed && parsed.settings ? parsed.settings : parsed;
             }
         } catch (error) {
-            console.warn(SCRIPT_NAME + ' could not read saved settings:', error);
         }
 
         // Preserve settings from the earlier prototype if the new key has not been used yet.
@@ -227,7 +215,6 @@
         try {
             localStorage.setItem(getWorldKey(SETTINGS_STORAGE_KEY), JSON.stringify(data));
         } catch (error) {
-            console.warn(SCRIPT_NAME + ' could not save local settings:', error);
         }
 
         if (typeof TribalWars !== 'undefined') {
@@ -1545,13 +1532,13 @@
                         <select class="twsr-select" data-twsr-multi-group>
                             ${groupOptionsHtml(mapping.groupId, mapping.groupName)}
                         </select>
-                        <div class="twsr-hint">Only villages in this group are used</div>
+                        <div class="twsr-hint">Villages in this group send toward the mint village on the right</div>
                     </div>
                     <div>
                         <label class="twsr-label">Mint village</label>
                         <input class="twsr-input" data-twsr-multi-target type="text"
                             value="${escapeHtml(mapping.targetCoord || '')}" placeholder="454|598">
-                        <div class="twsr-hint">Final target for this group</div>
+                        <div class="twsr-hint">Final mint destination for this group</div>
                     </div>
                 </div>
             `;
@@ -1585,7 +1572,6 @@
             settings = getSettingsFromUi();
             saveSettings(settings);
         } catch (error) {
-            console.warn('[' + SCRIPT_NAME + '] Could not auto-save UI settings:', error);
         }
     }
 
@@ -1603,19 +1589,19 @@
         box.id = SCRIPT_ID;
 
         const infoText = {
-            target: 'The final village all resources are ultimately moving toward. Villages inside the direct radius send straight here. Relay candidates are always required to be closer to this final target than their origin.',
-            radius: 'Two uses: (1) every origin at or inside this distance from the final target sends directly; (2) a relay candidate must be within this many fields of the origin. P1-P4 still use the fixed 18 and 24 field bands.',
-            keep: 'Percentage of each resource warehouse capacity that direct and relay sends protect in the origin. 0% reproduces the original sender behavior of using all sendable resources allowed by merchants and ratio.',
-            trigger: 'WH fullness is based on the fullest individual resource. At 70%, a 400,000 warehouse becomes 70% full as soon as wood, clay OR iron reaches 280,000.',
-            imbalance: 'P7/P8 consider a village imbalanced when the difference between its fullest and emptiest resource reaches this many percentage points of warehouse capacity.',
-            safe: 'P9/P10 may use a receiver only while its projected fullest resource stays below this ceiling. Planned incoming relay resources count toward this safety calculation.'
+            target: 'The mint village you ultimately want the resources to reach. Villages close enough will request resources directly into this village. Villages farther away can first move resources into relay villages that are closer to the mint. In normal single-target mode this field automatically starts as the village you are currently viewing.',
+            radius: 'Sets both the direct range and the maximum relay-step distance. A village inside this distance from the mint requests directly to the mint. A village farther away may use a relay, but that relay must also be within this many fields of the origin and must move the resources closer to the mint.',
+            keep: 'Protects this percentage of warehouse capacity for EACH resource in every origin. Example: with a 400,000 warehouse and Keep WH% = 10, the script keeps at least 40,000 wood, 40,000 clay and 40,000 iron in the origin before planning requests.',
+            trigger: 'Controls when a village is treated as highly filled. WH% is based on the single fullest resource, not the average of all three. Example: with a 400,000 warehouse and threshold 70%, a village reaches the threshold as soon as wood, clay OR iron reaches 280,000.',
+            imbalance: 'Controls when a potential relay village is considered resource-imbalanced. The script compares its fullest and emptiest resource as percentages of warehouse capacity. Example: 80% wood and 60% iron is a 20 percentage-point gap.',
+            safe: 'Maximum projected fill allowed for any single resource in a relay receiver. The script counts both resources already in the village and relay resources planned to arrive. Example: with a 400,000 warehouse and a 90% ceiling, no resource should be planned above 360,000.'
         };
 
         box.innerHTML = `
             <div class="twsr-header">
                 <div class="twsr-title">
                     <span>${escapeHtml(SCRIPT_NAME + ' ' + SCRIPT_VERSION)}</span>
-                    <span class="twsr-subtitle">Target-first routing with grouped market requests</span>
+                    <span class="twsr-subtitle">Smart direct and relay routing for mint resources</span>
                 </div>
                 <button type="button" class="twsr-close">x</button>
             </div>
@@ -1623,7 +1609,7 @@
                 <div class="twsr-quick-help">
                     <span class="twsr-pill">Single or multiple mint targets</span>
                     <span class="twsr-pill">WH% = fullest resource</span>
-                    <span class="twsr-pill">Closer-to-target relays only</span>
+                    <span class="twsr-pill">Relays always move resources closer</span>
                     <span class="twsr-pill">Direct ratio 28 / 30 / 25</span>
                     <span class="twsr-pill">Minimum 900 resources / send</span>
                     <span class="twsr-pill">One manual request per target</span>
@@ -1636,7 +1622,7 @@
                                 <input id="strr-multi-enabled" type="checkbox" ${settings.multiMintEnabled ? 'checked' : ''}>
                                 <strong>Multiple mint villages</strong>
                             </label>
-                            <span class="twsr-small">Map one Tribal Wars village group to each mint village. Saved per world.</span>
+                            <span class="twsr-small">Assign one Tribal Wars village group to each mint village. The setup is saved automatically per world.</span>
                         </div>
                         <div id="strr-multi-config" class="twsr-multi-config">
                             <div class="twsr-multi-toolbar">
@@ -1647,7 +1633,7 @@
                                     <div class="twsr-hint">1-10 mappings</div>
                                 </div>
                                 <div class="twsr-small">
-                                    Mapping order also decides precedence if two selected groups overlap. A village is only used by the first mapping that contains it.
+                                    If selected groups overlap, a village is only used by the first mapping that contains it. This prevents the same village from being planned twice.
                                 </div>
                             </div>
                             <div id="strr-multi-rows"></div>
@@ -1732,10 +1718,7 @@
             getRequestGroups: () => groupTransfersByTarget(plan),
             getVillages: () => villages.slice(),
             getVillageGroups: () => villageGroups.slice(),
-            getMultiMintTargets: () => multiMintTargets.slice(),
-            getDiagnosticSnapshot: buildDiagnosticSnapshot,
-            copyDiagnosticReport,
-            downloadDiagnosticJson
+            getMultiMintTargets: () => multiMintTargets.slice()
         };
     }
 
@@ -1809,10 +1792,6 @@
         villages = allVillages;
         refreshMultiMintGroupOptions();
 
-        if (overlapSkips.length) {
-            console.warn('[' + SCRIPT_NAME + '] Multi-mint overlapping group villages skipped:', overlapSkips);
-        }
-
         return sets;
     }
 
@@ -1827,7 +1806,6 @@
             const groupVillages = sets.get(String(mapping.groupId)) || [];
 
             if (!groupVillages.length) {
-                console.warn('[' + SCRIPT_NAME + '] No unique villages left for mapping', mapping);
                 continue;
             }
 
@@ -1904,7 +1882,6 @@
                 'success'
             );
         } catch (error) {
-            console.error('[' + SCRIPT_NAME + ']', error);
             setStatus(error && error.message ? error.message : String(error), 'error');
             if (output) output.innerHTML = '';
         } finally {
@@ -1912,185 +1889,159 @@
         }
     }
 
-    function buildDiagnosticSnapshot() {
-        const direct = plan.filter(item => item.kind === 'direct');
-        const relay = plan.filter(item => item.kind === 'relay');
+    function emptyResourceSummary() {
+        return { wood: 0, stone: 0, iron: 0 };
+    }
 
-        return {
-            generatedAt: new Date().toISOString(),
-            script: {
-                name: SCRIPT_NAME,
-                version: SCRIPT_VERSION
-            },
-            world: typeof game_data !== 'undefined' ? game_data.world : null,
-            settings: { ...settings },
-            mode: settings.multiMintEnabled ? 'multi-mint' : 'single-target',
-            target: resolvedTarget ? { ...resolvedTarget } : null,
-            multiMintTargets: multiMintTargets.map(item => ({
-                index: item.index,
-                groupId: item.groupId,
+    function addTransferToResourceSummary(summary, transfer) {
+        summary.wood += Math.max(0, Number(transfer.wood) || 0);
+        summary.stone += Math.max(0, Number(transfer.stone) || 0);
+        summary.iron += Math.max(0, Number(transfer.iron) || 0);
+        return summary;
+    }
+
+    function resourceSummaryHtml(resources) {
+        const values = resources || emptyResourceSummary();
+        return `
+            <div class="twsr-resource-summary-line">
+                <span class="twsr-resource-summary-item">
+                    <img src="/graphic/holz.png" alt="Wood" title="Wood">
+                    <span>${fmt(values.wood)}</span>
+                </span>
+                <span class="twsr-resource-summary-item">
+                    <img src="/graphic/lehm.png" alt="Clay" title="Clay">
+                    <span>${fmt(values.stone)}</span>
+                </span>
+                <span class="twsr-resource-summary-item">
+                    <img src="/graphic/eisen.png" alt="Iron" title="Iron">
+                    <span>${fmt(values.iron)}</span>
+                </span>
+            </div>
+        `;
+    }
+
+    function getMintTargetDefinitions() {
+        if (settings.multiMintEnabled) {
+            return multiMintTargets.map(item => ({
+                key: String(item.target.id || item.target.coord),
+                id: item.target.id,
+                coord: item.target.coord,
+                name: item.target.name,
                 groupName: item.groupName,
-                target: { ...item.target },
-                villageCount: item.villageCount,
-                transferCount: item.transferCount
-            })),
-            multiMintOverlapSkips: multiMintOverlapSkips.slice(),
-            summary: {
-                villagesLoaded: villages.length,
-                plannedTransfers: plan.length,
-                groupedRequests: groupTransfersByTarget(plan).length,
-                uniqueOrigins: new Set(plan.map(item => item.sourceId)).size,
-                directTransfers: direct.length,
-                relayTransfers: relay.length,
-                totalResources: plan.reduce((sum, item) => sum + item.total, 0),
-                directResources: direct.reduce((sum, item) => sum + item.total, 0),
-                relayResources: relay.reduce((sum, item) => sum + item.total, 0)
-            },
-            transfers: plan.map((item, index) => ({
-                index: index + 1,
-                type: item.kind,
-                rule: item.rule,
-                note: item.note,
-                receiverPriority: item.receiverPriority,
-                receiverLabel: item.receiverLabel,
-                sourceId: item.sourceId,
-                sourceName: item.sourceName,
-                sourceCoord: item.sourceCoord,
-                sourceToFinal: item.sourceToTarget,
-                targetId: item.targetId,
-                targetName: item.targetName,
-                targetCoord: item.targetCoord,
-                receiverToFinal: item.targetToFinal,
-                legDistance: item.legDistance,
-                wood: item.wood,
-                clay: item.stone,
-                iron: item.iron,
-                total: item.total,
-                merchantsUsed: item.merchants,
-                sourceWhBeforePct: item.sourceBeforePct,
-                sourceWhAfterPct: item.sourceAfterPct,
-                receiverWhBeforePct: item.receiverBeforePct ?? null,
-                receiverWhAfterPct: item.receiverAfterPct ?? null,
-                sourceGroupId: item.sourceGroupId || null,
-                sourceGroupName: item.sourceGroupName || null,
-                finalTargetCoord: item.finalTargetCoord || (resolvedTarget ? resolvedTarget.coord : null),
-                sent: item.sent
-            })),
-            villages: villages.map(v => ({
-                id: v.id,
-                name: v.name,
-                coord: v.coord,
-                wood: v.wood,
-                clay: v.stone,
-                iron: v.iron,
-                warehouse: v.warehouse,
-                availableMerchants: v.availableMerchants,
-                totalMerchants: v.totalMerchants,
-                whMaxPct: maxFill(v)
-            }))
-        };
-    }
-
-    function buildDiagnosticText(snapshot) {
-        const lines = [];
-        lines.push('# Twactics Smart Resource Sender - Test Report');
-        lines.push('');
-        lines.push('Generated: ' + snapshot.generatedAt);
-        lines.push('World: ' + (snapshot.world || 'unknown'));
-        lines.push('Script: ' + snapshot.script.name + ' ' + snapshot.script.version);
-        lines.push('');
-        lines.push('## Settings');
-        lines.push(JSON.stringify(snapshot.settings, null, 2));
-        lines.push('');
-        lines.push(snapshot.mode === 'multi-mint' ? '## Mint targets' : '## Target');
-        lines.push(JSON.stringify(snapshot.mode === 'multi-mint' ? snapshot.multiMintTargets : snapshot.target, null, 2));
-        lines.push('');
-        lines.push('## Summary');
-        lines.push(JSON.stringify(snapshot.summary, null, 2));
-        lines.push('');
-        lines.push('## Transfer plan');
-
-        snapshot.transfers.forEach(t => {
-            lines.push(
-                [
-                    '#' + t.index,
-                    t.type.toUpperCase(),
-                    t.rule + (t.receiverPriority ? '/P' + t.receiverPriority : ''),
-                    t.sourceCoord + ' -> ' + t.targetCoord,
-                    'origin->final ' + Number(t.sourceToFinal).toFixed(1),
-                    'receiver->final ' + Number(t.receiverToFinal).toFixed(1),
-                    'leg ' + Number(t.legDistance).toFixed(1),
-                    'W/C/I ' + t.wood + '/' + t.clay + '/' + t.iron,
-                    'total ' + t.total,
-                    'merchants ' + t.merchantsUsed,
-                    'origin WH ' + (t.sourceWhBeforePct * 100).toFixed(1) + '% -> ' + (t.sourceWhAfterPct * 100).toFixed(1) + '%',
-                    t.receiverWhBeforePct !== null
-                        ? 'receiver WH ' + (t.receiverWhBeforePct * 100).toFixed(1) + '% -> ' + (t.receiverWhAfterPct * 100).toFixed(1) + '%'
-                        : '',
-                    t.note || ''
-                ].filter(Boolean).join(' | ')
-            );
-        });
-
-        lines.push('');
-        lines.push('## Raw JSON');
-        lines.push(JSON.stringify(snapshot, null, 2));
-
-        return lines.join('\n');
-    }
-
-    function logDiagnosticSnapshot() {
-        const snapshot = buildDiagnosticSnapshot();
-        console.group('[Twactics Smart Resource Sender] Routing test');
-        console.log('Settings:', snapshot.settings);
-        console.log('Target:', snapshot.target);
-        console.log('Summary:', snapshot.summary);
-        console.table(snapshot.transfers.map(t => ({
-            '#': t.index,
-            Type: t.type,
-            Rule: t.receiverPriority ? t.rule + '/P' + t.receiverPriority : t.rule,
-            Origin: t.sourceCoord,
-            Destination: t.targetCoord,
-            'Origin->Final': Number(t.sourceToFinal).toFixed(1),
-            'Receiver->Final': Number(t.receiverToFinal).toFixed(1),
-            Leg: Number(t.legDistance).toFixed(1),
-            Wood: t.wood,
-            Clay: t.clay,
-            Iron: t.iron,
-            Total: t.total,
-            Merchants: t.merchantsUsed,
-            'WH before': (t.sourceWhBeforePct * 100).toFixed(1) + '%',
-            'WH after': (t.sourceWhAfterPct * 100).toFixed(1) + '%'
-        })));
-        console.log('Full diagnostic snapshot:', snapshot);
-        console.groupEnd();
-        return snapshot;
-    }
-
-    async function copyDiagnosticReport() {
-        const snapshot = logDiagnosticSnapshot();
-        const report = buildDiagnosticText(snapshot);
-
-        try {
-            await navigator.clipboard.writeText(report);
-            if (window.UI?.SuccessMessage) UI.SuccessMessage('Test report copied to clipboard.');
-        } catch (error) {
-            console.error('[' + SCRIPT_NAME + '] Clipboard export failed:', error);
-            showInfoDialog('Test report', report);
+                groupId: item.groupId
+            }));
         }
+
+        if (!resolvedTarget) return [];
+        return [{
+            key: String(resolvedTarget.id || resolvedTarget.coord),
+            id: resolvedTarget.id,
+            coord: resolvedTarget.coord,
+            name: resolvedTarget.name,
+            groupName: '',
+            groupId: ''
+        }];
     }
 
-    function downloadDiagnosticJson() {
-        const snapshot = logDiagnosticSnapshot();
-        const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = 'twactics-resource-sender-test-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    function transferBelongsToMint(transfer, target) {
+        if (settings.multiMintEnabled) {
+            if (transfer.finalTargetId !== undefined && transfer.finalTargetId !== null) {
+                return String(transfer.finalTargetId) === String(target.id);
+            }
+            return String(transfer.finalTargetCoord || '') === String(target.coord);
+        }
+
+        return true;
+    }
+
+    function buildMintSummaries(sentOnly = false) {
+        return getMintTargetDefinitions().map(target => {
+            const matching = plan.filter(transfer =>
+                transferBelongsToMint(transfer, target) &&
+                (!sentOnly || transfer.sent)
+            );
+
+            const direct = emptyResourceSummary();
+            const relay = emptyResourceSummary();
+
+            matching.forEach(transfer => {
+                if (transfer.kind === 'relay') addTransferToResourceSummary(relay, transfer);
+                else addTransferToResourceSummary(direct, transfer);
+            });
+
+            return {
+                target,
+                direct,
+                relay,
+                directTransfers: matching.filter(transfer => transfer.kind !== 'relay').length,
+                relayTransfers: matching.filter(transfer => transfer.kind === 'relay').length
+            };
+        });
+    }
+
+    function getRelayRerunAdvice(sentOnly = false) {
+        const relays = plan.filter(transfer =>
+            transfer.kind === 'relay' &&
+            (!sentOnly || transfer.sent)
+        );
+
+        if (!relays.length) {
+            return 'No relay step is used in this batch. You do not need to rerun the script for relay progression; create a fresh plan whenever village resources or merchants change.';
+        }
+
+        const longestLeg = Math.max(...relays.map(transfer => Number(transfer.legDistance) || 0));
+        return 'Run the script again after the relay transports from this batch have arrived. The longest relay hop is ' +
+            longestLeg.toFixed(1) +
+            ' fields. Once those deliveries have landed, refresh/create a new plan so the staged resources can continue toward the mint village' +
+            (getMintTargetDefinitions().length > 1 ? 's' : '') + '.';
+    }
+
+    function mintSummaryCardsHtml(sentOnly = false) {
+        const summaries = buildMintSummaries(sentOnly);
+        if (!summaries.length) return '';
+
+        return '<div class="twsr-mint-summary-grid">' +
+            summaries.map(summary => {
+                const groupLine = summary.target.groupName
+                    ? '<div class="twsr-small">' + escapeHtml(summary.target.groupName) + ' (#' + escapeHtml(summary.target.groupId) + ')</div>'
+                    : '';
+
+                return '<div class="twsr-mint-summary-card">' +
+                    '<div class="twsr-mint-summary-title">' +
+                        escapeHtml(summary.target.name || 'Mint village') + ' (' + escapeHtml(summary.target.coord) + ')' +
+                    '</div>' +
+                    groupLine +
+                    '<div class="twsr-small" style="margin-top:6px;"><strong>Directly to mint in this batch</strong></div>' +
+                    resourceSummaryHtml(summary.direct) +
+                    (summary.relayTransfers
+                        ? '<div class="twsr-small" style="margin-top:8px;"><strong>Staged through relay villages first</strong></div>' +
+                          resourceSummaryHtml(summary.relay)
+                        : '<div class="twsr-small" style="margin-top:8px;">No relay resources for this mint in this batch.</div>') +
+                '</div>';
+            }).join('') +
+        '</div>';
+    }
+
+    function renderFinishedSummary() {
+        const output = document.querySelector('#strr-output');
+        if (!output) return;
+
+        output.innerHTML = `
+            <div class="twsr-finished">
+                <div class="twsr-finished-title">Finished sending</div>
+                <div>All requests in this plan have been completed.</div>
+            </div>
+            <div class="twsr-summary-panel">
+                <div><strong>Resources requested directly to the mint village${getMintTargetDefinitions().length > 1 ? 's' : ''}</strong></div>
+                ${mintSummaryCardsHtml(true)}
+                <div class="twsr-next-run"><strong>When to run again:</strong> ${escapeHtml(getRelayRerunAdvice(true))}</div>
+            </div>
+        `;
+
+        setStatus('Finished sending. All requests in this plan are complete.', 'success');
+        if (window.UI?.SuccessMessage) {
+            UI.SuccessMessage('Finished sending. All requests in this plan are complete.');
+        }
     }
 
     function groupTransfersByTarget(transfers) {
@@ -2158,8 +2109,10 @@
 
     function getRequestGroupTypeLabel(group) {
         if (!group || !group.kinds || !group.kinds.length) return '';
-        if (group.kinds.length === 1) return group.kinds[0].toUpperCase();
-        return group.kinds.map(kind => kind.toUpperCase()).join(' + ');
+        if (group.kinds.length === 1) {
+            return group.kinds[0] === 'relay' ? 'Relay' : 'Direct to mint';
+        }
+        return 'Direct + relay';
     }
 
     function renderPlan() {
@@ -2169,21 +2122,12 @@
 
         const direct = plan.filter(item => item.kind === 'direct');
         const relay = plan.filter(item => item.kind === 'relay');
-        const total = plan.reduce((sum, item) => sum + item.total, 0);
-        const directTotal = direct.reduce((sum, item) => sum + item.total, 0);
-        const relayTotal = relay.reduce((sum, item) => sum + item.total, 0);
         const uniqueSources = new Set(plan.map(item => item.sourceId)).size;
         const requestGroups = groupTransfersByTarget(plan);
 
         const targetSummaryHtml = settings.multiMintEnabled
-            ? '<div><strong>Multi-mint targets:</strong></div>' +
-                multiMintTargets.map(item =>
-                    '<div class="twsr-small" style="margin-top:3px;">#' + (item.index + 1) + ' ' +
-                    escapeHtml(item.groupName) + ' (#' + escapeHtml(item.groupId) + ') &rarr; ' +
-                    escapeHtml(item.target.name) + ' (' + escapeHtml(item.target.coord) + ') &middot; ' +
-                    item.villageCount + ' village(s)</div>'
-                ).join('')
-            : '<div><strong>Final target:</strong> ' + escapeHtml(resolvedTarget.name) + ' (' + escapeHtml(resolvedTarget.coord) + ')</div>';
+            ? '<div><strong>Mint setup:</strong> ' + multiMintTargets.length + ' mint villages</div>'
+            : '<div><strong>Mint village:</strong> ' + escapeHtml(resolvedTarget.name) + ' (' + escapeHtml(resolvedTarget.coord) + ')</div>';
 
         let html = `
             <div class="twsr-summary-panel">
@@ -2191,17 +2135,14 @@
                 <div class="twsr-small" style="margin-top:5px;">
                     ${villages.length} villages loaded &middot;
                     ${uniqueSources} origins used &middot;
-                    ${relay.length} relay transfer(s) / ${fmt(relayTotal)} resources &middot;
-                    ${direct.length} direct transfer(s) / ${fmt(directTotal)} resources &middot;
-                    ${requestGroups.length} grouped request(s) &middot;
-                    ${fmt(total)} total planned resources
+                    ${requestGroups.length} request(s) to complete
                 </div>
-                <div class="twsr-small" style="margin-top:6px;">
-                    Transfers to the same destination are grouped into one Tribal Wars market request. Relay destinations are requested separately from the final target. For multi-hop movement, complete relay requests and rerun after resources arrive.
-                </div>
-                <div class="twsr-buttons" style="margin-top:8px;">
-                    <button id="strr-copy-test" type="button" class="btn">Copy test report</button>
-                    <button id="strr-download-test" type="button" class="btn">Download test JSON</button>
+
+                <div class="twsr-section-title" style="margin-top:10px;">What reaches the mint in this batch</div>
+                ${mintSummaryCardsHtml(false)}
+
+                <div class="twsr-next-run">
+                    <strong>When to run again:</strong> ${escapeHtml(getRelayRerunAdvice(false))}
                 </div>
             </div>
         `;
@@ -2212,16 +2153,16 @@
         }
 
         html += `
-            <div class="twsr-section-title">Grouped request plan</div>
+            <div class="twsr-section-title">Requests to complete</div>
             <div class="twsr-table-wrap">
                 <table class="twsr-table">
                     <thead>
                         <tr>
                             <th>#</th>
-                            <th>Type</th>
-                            <th>Request to</th>
+                            <th>Route</th>
+                            <th>Destination</th>
                             <th>Origins</th>
-                            <th>Max leg</th>
+                            <th>Distance</th>
                             <th class="twsr-resource-head"><img src="/graphic/holz.png" alt="Wood">Wood</th>
                             <th class="twsr-resource-head"><img src="/graphic/lehm.png" alt="Clay">Clay</th>
                             <th class="twsr-resource-head"><img src="/graphic/eisen.png" alt="Iron">Iron</th>
@@ -2236,9 +2177,9 @@
         requestGroups.forEach((group, groupIndex) => {
             const originDetails = group.transfers.map(entry => {
                 const transfer = entry.transfer;
-                const rule = transfer.kind === 'relay' && transfer.receiverPriority
-                    ? transfer.rule + '/P' + transfer.receiverPriority
-                    : transfer.rule;
+                const routeLabel = transfer.kind === 'relay'
+                    ? 'Relay toward mint'
+                    : 'Direct to mint';
 
                 return '<div class="twsr-origin-line">' +
                     '<strong>' + escapeHtml(transfer.sourceCoord) + '</strong> ' +
@@ -2246,7 +2187,7 @@
                     (transfer.sourceGroupName ? ' · ' + escapeHtml(transfer.sourceGroupName) : '') +
                     '</span><br>' +
                     '<span class="twsr-small">' +
-                    escapeHtml(rule) + ' &middot; ' +
+                    escapeHtml(routeLabel) + ' &middot; ' +
                     fmt(transfer.wood) + '/' + fmt(transfer.stone) + '/' + fmt(transfer.iron) +
                     ' &middot; ' + transfer.legDistance.toFixed(1) + ' fields' +
                     '</span></div>';
@@ -2280,11 +2221,6 @@
         html += '</tbody></table></div>';
         output.innerHTML = html;
 
-        output.querySelector('#strr-copy-test')?.addEventListener('click', copyDiagnosticReport);
-        output.querySelector('#strr-download-test')?.addEventListener('click', downloadDiagnosticJson);
-
-        logDiagnosticSnapshot();
-
         const firstButton = output.querySelector('.twsr-send-button:not(:disabled)');
         if (firstButton) firstButton.focus();
     }
@@ -2294,16 +2230,11 @@
         const group = requestGroups.find(item => String(item.targetId) === String(targetId));
 
         if (!group || !group.transfers.length) {
-            console.warn('[' + SCRIPT_NAME + '] Request group no longer exists. Re-rendering plan.', { targetId });
             renderPlan();
             return;
         }
 
         if (sendLocked) {
-            console.warn('[' + SCRIPT_NAME + '] Request ignored because another request is still in progress.', {
-                targetId: group.targetId,
-                targetCoord: group.targetCoord
-            });
             return;
         }
 
@@ -2319,22 +2250,6 @@
 
         const payload = buildCallDataForRequestGroup(group);
 
-        console.log('[' + SCRIPT_NAME + '] grouped market request', {
-            target: group.targetCoord,
-            targetId: group.targetId,
-            originCount: group.transfers.length,
-            origins: group.transfers.map(entry => ({
-                sourceId: entry.transfer.sourceId,
-                sourceCoord: entry.transfer.sourceCoord,
-                wood: entry.transfer.wood,
-                stone: entry.transfer.stone,
-                iron: entry.transfer.iron,
-                total: entry.transfer.total,
-                merchants: entry.transfer.merchants
-            })),
-            total: group.total,
-            payload
-        });
 
         try {
             const response = await postMarketRequest(group.targetId, payload);
@@ -2351,21 +2266,10 @@
                 'Resources requested from ' + group.transfers.length + ' origin(s).'
             );
 
-            console.log('[' + SCRIPT_NAME + '] grouped market request response', {
-                target: group.targetCoord,
-                success: true,
-                response
-            });
 
             setStatus(message, 'success');
             if (window.UI?.SuccessMessage) UI.SuccessMessage(message);
         } catch (error) {
-            console.error('[' + SCRIPT_NAME + '] grouped request failed:', {
-                target: group.targetCoord,
-                targetId: group.targetId,
-                payload,
-                error
-            });
 
             button.textContent = oldText;
             setStatus(
@@ -2381,7 +2285,7 @@
             document.querySelectorAll('.twsr-send-button').forEach(node => { node.disabled = false; });
             const next = document.querySelector('.twsr-send-button:not(:disabled)');
             if (next) next.focus();
-            else setStatus('All visible grouped requests have been completed.', 'success');
+            else renderFinishedSummary();
         }
     }
 
@@ -2424,7 +2328,6 @@
                 }
             }
         } catch (error) {
-            console.error('[' + SCRIPT_NAME + ']', error);
             setStatus(error && error.message ? error.message : String(error), 'error');
             const output = document.querySelector('#strr-output');
             if (output) output.innerHTML = '';
@@ -2441,19 +2344,15 @@
 
         window.twacticsSmartResourceSenderLoaded = false;
 
-        console.log('[Twactics Smart Resource Sender] Rendering UI...');
         renderShell();
-        console.log('[Twactics Smart Resource Sender] UI rendered.');
 
         window.twacticsSmartResourceSenderLoaded = true;
 
         await refreshData(false);
 
-        console.log('[' + SCRIPT_NAME + '] ' + SCRIPT_VERSION + ' loaded successfully');
     } catch (error) {
         window.twacticsSmartResourceSenderLoaded = false;
 
-        console.error('[' + SCRIPT_NAME + '] Startup failed:', error);
 
         const message =
             SCRIPT_NAME +
