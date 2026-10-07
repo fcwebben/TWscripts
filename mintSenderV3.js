@@ -4,11 +4,12 @@
  *
  * Twactics Smart Resource Sender
  *
- * Creates a manual resource transfer plan from the villages in the currently
- * selected Tribal Wars village group toward one specific final target village.
+ * Creates manual resource transfer plans toward one final target village, or
+ * toward multiple saved mint villages mapped to separate Tribal Wars village groups.
  *
  * This script:
- * - Reads production overview data for the currently selected village group
+ * - Reads production overview data for the current group in single-target mode
+ * - Supports a saved multi-mint mode where each configured village group routes to its own mint village
  * - Reads wood, clay, iron, warehouse capacity and available merchants
  * - Resolves one user-entered final target coordinate
  * - Sends villages inside the configured direct radius straight to that target
@@ -64,7 +65,13 @@
  *     "keepWhPct": 0,
  *     "triggerPct": 70,
  *     "imbalanceGapPct": 15,
- *     "safeCeilingPct": 90
+ *     "safeCeilingPct": 90,
+ *     "multiMintEnabled": false,
+ *     "multiMintCount": 2,
+ *     "multiMintMappings": [
+ *       { "groupId": "123", "groupName": "North", "targetCoord": "454|598" },
+ *       { "groupId": "456", "groupName": "South", "targetCoord": "460|620" }
+ *     ]
  *   }
  * }
  */
@@ -85,13 +92,13 @@
 (async function twacticsSmartResourceSender() {
     'use strict';
 
-    console.log('[Twactics Smart Resource Sender v1.0.5] Starting...');
+    console.log('[Twactics Smart Resource Sender v1.1.0] Starting...');
 
     const SCRIPT_NAME = 'Twactics Smart Resource Sender';
-    const SCRIPT_VERSION = '1.0.5';
+    const SCRIPT_VERSION = '1.1.0';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
-    const DATA_VERSION = 1;
+    const DATA_VERSION = 2;
     const SETTINGS_STORAGE_KEY = 'twacticsSmartResourceSenderSettings';
     const LEGACY_STORAGE_KEY = 'smartTargetResourceRouter.settings.v2';
     const RESOURCE_KEYS = ['wood', 'stone', 'iron'];
@@ -120,12 +127,19 @@
         keepWhPct: 0,
         triggerPct: 70,
         imbalanceGapPct: 15,
-        safeCeilingPct: 90
+        safeCeilingPct: 90,
+        multiMintEnabled: false,
+        multiMintCount: 2,
+        multiMintMappings: []
     };
 
     let villages = [];
     let plan = [];
     let resolvedTarget = null;
+    let multiMintTargets = [];
+    let multiMintVillageSets = new Map();
+    let villageGroups = [];
+    let multiMintOverlapSkips = [];
     let sendLocked = false;
     let enterKeyHeld = false;
     let settings;
@@ -199,9 +213,9 @@
         const merged = sanitizeSettings(Object.assign({}, DEFAULTS, localSettings || {}, scriptSettings || {}));
         const currentVillageCoord = getCurrentVillageCoord();
 
-        // Target always starts as the village currently open in Tribal Wars.
-        // Do not reuse a cached target coordinate from an earlier run.
-        if (currentVillageCoord) merged.targetCoord = currentVillageCoord;
+        // Normal single-target mode always starts from the village currently open.
+        // Multi-mint mappings are persistent and must not be replaced by the current village.
+        if (!merged.multiMintEnabled && currentVillageCoord) merged.targetCoord = currentVillageCoord;
 
         return merged;
     }
@@ -393,18 +407,78 @@
         return RESOURCE_KEYS.reduce((sum, key) => sum + Math.max(0, Number(amount[key]) || 0), 0);
     }
 
-    function buildOverviewUrl() {
+    function getCurrentGroupId() {
+        const currentParams = new URLSearchParams(location.search);
+        const group = currentParams.get('group');
+        if (group !== null && group !== '') return String(group);
+        if (game_data?.group_id !== undefined && game_data?.group_id !== null && game_data.group_id !== '') {
+            return String(game_data.group_id);
+        }
+        return '';
+    }
+
+    function buildOverviewUrl(groupId) {
         const sitter = Number(game_data?.player?.sitter || 0) > 0;
         const sitterPart = sitter ? `t=${encodeURIComponent(game_data.player.id)}&` : '';
-        const currentParams = new URLSearchParams(location.search);
-        const group = currentParams.get('group') || game_data?.group_id || '';
-        const groupPart = group !== '' && group !== null ? `&group=${encodeURIComponent(group)}` : '';
+        const selectedGroup = groupId === undefined || groupId === null ? getCurrentGroupId() : String(groupId);
+        const groupPart = selectedGroup !== '' ? `&group=${encodeURIComponent(selectedGroup)}` : '';
         return `game.php?${sitterPart}screen=overview_villages&mode=prod&page=-1${groupPart}`;
     }
 
-    async function loadVillageData() {
-        const html = await fetchText(buildOverviewUrl(), 'Production overview');
+    function mergeVillageGroupsFromDocument(doc) {
+        const found = new Map(villageGroups.map(group => [String(group.id), group]));
+
+        function addGroup(id, name) {
+            if (id === undefined || id === null || String(id) === '') return;
+            const key = String(id);
+            const cleanName = String(name || '').replace(/\s+/g, ' ').trim();
+            if (!found.has(key) || (cleanName && /^Group\s+\d+$/i.test(found.get(key).name || ''))) {
+                found.set(key, {
+                    id: key,
+                    name: cleanName || (key === '0' ? 'All villages' : 'Group ' + key)
+                });
+            }
+        }
+
+        const currentGroupId = getCurrentGroupId();
+        if (currentGroupId) addGroup(currentGroupId, 'Current group');
+
+        const scope = doc || document;
+
+        scope.querySelectorAll('select').forEach(select => {
+            const marker = ((select.name || '') + ' ' + (select.id || '') + ' ' + (select.className || '')).toLowerCase();
+            if (!marker.includes('group')) return;
+
+            select.querySelectorAll('option').forEach(option => {
+                const value = option.value;
+                if (/^\d+$/.test(String(value || ''))) addGroup(value, option.textContent);
+            });
+        });
+
+        scope.querySelectorAll('a[href*="group="]').forEach(link => {
+            try {
+                const url = new URL(link.getAttribute('href'), location.origin);
+                const id = url.searchParams.get('group');
+                if (id !== null && /^\d+$/.test(id)) addGroup(id, link.textContent);
+            } catch (_) {}
+        });
+
+        if (!found.has('0')) found.set('0', { id: '0', name: 'All villages' });
+
+        villageGroups = Array.from(found.values()).sort((a, b) => {
+            if (a.id === '0') return 1;
+            if (b.id === '0') return -1;
+            return (a.name || '').localeCompare(b.name || '') || Number(a.id) - Number(b.id);
+        });
+
+        return villageGroups;
+    }
+
+    async function loadVillageData(groupId) {
+        const selectedGroupId = groupId === undefined || groupId === null ? getCurrentGroupId() : String(groupId);
+        const html = await fetchText(buildOverviewUrl(selectedGroupId), 'Production overview' + (selectedGroupId ? ' group ' + selectedGroupId : ''));
         const doc = new DOMParser().parseFromString(html, 'text/html');
+        mergeVillageGroupsFromDocument(doc);
 
         if (doc.querySelector('.mheader.ressources')) {
             throw new Error('This version is built for desktop view. Switch to desktop view and run it again.');
@@ -454,7 +528,8 @@
                 iron: parseNumber(ironEl.textContent),
                 warehouse,
                 availableMerchants: parseNumber(merchantMatch[1]),
-                totalMerchants: parseNumber(merchantMatch[2])
+                totalMerchants: parseNumber(merchantMatch[2]),
+                sourceGroupId: selectedGroupId
             });
         }
 
@@ -463,15 +538,51 @@
     }
 
     function sanitizeSettings(raw) {
+        raw = raw || {};
         const target = parseCoord(raw.targetCoord);
+        const rawMappings = Array.isArray(raw.multiMintMappings) ? raw.multiMintMappings : [];
+        const multiMintCount = clamp(
+            Number(raw.multiMintCount) || rawMappings.length || DEFAULTS.multiMintCount,
+            1,
+            10
+        );
+
+        const multiMintMappings = [];
+        for (let index = 0; index < multiMintCount; index++) {
+            const mapping = rawMappings[index] || {};
+            const parsedTarget = parseCoord(mapping.targetCoord);
+            multiMintMappings.push({
+                groupId: mapping.groupId !== undefined && mapping.groupId !== null ? String(mapping.groupId) : '',
+                groupName: String(mapping.groupName || '').trim(),
+                targetCoord: parsedTarget?.coord || String(mapping.targetCoord || '').trim()
+            });
+        }
+
         return {
             targetCoord: target?.coord || String(raw.targetCoord || '').trim(),
             directRadius: clamp(Number(raw.directRadius) || DEFAULTS.directRadius, 1, 100),
             keepWhPct: clamp(Number(raw.keepWhPct) || 0, 0, 99),
             triggerPct: clamp(Number(raw.triggerPct) || DEFAULTS.triggerPct, 1, 99),
             imbalanceGapPct: clamp(Number(raw.imbalanceGapPct) || DEFAULTS.imbalanceGapPct, 1, 99),
-            safeCeilingPct: clamp(Number(raw.safeCeilingPct) || DEFAULTS.safeCeilingPct, 1, 99)
+            safeCeilingPct: clamp(Number(raw.safeCeilingPct) || DEFAULTS.safeCeilingPct, 1, 99),
+            multiMintEnabled: raw.multiMintEnabled === true,
+            multiMintCount,
+            multiMintMappings
         };
+    }
+
+    function getMultiMintMappingsFromUi() {
+        const rows = Array.from(document.querySelectorAll('.twsr-multi-row'));
+        return rows.map(row => {
+            const groupSelect = row.querySelector('[data-twsr-multi-group]');
+            const targetInput = row.querySelector('[data-twsr-multi-target]');
+            const selectedOption = groupSelect?.selectedOptions?.[0];
+            return {
+                groupId: String(groupSelect?.value || ''),
+                groupName: String(selectedOption?.dataset?.groupName || selectedOption?.textContent || '').trim(),
+                targetCoord: String(targetInput?.value || '').trim()
+            };
+        });
     }
 
     function getSettingsFromUi() {
@@ -481,7 +592,10 @@
             keepWhPct: document.querySelector('#strr-keep')?.value,
             triggerPct: document.querySelector('#strr-trigger')?.value,
             imbalanceGapPct: document.querySelector('#strr-imbalance')?.value,
-            safeCeilingPct: document.querySelector('#strr-safe')?.value
+            safeCeilingPct: document.querySelector('#strr-safe')?.value,
+            multiMintEnabled: Boolean(document.querySelector('#strr-multi-enabled')?.checked),
+            multiMintCount: document.querySelector('#strr-multi-count')?.value,
+            multiMintMappings: getMultiMintMappingsFromUi()
         });
     }
 
@@ -499,11 +613,11 @@
         };
     }
 
-    async function resolveTarget(coord) {
+    async function resolveTarget(coord, sourceVillages = villages) {
         const parsed = parseCoord(coord);
         if (!parsed) throw new Error('Enter a valid target coordinate, for example 454|598.');
 
-        const local = villages.find(v => v.coord === parsed.coord);
+        const local = sourceVillages.find(v => v.coord === parsed.coord);
         if (local) {
             return {
                 id: String(local.id),
@@ -1058,7 +1172,8 @@
                 padding: 0;
                 font-weight: bold;
             }
-            #${SCRIPT_ID} .twsr-input {
+            #${SCRIPT_ID} .twsr-input,
+            #${SCRIPT_ID} .twsr-select {
                 width: 100%;
                 padding: 6px;
                 border: 1px solid #b99351;
@@ -1067,9 +1182,48 @@
                 color: #2f1b00;
                 outline: none;
             }
-            #${SCRIPT_ID} .twsr-input:focus {
+            #${SCRIPT_ID} .twsr-input:focus,
+            #${SCRIPT_ID} .twsr-select:focus {
                 border-color: #7d510f;
                 box-shadow: 0 0 0 2px rgba(125,81,15,0.16);
+            }
+            #${SCRIPT_ID} .twsr-mode-panel {
+                margin-bottom: 10px;
+                padding: 9px;
+                border: 1px solid #d0ad6a;
+                border-radius: 7px;
+                background: #fffaf0;
+            }
+            #${SCRIPT_ID} .twsr-mode-row {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            #${SCRIPT_ID} .twsr-multi-config {
+                margin-top: 9px;
+                padding-top: 9px;
+                border-top: 1px solid #ead8b3;
+            }
+            #${SCRIPT_ID} .twsr-multi-toolbar {
+                display: grid;
+                grid-template-columns: minmax(160px, 220px) 1fr;
+                gap: 8px;
+                align-items: end;
+                margin-bottom: 8px;
+            }
+            #${SCRIPT_ID} .twsr-multi-row {
+                display: grid;
+                grid-template-columns: 52px minmax(180px, 1fr) minmax(150px, 190px);
+                gap: 8px;
+                align-items: end;
+                padding: 7px 0;
+                border-top: 1px solid #ead8b3;
+            }
+            #${SCRIPT_ID} .twsr-multi-row:first-child { border-top: 0; }
+            #${SCRIPT_ID} .twsr-multi-index {
+                font-weight: bold;
+                padding-bottom: 7px;
             }
             #${SCRIPT_ID} .twsr-buttons {
                 display: flex;
@@ -1335,7 +1489,7 @@
 
     function fieldHtml(id, label, value, hint, infoKey, type = 'number', attrs = '') {
         return `
-            <div>
+            <div data-twsr-field="${escapeHtml(id)}">
                 <div class="twsr-label-row">
                     <label class="twsr-label" for="${id}">${escapeHtml(label)}</label>
                     <button type="button" class="twsr-info-button" data-twsr-info="${escapeHtml(infoKey)}">?</button>
@@ -1346,7 +1500,97 @@
         `;
     }
 
+    function getGroupName(groupId) {
+        const group = villageGroups.find(item => String(item.id) === String(groupId));
+        return group?.name || (String(groupId) === '0' ? 'All villages' : 'Group ' + groupId);
+    }
+
+    function groupOptionsHtml(selectedId, selectedName) {
+        const selectedKey = String(selectedId || '');
+        const options = villageGroups.slice();
+
+        if (selectedKey && !options.some(group => String(group.id) === selectedKey)) {
+            options.push({
+                id: selectedKey,
+                name: selectedName || ('Group ' + selectedKey)
+            });
+        }
+
+        let html = '<option value="">Select village group...</option>';
+        options.forEach(group => {
+            const id = String(group.id);
+            const name = group.name || ('Group ' + id);
+            html += '<option value="' + escapeHtml(id) + '" data-group-name="' + escapeHtml(name) + '"' +
+                (id === selectedKey ? ' selected' : '') + '>' +
+                escapeHtml(name) + ' (#' + escapeHtml(id) + ')</option>';
+        });
+        return html;
+    }
+
+    function renderMultiMintRows(mappings, count) {
+        const container = document.querySelector('#strr-multi-rows');
+        if (!container) return;
+
+        const normalizedCount = clamp(Number(count) || DEFAULTS.multiMintCount, 1, 10);
+        const currentMappings = Array.isArray(mappings) ? mappings : getMultiMintMappingsFromUi();
+        let html = '';
+
+        for (let index = 0; index < normalizedCount; index++) {
+            const mapping = currentMappings[index] || {};
+            html += `
+                <div class="twsr-multi-row" data-multi-index="${index}">
+                    <div class="twsr-multi-index">#${index + 1}</div>
+                    <div>
+                        <label class="twsr-label">Source group</label>
+                        <select class="twsr-select" data-twsr-multi-group>
+                            ${groupOptionsHtml(mapping.groupId, mapping.groupName)}
+                        </select>
+                        <div class="twsr-hint">Only villages in this group are used</div>
+                    </div>
+                    <div>
+                        <label class="twsr-label">Mint village</label>
+                        <input class="twsr-input" data-twsr-multi-target type="text"
+                            value="${escapeHtml(mapping.targetCoord || '')}" placeholder="454|598">
+                        <div class="twsr-hint">Final target for this group</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        container.innerHTML = html;
+    }
+
+    function updateMultiMintUi() {
+        const enabled = Boolean(document.querySelector('#strr-multi-enabled')?.checked);
+        const config = document.querySelector('#strr-multi-config');
+        const singleTarget = document.querySelector('[data-twsr-field="strr-target"]');
+        if (config) config.style.display = enabled ? 'block' : 'none';
+        if (singleTarget) singleTarget.style.display = enabled ? 'none' : '';
+    }
+
+    function refreshMultiMintGroupOptions() {
+        const rows = Array.from(document.querySelectorAll('.twsr-multi-row'));
+        rows.forEach(row => {
+            const select = row.querySelector('[data-twsr-multi-group]');
+            if (!select) return;
+            const current = String(select.value || '');
+            const currentText = select.selectedOptions?.[0]?.dataset?.groupName || select.selectedOptions?.[0]?.textContent || '';
+            select.innerHTML = groupOptionsHtml(current, currentText);
+            select.value = current;
+        });
+    }
+
+    function persistUiSettings() {
+        try {
+            settings = getSettingsFromUi();
+            saveSettings(settings);
+        } catch (error) {
+            console.warn('[' + SCRIPT_NAME + '] Could not auto-save UI settings:', error);
+        }
+    }
+
     function renderShell() {
+        mergeVillageGroupsFromDocument(document);
         document.getElementById(SCRIPT_ID)?.remove();
         document.getElementById(STYLE_ID)?.remove();
 
@@ -1377,7 +1621,7 @@
             </div>
             <div class="twsr-body">
                 <div class="twsr-quick-help">
-                    <span class="twsr-pill">One final target</span>
+                    <span class="twsr-pill">Single or multiple mint targets</span>
                     <span class="twsr-pill">WH% = fullest resource</span>
                     <span class="twsr-pill">Closer-to-target relays only</span>
                     <span class="twsr-pill">Direct ratio 28 / 30 / 25</span>
@@ -1386,6 +1630,30 @@
                 </div>
 
                 <div class="twsr-panel">
+                    <div class="twsr-mode-panel">
+                        <div class="twsr-mode-row">
+                            <label>
+                                <input id="strr-multi-enabled" type="checkbox" ${settings.multiMintEnabled ? 'checked' : ''}>
+                                <strong>Multiple mint villages</strong>
+                            </label>
+                            <span class="twsr-small">Map one Tribal Wars village group to each mint village. Saved per world.</span>
+                        </div>
+                        <div id="strr-multi-config" class="twsr-multi-config">
+                            <div class="twsr-multi-toolbar">
+                                <div>
+                                    <label class="twsr-label" for="strr-multi-count">Number of mint villages</label>
+                                    <input id="strr-multi-count" class="twsr-input" type="number" min="1" max="10" step="1"
+                                        value="${escapeHtml(settings.multiMintCount)}">
+                                    <div class="twsr-hint">1-10 mappings</div>
+                                </div>
+                                <div class="twsr-small">
+                                    Mapping order also decides precedence if two selected groups overlap. A village is only used by the first mapping that contains it.
+                                </div>
+                            </div>
+                            <div id="strr-multi-rows"></div>
+                        </div>
+                    </div>
+
                     <div class="twsr-grid">
                         ${fieldHtml('strr-target', 'Target village', settings.targetCoord, 'XXX|YYY', 'target', 'text', 'placeholder="454|598"')}
                         ${fieldHtml('strr-radius', 'Direct / relay radius', settings.directRadius, 'fields', 'radius', 'number', 'min="1" max="100" step="1"')}
@@ -1415,6 +1683,25 @@
         box.querySelector('.twsr-close').addEventListener('click', closeDialog);
         box.querySelector('#strr-build').addEventListener('click', generateFromUi);
         box.querySelector('#strr-refresh').addEventListener('click', () => refreshData(true));
+
+        renderMultiMintRows(settings.multiMintMappings, settings.multiMintCount);
+        updateMultiMintUi();
+
+        box.querySelector('#strr-multi-enabled').addEventListener('change', () => {
+            updateMultiMintUi();
+            persistUiSettings();
+        });
+
+        box.querySelector('#strr-multi-count').addEventListener('change', event => {
+            const existing = getMultiMintMappingsFromUi();
+            const count = clamp(Number(event.target.value) || DEFAULTS.multiMintCount, 1, 10);
+            event.target.value = String(count);
+            renderMultiMintRows(existing, count);
+            persistUiSettings();
+        });
+
+        box.querySelector('#strr-multi-rows').addEventListener('change', persistUiSettings);
+        box.querySelector('#strr-multi-rows').addEventListener('input', persistUiSettings);
         box.querySelectorAll('[data-twsr-info]').forEach(button => {
             button.addEventListener('click', () => {
                 const key = button.dataset.twsrInfo;
@@ -1428,6 +1715,12 @@
             await executeTargetRequest(button.dataset.strrRequestTarget, button);
         });
 
+        ['#strr-target', '#strr-radius', '#strr-keep', '#strr-trigger', '#strr-imbalance', '#strr-safe'].forEach(selector => {
+            const input = box.querySelector(selector);
+            if (!input) return;
+            input.addEventListener('change', persistUiSettings);
+        });
+
         makeDraggable(box, box.querySelector('.twsr-header'));
         installEnterHandler();
 
@@ -1438,10 +1731,146 @@
             getPlan: () => plan.slice(),
             getRequestGroups: () => groupTransfersByTarget(plan),
             getVillages: () => villages.slice(),
+            getVillageGroups: () => villageGroups.slice(),
+            getMultiMintTargets: () => multiMintTargets.slice(),
             getDiagnosticSnapshot: buildDiagnosticSnapshot,
             copyDiagnosticReport,
             downloadDiagnosticJson
         };
+    }
+
+    function validateMultiMintMappings(cfg) {
+        const mappings = (cfg.multiMintMappings || []).slice(0, cfg.multiMintCount);
+        if (!mappings.length) throw new Error('Add at least one multi-mint mapping.');
+
+        const seenGroups = new Set();
+
+        mappings.forEach((mapping, index) => {
+            if (!mapping.groupId) {
+                throw new Error('Select a source group for mint #' + (index + 1) + '.');
+            }
+            if (!parseCoord(mapping.targetCoord)) {
+                throw new Error('Enter a valid mint coordinate for mint #' + (index + 1) + '.');
+            }
+            if (seenGroups.has(String(mapping.groupId))) {
+                throw new Error('The same source group is selected more than once. Each group can only map to one mint village.');
+            }
+            seenGroups.add(String(mapping.groupId));
+        });
+
+        return mappings;
+    }
+
+    async function loadMultiMintVillageSets(cfg, showProgress = true) {
+        const mappings = validateMultiMintMappings(cfg);
+        const sets = new Map();
+        const allVillages = [];
+        const seenVillageIds = new Set();
+        const overlapSkips = [];
+
+        for (let index = 0; index < mappings.length; index++) {
+            const mapping = mappings[index];
+            if (showProgress) {
+                setStatus(
+                    'Loading group ' + (index + 1) + '/' + mappings.length + ': ' +
+                    (mapping.groupName || getGroupName(mapping.groupId)) + '...',
+                    'warn'
+                );
+            }
+
+            const loaded = await loadVillageData(mapping.groupId);
+            const assigned = [];
+
+            loaded.forEach(village => {
+                const key = String(village.id || village.coord);
+                if (seenVillageIds.has(key)) {
+                    overlapSkips.push({
+                        villageId: village.id,
+                        coord: village.coord,
+                        skippedGroupId: mapping.groupId,
+                        skippedGroupName: mapping.groupName || getGroupName(mapping.groupId),
+                        reason: 'Village already assigned to an earlier multi-mint mapping'
+                    });
+                    return;
+                }
+
+                seenVillageIds.add(key);
+                village.sourceGroupId = String(mapping.groupId);
+                village.sourceGroupName = mapping.groupName || getGroupName(mapping.groupId);
+                assigned.push(village);
+                allVillages.push(village);
+            });
+
+            sets.set(String(mapping.groupId), assigned);
+        }
+
+        multiMintVillageSets = sets;
+        multiMintOverlapSkips = overlapSkips;
+        villages = allVillages;
+        refreshMultiMintGroupOptions();
+
+        if (overlapSkips.length) {
+            console.warn('[' + SCRIPT_NAME + '] Multi-mint overlapping group villages skipped:', overlapSkips);
+        }
+
+        return sets;
+    }
+
+    async function generateMultiMintPlan(cfg) {
+        const mappings = validateMultiMintMappings(cfg);
+        const sets = await loadMultiMintVillageSets(cfg, true);
+        const combinedPlan = [];
+        const targets = [];
+
+        for (let index = 0; index < mappings.length; index++) {
+            const mapping = mappings[index];
+            const groupVillages = sets.get(String(mapping.groupId)) || [];
+
+            if (!groupVillages.length) {
+                console.warn('[' + SCRIPT_NAME + '] No unique villages left for mapping', mapping);
+                continue;
+            }
+
+            setStatus(
+                'Planning mint ' + (index + 1) + '/' + mappings.length + ': ' +
+                (mapping.groupName || getGroupName(mapping.groupId)) + ' -> ' + mapping.targetCoord + '...',
+                'warn'
+            );
+
+            const target = await resolveTarget(mapping.targetCoord, groupVillages);
+            const groupPlan = buildPlan(groupVillages, target, cfg);
+
+            groupPlan.forEach(transfer => {
+                transfer.multiMintIndex = index;
+                transfer.sourceGroupId = String(mapping.groupId);
+                transfer.sourceGroupName = mapping.groupName || getGroupName(mapping.groupId);
+                transfer.finalTargetId = target.id;
+                transfer.finalTargetCoord = target.coord;
+                transfer.finalTargetName = target.name;
+            });
+
+            targets.push({
+                index,
+                groupId: String(mapping.groupId),
+                groupName: mapping.groupName || getGroupName(mapping.groupId),
+                target,
+                villageCount: groupVillages.length,
+                transferCount: groupPlan.length
+            });
+
+            combinedPlan.push(...groupPlan);
+        }
+
+        combinedPlan.sort((a, b) => {
+            if (a.kind !== b.kind) return a.kind === 'relay' ? -1 : 1;
+            if ((a.multiMintIndex || 0) !== (b.multiMintIndex || 0)) return (a.multiMintIndex || 0) - (b.multiMintIndex || 0);
+            if (Math.abs(a.sourceToTarget - b.sourceToTarget) > 0.000001) return b.sourceToTarget - a.sourceToTarget;
+            return a.legDistance - b.legDistance;
+        });
+
+        resolvedTarget = null;
+        multiMintTargets = targets;
+        plan = combinedPlan;
     }
 
     async function generateFromUi() {
@@ -1451,13 +1880,27 @@
         try {
             if (buildButton) buildButton.disabled = true;
             settings = getSettingsFromUi();
-            saveSettings(settings);
-            setStatus('Resolving target village and creating routing plan...', 'warn');
-            resolvedTarget = await resolveTarget(settings.targetCoord);
-            plan = buildPlan(villages, resolvedTarget, settings);
+            settings = saveSettings(settings);
+
+            if (settings.multiMintEnabled) {
+                setStatus('Loading configured groups and creating multi-mint routing plan...', 'warn');
+                await generateMultiMintPlan(settings);
+            } else {
+                multiMintTargets = [];
+                multiMintVillageSets = new Map();
+                multiMintOverlapSkips = [];
+                setStatus('Resolving target village and creating routing plan...', 'warn');
+                resolvedTarget = await resolveTarget(settings.targetCoord, villages);
+                plan = buildPlan(villages, resolvedTarget, settings);
+            }
+
             renderPlan();
+
+            const targetCount = settings.multiMintEnabled ? multiMintTargets.length : 1;
             setStatus(
-                'Plan ready: ' + plan.length + ' transfer(s) from ' + new Set(plan.map(item => item.sourceId)).size + ' origin village(s).',
+                'Plan ready: ' + plan.length + ' transfer(s) from ' +
+                new Set(plan.map(item => item.sourceId)).size + ' origin village(s) toward ' +
+                targetCount + ' mint target(s).',
                 'success'
             );
         } catch (error) {
@@ -1481,7 +1924,17 @@
             },
             world: typeof game_data !== 'undefined' ? game_data.world : null,
             settings: { ...settings },
+            mode: settings.multiMintEnabled ? 'multi-mint' : 'single-target',
             target: resolvedTarget ? { ...resolvedTarget } : null,
+            multiMintTargets: multiMintTargets.map(item => ({
+                index: item.index,
+                groupId: item.groupId,
+                groupName: item.groupName,
+                target: { ...item.target },
+                villageCount: item.villageCount,
+                transferCount: item.transferCount
+            })),
+            multiMintOverlapSkips: multiMintOverlapSkips.slice(),
             summary: {
                 villagesLoaded: villages.length,
                 plannedTransfers: plan.length,
@@ -1518,6 +1971,9 @@
                 sourceWhAfterPct: item.sourceAfterPct,
                 receiverWhBeforePct: item.receiverBeforePct ?? null,
                 receiverWhAfterPct: item.receiverAfterPct ?? null,
+                sourceGroupId: item.sourceGroupId || null,
+                sourceGroupName: item.sourceGroupName || null,
+                finalTargetCoord: item.finalTargetCoord || (resolvedTarget ? resolvedTarget.coord : null),
                 sent: item.sent
             })),
             villages: villages.map(v => ({
@@ -1546,8 +2002,8 @@
         lines.push('## Settings');
         lines.push(JSON.stringify(snapshot.settings, null, 2));
         lines.push('');
-        lines.push('## Target');
-        lines.push(JSON.stringify(snapshot.target, null, 2));
+        lines.push(snapshot.mode === 'multi-mint' ? '## Mint targets' : '## Target');
+        lines.push(JSON.stringify(snapshot.mode === 'multi-mint' ? snapshot.multiMintTargets : snapshot.target, null, 2));
         lines.push('');
         lines.push('## Summary');
         lines.push(JSON.stringify(snapshot.summary, null, 2));
@@ -1708,7 +2164,8 @@
 
     function renderPlan() {
         const output = document.querySelector('#strr-output');
-        if (!output || !resolvedTarget) return;
+        if (!output) return;
+        if (!resolvedTarget && !multiMintTargets.length) return;
 
         const direct = plan.filter(item => item.kind === 'direct');
         const relay = plan.filter(item => item.kind === 'relay');
@@ -1718,9 +2175,19 @@
         const uniqueSources = new Set(plan.map(item => item.sourceId)).size;
         const requestGroups = groupTransfersByTarget(plan);
 
+        const targetSummaryHtml = settings.multiMintEnabled
+            ? '<div><strong>Multi-mint targets:</strong></div>' +
+                multiMintTargets.map(item =>
+                    '<div class="twsr-small" style="margin-top:3px;">#' + (item.index + 1) + ' ' +
+                    escapeHtml(item.groupName) + ' (#' + escapeHtml(item.groupId) + ') &rarr; ' +
+                    escapeHtml(item.target.name) + ' (' + escapeHtml(item.target.coord) + ') &middot; ' +
+                    item.villageCount + ' village(s)</div>'
+                ).join('')
+            : '<div><strong>Final target:</strong> ' + escapeHtml(resolvedTarget.name) + ' (' + escapeHtml(resolvedTarget.coord) + ')</div>';
+
         let html = `
             <div class="twsr-summary-panel">
-                <div><strong>Final target:</strong> ${escapeHtml(resolvedTarget.name)} (${escapeHtml(resolvedTarget.coord)})</div>
+                ${targetSummaryHtml}
                 <div class="twsr-small" style="margin-top:5px;">
                     ${villages.length} villages loaded &middot;
                     ${uniqueSources} origins used &middot;
@@ -1775,7 +2242,9 @@
 
                 return '<div class="twsr-origin-line">' +
                     '<strong>' + escapeHtml(transfer.sourceCoord) + '</strong> ' +
-                    '<span class="twsr-small">' + escapeHtml(transfer.sourceName) + '</span><br>' +
+                    '<span class="twsr-small">' + escapeHtml(transfer.sourceName) +
+                    (transfer.sourceGroupName ? ' · ' + escapeHtml(transfer.sourceGroupName) : '') +
+                    '</span><br>' +
                     '<span class="twsr-small">' +
                     escapeHtml(rule) + ' &middot; ' +
                     fmt(transfer.wood) + '/' + fmt(transfer.stone) + '/' + fmt(transfer.iron) +
@@ -1789,7 +2258,7 @@
                     <td><strong>${escapeHtml(getRequestGroupTypeLabel(group))}</strong></td>
                     <td class="twsr-left">
                         <strong>${escapeHtml(group.targetCoord)}</strong>
-                        <div class="twsr-small">${escapeHtml(group.targetName || (group.targetCoord === resolvedTarget.coord ? 'Final target' : 'Relay target'))}</div>
+                        <div class="twsr-small">${escapeHtml(group.targetName || (resolvedTarget && group.targetCoord === resolvedTarget.coord ? 'Final target' : 'Relay target'))}</div>
                     </td>
                     <td class="twsr-left">
                         <details>
@@ -1927,13 +2396,32 @@
         if (refresh) refresh.disabled = true;
 
         try {
-            setStatus('Loading production data for the currently selected village group...', 'warn');
-            villages = await loadVillageData();
-            setStatus('Loaded ' + villages.length + ' village(s). Enter the final target and create a plan.', 'success');
-            if (showMessage && window.UI?.SuccessMessage) UI.SuccessMessage('Loaded ' + villages.length + ' villages.');
+            settings = getSettingsFromUi();
+            settings = saveSettings(settings);
 
-            if (settings.targetCoord && showMessage) {
-                await generateFromUi();
+            if (settings.multiMintEnabled) {
+                setStatus('Refreshing all configured multi-mint source groups...', 'warn');
+                await loadMultiMintVillageSets(settings, true);
+                setStatus(
+                    'Loaded ' + villages.length + ' unique village(s) across ' +
+                    settings.multiMintCount + ' configured mint group(s).',
+                    'success'
+                );
+            } else {
+                setStatus('Loading production data for the currently selected village group...', 'warn');
+                villages = await loadVillageData();
+                refreshMultiMintGroupOptions();
+                setStatus('Loaded ' + villages.length + ' village(s). Enter the final target and create a plan.', 'success');
+            }
+
+            if (showMessage && window.UI?.SuccessMessage) {
+                UI.SuccessMessage('Loaded ' + villages.length + ' villages.');
+            }
+
+            if (showMessage) {
+                if (settings.multiMintEnabled || settings.targetCoord) {
+                    await generateFromUi();
+                }
             }
         } catch (error) {
             console.error('[' + SCRIPT_NAME + ']', error);
