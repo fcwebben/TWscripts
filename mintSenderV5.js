@@ -86,7 +86,7 @@
     'use strict';
 
     const SCRIPT_NAME = 'Twactics Smart Mint Resource Sender';
-    const SCRIPT_VERSION = '1.2.0';
+    const SCRIPT_VERSION = '1.3.0';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 2;
@@ -95,6 +95,9 @@
     const RESOURCE_KEYS = ['wood', 'stone', 'iron'];
     const MERCHANT_CAPACITY = 1000;
     const MIN_TRANSFER_TOTAL = 900;
+    const MERCHANT_MINUTES_PER_FIELD = 10;
+    const WORLD_CONFIG_CACHE_MS = 60 * 60 * 1000;
+    const WORLD_CONFIG_STORAGE_KEY = 'twacticsSmartMintResourceSenderWorldConfig';
 
     // Script Library review requirement: keep script-started traffic below 5 requests/second.
     const NETWORK_MIN_INTERVAL_MS = 210;
@@ -133,6 +136,8 @@
     let multiMintOverlapSkips = [];
     let sendLocked = false;
     let enterKeyHeld = false;
+    let worldSpeed = 1;
+    let planCreatedAtServerMs = 0;
     let settings;
 
     try {
@@ -227,6 +232,93 @@
 
     function wait(ms) {
         return new Promise(resolve => window.setTimeout(resolve, Math.max(0, ms || 0)));
+    }
+
+    function getServerNowMs() {
+        if (typeof Timing !== 'undefined' && typeof Timing.getCurrentServerTime === 'function') {
+            const value = Number(Timing.getCurrentServerTime());
+            if (Number.isFinite(value) && value > 0) return value;
+        }
+        return Date.now();
+    }
+
+    function getVisibleServerClockSeconds() {
+        const text = String(document.querySelector('#serverTime')?.textContent || '').trim();
+        const match = text.match(/(\d{1,2}):(\d{2}):(\d{2})/);
+        if (match) {
+            return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+        }
+
+        const now = new Date();
+        return now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    }
+
+    function formatServerClock(targetMs) {
+        const nowMs = getServerNowMs();
+        const serverSecondsNow = getVisibleServerClockSeconds();
+        let seconds = serverSecondsNow + (Number(targetMs) - nowMs) / 1000;
+        let dayOffset = Math.floor(seconds / 86400);
+
+        seconds %= 86400;
+        if (seconds < 0) {
+            seconds += 86400;
+            dayOffset -= 1;
+        }
+
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const time = String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0');
+
+        return dayOffset > 0 ? '+' + dayOffset + 'd ' + time : time;
+    }
+
+    async function ensureWorldSpeed() {
+        const cacheKey = getWorldKey(WORLD_CONFIG_STORAGE_KEY);
+
+        try {
+            const raw = localStorage.getItem(cacheKey);
+            if (raw) {
+                const cached = JSON.parse(raw);
+                const cachedSpeed = Number(cached?.speed);
+                const cachedAt = Number(cached?.cachedAt);
+
+                if (
+                    Number.isFinite(cachedSpeed) &&
+                    cachedSpeed > 0 &&
+                    Number.isFinite(cachedAt) &&
+                    Date.now() - cachedAt < WORLD_CONFIG_CACHE_MS
+                ) {
+                    worldSpeed = cachedSpeed;
+                    return worldSpeed;
+                }
+            }
+        } catch (_) {}
+
+        try {
+            const xmlText = await fetchText('/interface.php?func=get_config', 'World config');
+            const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+            const parsed = Number(doc.querySelector('config > speed, speed')?.textContent);
+
+            if (Number.isFinite(parsed) && parsed > 0) {
+                worldSpeed = parsed;
+                try {
+                    localStorage.setItem(cacheKey, JSON.stringify({
+                        speed: parsed,
+                        cachedAt: Date.now()
+                    }));
+                } catch (_) {}
+                return worldSpeed;
+            }
+        } catch (_) {}
+
+        worldSpeed = 1;
+        return worldSpeed;
+    }
+
+    function estimateRelayTravelMs(transfer) {
+        const fields = Math.max(0, Number(transfer?.legDistance) || 0);
+        const speed = Math.max(0.01, Number(worldSpeed) || 1);
+        return fields * MERCHANT_MINUTES_PER_FIELD * 60 * 1000 / speed;
     }
 
     function runRateLimitedNetworkRequest(task, label) {
@@ -1122,6 +1214,111 @@
                 padding: 10px;
                 margin-bottom: 10px;
             }
+            #${SCRIPT_ID} .twsr-resource-cards {
+                display: grid;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                gap: 8px;
+                margin-top: 8px;
+            }
+            #${SCRIPT_ID} .twsr-resource-card {
+                padding: 9px;
+                border: 1px solid #c8a765;
+                border-radius: 8px;
+                background: #fffaf0;
+                box-shadow: 0 1px 0 rgba(0,0,0,0.08);
+                min-width: 0;
+            }
+            #${SCRIPT_ID} .twsr-resource-card-head {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin-bottom: 7px;
+            }
+            #${SCRIPT_ID} .twsr-resource-card-head img {
+                width: 20px;
+                height: 20px;
+                flex: 0 0 auto;
+            }
+            #${SCRIPT_ID} .twsr-resource-card-name {
+                font-size: 12px;
+                font-weight: bold;
+            }
+            #${SCRIPT_ID} .twsr-resource-card-total {
+                font-size: 18px;
+                font-weight: bold;
+                line-height: 1.1;
+                margin-bottom: 7px;
+            }
+            #${SCRIPT_ID} .twsr-resource-card-split {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 6px;
+            }
+            #${SCRIPT_ID} .twsr-resource-card-metric {
+                padding: 5px 6px;
+                border: 1px solid #ead8b3;
+                border-radius: 6px;
+                background: rgba(255,255,255,0.55);
+                min-width: 0;
+            }
+            #${SCRIPT_ID} .twsr-resource-card-label {
+                font-size: 9px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                opacity: 0.68;
+                margin-bottom: 2px;
+            }
+            #${SCRIPT_ID} .twsr-resource-card-value {
+                font-weight: bold;
+                font-size: 12px;
+                overflow-wrap: anywhere;
+            }
+            #${SCRIPT_ID} .twsr-rerun-card {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                margin-top: 8px;
+                padding: 8px 9px;
+                border: 1px solid #c8a765;
+                border-radius: 8px;
+                background: #fffaf0;
+            }
+            #${SCRIPT_ID} .twsr-rerun-label {
+                font-weight: bold;
+                white-space: nowrap;
+            }
+            #${SCRIPT_ID} .twsr-rerun-checkpoints {
+                display: flex;
+                flex-wrap: wrap;
+                justify-content: flex-end;
+                gap: 5px;
+            }
+            #${SCRIPT_ID} .twsr-rerun-pill {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                padding: 4px 7px;
+                border: 1px solid #d4bf8f;
+                border-radius: 999px;
+                background: #fff7e5;
+                font-size: 11px;
+                white-space: nowrap;
+            }
+            #${SCRIPT_ID} .twsr-rerun-pill strong {
+                font-size: 10px;
+            }
+            #${SCRIPT_ID} .twsr-finished {
+                padding: 10px;
+                border: 1px solid #9bc18e;
+                border-radius: 8px;
+                background: #dff0d8;
+                margin-bottom: 10px;
+            }
+            #${SCRIPT_ID} .twsr-finished-title {
+                font-size: 14px;
+                font-weight: bold;
+            }
             #${SCRIPT_ID} .twsr-grid {
                 display: grid;
                 grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1365,6 +1562,9 @@
             }
             @media (max-width: 560px) {
                 #${SCRIPT_ID} .twsr-grid { grid-template-columns: 1fr; }
+                #${SCRIPT_ID} .twsr-resource-cards { grid-template-columns: 1fr; }
+                #${SCRIPT_ID} .twsr-rerun-card { align-items: flex-start; flex-direction: column; }
+                #${SCRIPT_ID} .twsr-rerun-checkpoints { justify-content: flex-start; }
             }
         `;
     }
@@ -1872,6 +2072,11 @@
                 plan = buildPlan(villages, resolvedTarget, settings);
             }
 
+            planCreatedAtServerMs = getServerNowMs();
+            if (plan.some(item => item.kind === 'relay')) {
+                await ensureWorldSpeed();
+            }
+
             renderPlan();
 
             const targetCount = settings.multiMintEnabled ? multiMintTargets.length : 1;
@@ -1900,126 +2105,102 @@
         return summary;
     }
 
-    function resourceSummaryHtml(resources) {
-        const values = resources || emptyResourceSummary();
+    function buildResourceSplit(sentOnly = false) {
+        const direct = emptyResourceSummary();
+        const relay = emptyResourceSummary();
+
+        plan.forEach(transfer => {
+            if (sentOnly && !transfer.sent) return;
+            addTransferToResourceSummary(transfer.kind === 'relay' ? relay : direct, transfer);
+        });
+
+        return { direct, relay };
+    }
+
+    function resourceMetricCardHtml(key, label, image, split) {
+        const direct = Math.max(0, Number(split.direct[key]) || 0);
+        const relay = Math.max(0, Number(split.relay[key]) || 0);
+        const total = direct + relay;
+
         return `
-            <div class="twsr-resource-summary-line">
-                <span class="twsr-resource-summary-item">
-                    <img src="/graphic/holz.png" alt="Wood" title="Wood">
-                    <span>${fmt(values.wood)}</span>
-                </span>
-                <span class="twsr-resource-summary-item">
-                    <img src="/graphic/lehm.png" alt="Clay" title="Clay">
-                    <span>${fmt(values.stone)}</span>
-                </span>
-                <span class="twsr-resource-summary-item">
-                    <img src="/graphic/eisen.png" alt="Iron" title="Iron">
-                    <span>${fmt(values.iron)}</span>
-                </span>
+            <div class="twsr-resource-card">
+                <div class="twsr-resource-card-head">
+                    <img src="${image}" alt="${escapeHtml(label)}">
+                    <span class="twsr-resource-card-name">${escapeHtml(label)}</span>
+                </div>
+                <div class="twsr-resource-card-total">${fmt(total)}</div>
+                <div class="twsr-resource-card-split">
+                    <div class="twsr-resource-card-metric">
+                        <div class="twsr-resource-card-label">Direct</div>
+                        <div class="twsr-resource-card-value">${fmt(direct)}</div>
+                    </div>
+                    <div class="twsr-resource-card-metric">
+                        <div class="twsr-resource-card-label">Relay</div>
+                        <div class="twsr-resource-card-value">${fmt(relay)}</div>
+                    </div>
+                </div>
             </div>
         `;
     }
 
-    function getMintTargetDefinitions() {
-        if (settings.multiMintEnabled) {
-            return multiMintTargets.map(item => ({
-                key: String(item.target.id || item.target.coord),
-                id: item.target.id,
-                coord: item.target.coord,
-                name: item.target.name,
-                groupName: item.groupName,
-                groupId: item.groupId
-            }));
-        }
-
-        if (!resolvedTarget) return [];
-        return [{
-            key: String(resolvedTarget.id || resolvedTarget.coord),
-            id: resolvedTarget.id,
-            coord: resolvedTarget.coord,
-            name: resolvedTarget.name,
-            groupName: '',
-            groupId: ''
-        }];
+    function resourceCardsHtml(sentOnly = false) {
+        const split = buildResourceSplit(sentOnly);
+        return '<div class="twsr-resource-cards">' +
+            resourceMetricCardHtml('wood', 'Wood', '/graphic/holz.png', split) +
+            resourceMetricCardHtml('stone', 'Clay', '/graphic/lehm.png', split) +
+            resourceMetricCardHtml('iron', 'Iron', '/graphic/eisen.png', split) +
+        '</div>';
     }
 
-    function transferBelongsToMint(transfer, target) {
-        if (settings.multiMintEnabled) {
-            if (transfer.finalTargetId !== undefined && transfer.finalTargetId !== null) {
-                return String(transfer.finalTargetId) === String(target.id);
-            }
-            return String(transfer.finalTargetCoord || '') === String(target.coord);
-        }
-
-        return true;
-    }
-
-    function buildMintSummaries(sentOnly = false) {
-        return getMintTargetDefinitions().map(target => {
-            const matching = plan.filter(transfer =>
-                transferBelongsToMint(transfer, target) &&
-                (!sentOnly || transfer.sent)
-            );
-
-            const direct = emptyResourceSummary();
-            const relay = emptyResourceSummary();
-
-            matching.forEach(transfer => {
-                if (transfer.kind === 'relay') addTransferToResourceSummary(relay, transfer);
-                else addTransferToResourceSummary(direct, transfer);
-            });
-
-            return {
-                target,
-                direct,
-                relay,
-                directTransfers: matching.filter(transfer => transfer.kind !== 'relay').length,
-                relayTransfers: matching.filter(transfer => transfer.kind === 'relay').length
-            };
-        });
-    }
-
-    function getRelayRerunAdvice(sentOnly = false) {
+    function getRelayArrivalCheckpoints(sentOnly = false) {
         const relays = plan.filter(transfer =>
             transfer.kind === 'relay' &&
             (!sentOnly || transfer.sent)
         );
 
-        if (!relays.length) {
-            return 'No relay step is used in this batch. You do not need to rerun the script for relay progression; create a fresh plan whenever village resources or merchants change.';
-        }
+        if (!relays.length) return [];
 
-        const longestLeg = Math.max(...relays.map(transfer => Number(transfer.legDistance) || 0));
-        return 'Run the script again after the relay transports from this batch have arrived. The longest relay hop is ' +
-            longestLeg.toFixed(1) +
-            ' fields. Once those deliveries have landed, refresh/create a new plan so the staged resources can continue toward the mint village' +
-            (getMintTargetDefinitions().length > 1 ? 's' : '') + '.';
+        const fallbackBase = planCreatedAtServerMs || getServerNowMs();
+        const arrivals = relays.map(transfer => {
+            const base = Number(transfer.sentAtServerMs) || fallbackBase;
+            return Number(transfer.estimatedArrivalAtServerMs) || (base + estimateRelayTravelMs(transfer));
+        }).sort((a, b) => a - b);
+
+        return [
+            { pct: 33, index: Math.max(0, Math.ceil(arrivals.length * 0.33) - 1) },
+            { pct: 66, index: Math.max(0, Math.ceil(arrivals.length * 0.66) - 1) },
+            { pct: 100, index: arrivals.length - 1 }
+        ].map(item => ({
+            pct: item.pct,
+            arrival: arrivals[item.index]
+        }));
     }
 
-    function mintSummaryCardsHtml(sentOnly = false) {
-        const summaries = buildMintSummaries(sentOnly);
-        if (!summaries.length) return '';
+    function rerunScheduleHtml(sentOnly = false) {
+        const checkpoints = getRelayArrivalCheckpoints(sentOnly);
 
-        return '<div class="twsr-mint-summary-grid">' +
-            summaries.map(summary => {
-                const groupLine = summary.target.groupName
-                    ? '<div class="twsr-small">' + escapeHtml(summary.target.groupName) + ' (#' + escapeHtml(summary.target.groupId) + ')</div>'
-                    : '';
+        if (!checkpoints.length) {
+            return `
+                <div class="twsr-rerun-card">
+                    <div class="twsr-rerun-label">Run again</div>
+                    <div class="twsr-small">No relay step needed</div>
+                </div>
+            `;
+        }
 
-                return '<div class="twsr-mint-summary-card">' +
-                    '<div class="twsr-mint-summary-title">' +
-                        escapeHtml(summary.target.name || 'Mint village') + ' (' + escapeHtml(summary.target.coord) + ')' +
-                    '</div>' +
-                    groupLine +
-                    '<div class="twsr-small" style="margin-top:6px;"><strong>Directly to mint in this batch</strong></div>' +
-                    resourceSummaryHtml(summary.direct) +
-                    (summary.relayTransfers
-                        ? '<div class="twsr-small" style="margin-top:8px;"><strong>Staged through relay villages first</strong></div>' +
-                          resourceSummaryHtml(summary.relay)
-                        : '<div class="twsr-small" style="margin-top:8px;">No relay resources for this mint in this batch.</div>') +
-                '</div>';
-            }).join('') +
-        '</div>';
+        return `
+            <div class="twsr-rerun-card">
+                <div class="twsr-rerun-label">Run again</div>
+                <div class="twsr-rerun-checkpoints">
+                    ${checkpoints.map(item =>
+                        '<span class="twsr-rerun-pill" title="Estimated relay arrival based on world speed">' +
+                            '<strong>' + item.pct + '%</strong>' +
+                            '<span>~' + escapeHtml(formatServerClock(item.arrival)) + '</span>' +
+                        '</span>'
+                    ).join('')}
+                </div>
+            </div>
+        `;
     }
 
     function renderFinishedSummary() {
@@ -2029,18 +2210,16 @@
         output.innerHTML = `
             <div class="twsr-finished">
                 <div class="twsr-finished-title">Finished sending</div>
-                <div>All requests in this plan have been completed.</div>
             </div>
             <div class="twsr-summary-panel">
-                <div><strong>Resources requested directly to the mint village${getMintTargetDefinitions().length > 1 ? 's' : ''}</strong></div>
-                ${mintSummaryCardsHtml(true)}
-                <div class="twsr-next-run"><strong>When to run again:</strong> ${escapeHtml(getRelayRerunAdvice(true))}</div>
+                ${resourceCardsHtml(true)}
+                ${rerunScheduleHtml(true)}
             </div>
         `;
 
         setStatus('Finished sending. All requests in this plan are complete.', 'success');
         if (window.UI?.SuccessMessage) {
-            UI.SuccessMessage('Finished sending. All requests in this plan are complete.');
+            UI.SuccessMessage('Finished sending.');
         }
     }
 
@@ -2126,24 +2305,17 @@
         const requestGroups = groupTransfersByTarget(plan);
 
         const targetSummaryHtml = settings.multiMintEnabled
-            ? '<div><strong>Mint setup:</strong> ' + multiMintTargets.length + ' mint villages</div>'
-            : '<div><strong>Mint village:</strong> ' + escapeHtml(resolvedTarget.name) + ' (' + escapeHtml(resolvedTarget.coord) + ')</div>';
+            ? '<strong>' + multiMintTargets.length + ' mint villages</strong>'
+            : '<strong>' + escapeHtml(resolvedTarget.coord) + '</strong> ' + escapeHtml(resolvedTarget.name);
 
         let html = `
             <div class="twsr-summary-panel">
-                ${targetSummaryHtml}
-                <div class="twsr-small" style="margin-top:5px;">
-                    ${villages.length} villages loaded &middot;
-                    ${uniqueSources} origins used &middot;
-                    ${requestGroups.length} request(s) to complete
+                <div>
+                    ${targetSummaryHtml}
+                    <span class="twsr-small"> &middot; ${uniqueSources} origins &middot; ${requestGroups.length} requests</span>
                 </div>
-
-                <div class="twsr-section-title" style="margin-top:10px;">What reaches the mint in this batch</div>
-                ${mintSummaryCardsHtml(false)}
-
-                <div class="twsr-next-run">
-                    <strong>When to run again:</strong> ${escapeHtml(getRelayRerunAdvice(false))}
-                </div>
+                ${resourceCardsHtml(false)}
+                ${rerunScheduleHtml(false)}
             </div>
         `;
 
@@ -2254,8 +2426,14 @@
         try {
             const response = await postMarketRequest(group.targetId, payload);
 
+            const sentAtServerMs = getServerNowMs();
             group.transfers.forEach(entry => {
                 entry.transfer.sent = true;
+                entry.transfer.sentAtServerMs = sentAtServerMs;
+                if (entry.transfer.kind === 'relay') {
+                    entry.transfer.estimatedArrivalAtServerMs =
+                        sentAtServerMs + estimateRelayTravelMs(entry.transfer);
+                }
             });
 
             const row = document.getElementById('strr-group-row-' + String(group.targetId));
@@ -2349,6 +2527,9 @@
         window.twacticsSmartResourceSenderLoaded = true;
 
         await refreshData(false);
+
+        const createPlanButton = document.querySelector('#strr-build');
+        if (createPlanButton && !createPlanButton.disabled) createPlanButton.focus();
 
     } catch (error) {
         window.twacticsSmartResourceSenderLoaded = false;
