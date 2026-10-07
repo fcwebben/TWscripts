@@ -19,7 +19,7 @@
  * - Uses the 28,000 / 30,000 / 25,000 wood/clay/iron proportional ratio for direct sends
  * - Simulates planned relay incoming resources before choosing later relay destinations
  * - Uses one shared network limiter for all script-started GET/POST traffic
- * - Requires a separate manual action for every resource transfer
+ * - Groups planned transfers by destination and uses one manual market request per target village
  * - Skips any planned transfer below 900 total resources so every send uses at least one meaningful merchant load
  * - Supports TribalWars.scriptData settings input when enabled in the Script Library
  *
@@ -51,7 +51,7 @@
  *
  * This script does NOT:
  * - Send attacks, support, or troops
- * - Automatically send every planned transfer
+ * - Automatically request every planned target
  * - Auto-click game actions
  * - Use external servers or external files
  * - Treat planned relay incoming resources as instantly available for another outgoing hop
@@ -85,10 +85,10 @@
 (async function twacticsSmartResourceSender() {
     'use strict';
 
-    console.log('[Twactics Smart Resource Sender v1.0.3] Starting...');
+    console.log('[Twactics Smart Resource Sender v1.0.4] Starting...');
 
     const SCRIPT_NAME = 'Twactics Smart Resource Sender';
-    const SCRIPT_VERSION = '1.0.3';
+    const SCRIPT_VERSION = '1.0.4';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 1;
@@ -262,16 +262,42 @@
         return response.text();
     }
 
-    function postMarketAction(sourceId, payload) {
+    function getCsrfToken() {
+        if (typeof window.csrf_token !== 'undefined' && window.csrf_token) return window.csrf_token;
+        if (typeof game_data !== 'undefined' && game_data.csrf) return game_data.csrf;
+
+        const input = document.querySelector('input[name="h"]');
+        return input ? input.value : '';
+    }
+
+    function responseHasError(response) {
+        if (!response) return false;
+        return Boolean(response.error || response.errors || response.warning || response.warnings);
+    }
+
+    function getResponseMessage(response, fallback) {
+        if (!response) return fallback;
+        return response.success || response.message || response.error || response.warning || fallback;
+    }
+
+    function postMarketRequest(targetId, payload) {
+        const options = {
+            village: targetId,
+            ajaxaction: 'call'
+        };
+
+        const csrf = getCsrfToken();
+        if (csrf) options.h = csrf;
+
         return runRateLimitedNetworkRequest(function () {
             return new Promise((resolve, reject) => {
                 try {
                     TribalWars.post(
                         'market',
-                        { ajaxaction: 'map_send', village: sourceId },
+                        options,
                         payload,
                         response => {
-                            if (response && (response.error || response.errors || response.warning || response.warnings)) {
+                            if (responseHasError(response)) {
                                 reject(response);
                                 return;
                             }
@@ -283,7 +309,7 @@
                     reject(error);
                 }
             });
-        }, 'POST market map_send');
+        }, 'POST market call');
     }
 
     function clamp(value, min, max) {
@@ -1322,7 +1348,7 @@
             <div class="twsr-header">
                 <div class="twsr-title">
                     <span>${escapeHtml(SCRIPT_NAME + ' ' + SCRIPT_VERSION)}</span>
-                    <span class="twsr-subtitle">Target-first resource routing with direct sends and closer relays</span>
+                    <span class="twsr-subtitle">Target-first routing with grouped market requests</span>
                 </div>
                 <button type="button" class="twsr-close">x</button>
             </div>
@@ -1333,7 +1359,7 @@
                     <span class="twsr-pill">Closer-to-target relays only</span>
                     <span class="twsr-pill">Direct ratio 28 / 30 / 25</span>
                     <span class="twsr-pill">Minimum 900 resources / send</span>
-                    <span class="twsr-pill">Manual send per row</span>
+                    <span class="twsr-pill">One manual request per target</span>
                 </div>
 
                 <div class="twsr-panel">
@@ -1374,9 +1400,9 @@
             });
         });
         box.addEventListener('click', async event => {
-            const button = event.target.closest('[data-strr-send]');
+            const button = event.target.closest('[data-strr-request-group]');
             if (!button) return;
-            await executeTransfer(Number(button.dataset.strrSend), button);
+            await executeTargetRequest(Number(button.dataset.strrRequestGroup), button);
         });
 
         makeDraggable(box, box.querySelector('.twsr-header'));
@@ -1387,6 +1413,7 @@
             refresh: () => refreshData(true),
             createPlan: generateFromUi,
             getPlan: () => plan.slice(),
+            getRequestGroups: () => groupTransfersByTarget(plan),
             getVillages: () => villages.slice(),
             getDiagnosticSnapshot: buildDiagnosticSnapshot,
             copyDiagnosticReport,
@@ -1435,6 +1462,7 @@
             summary: {
                 villagesLoaded: villages.length,
                 plannedTransfers: plan.length,
+                groupedRequests: groupTransfersByTarget(plan).length,
                 uniqueOrigins: new Set(plan.map(item => item.sourceId)).size,
                 directTransfers: direct.length,
                 relayTransfers: relay.length,
@@ -1586,6 +1614,75 @@
         window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
+    function groupTransfersByTarget(transfers) {
+        const groups = new Map();
+
+        (transfers || []).forEach((transfer, transferIndex) => {
+            if (!transfer || transfer.sent) return;
+
+            const key = String(transfer.targetId);
+            if (!groups.has(key)) {
+                groups.set(key, {
+                    targetId: transfer.targetId,
+                    targetCoord: transfer.targetCoord,
+                    targetName: transfer.targetName,
+                    transfers: [],
+                    wood: 0,
+                    stone: 0,
+                    iron: 0,
+                    total: 0,
+                    merchants: 0,
+                    maxLegDistance: 0,
+                    kinds: new Set(),
+                    rules: new Set()
+                });
+            }
+
+            const group = groups.get(key);
+            group.transfers.push({ transfer, transferIndex });
+            group.wood += transfer.wood || 0;
+            group.stone += transfer.stone || 0;
+            group.iron += transfer.iron || 0;
+            group.total += transfer.total || 0;
+            group.merchants += transfer.merchants || 0;
+            group.maxLegDistance = Math.max(group.maxLegDistance, transfer.legDistance || 0);
+            group.kinds.add(transfer.kind || 'direct');
+            group.rules.add(transfer.rule || '');
+        });
+
+        return Array.from(groups.values()).map((group, index) => ({
+            ...group,
+            index,
+            kinds: Array.from(group.kinds),
+            rules: Array.from(group.rules).filter(Boolean)
+        }));
+    }
+
+    function buildCallDataForRequestGroup(group) {
+        const data = {};
+
+        group.transfers.forEach(entry => {
+            const transfer = entry.transfer;
+            const sourceId = transfer.sourceId;
+
+            const woodKey = 'resource[' + sourceId + '][wood]';
+            const stoneKey = 'resource[' + sourceId + '][stone]';
+            const ironKey = 'resource[' + sourceId + '][iron]';
+
+            data[woodKey] = (data[woodKey] || 0) + Math.max(0, Math.round(transfer.wood || 0));
+            data[stoneKey] = (data[stoneKey] || 0) + Math.max(0, Math.round(transfer.stone || 0));
+            data[ironKey] = (data[ironKey] || 0) + Math.max(0, Math.round(transfer.iron || 0));
+        });
+
+        return data;
+    }
+
+    function getRequestGroupTypeLabel(group) {
+        if (!group || !group.kinds || !group.kinds.length) return '';
+        if (group.kinds.length === 1) return group.kinds[0].toUpperCase();
+        return group.kinds.map(kind => kind.toUpperCase()).join(' + ');
+    }
+
     function renderPlan() {
         const output = document.querySelector('#strr-output');
         if (!output || !resolvedTarget) return;
@@ -1596,6 +1693,7 @@
         const directTotal = direct.reduce((sum, item) => sum + item.total, 0);
         const relayTotal = relay.reduce((sum, item) => sum + item.total, 0);
         const uniqueSources = new Set(plan.map(item => item.sourceId)).size;
+        const requestGroups = groupTransfersByTarget(plan);
 
         let html = `
             <div class="twsr-summary-panel">
@@ -1603,12 +1701,13 @@
                 <div class="twsr-small" style="margin-top:5px;">
                     ${villages.length} villages loaded &middot;
                     ${uniqueSources} origins used &middot;
-                    ${relay.length} relay send(s) / ${fmt(relayTotal)} resources &middot;
-                    ${direct.length} direct send(s) / ${fmt(directTotal)} resources &middot;
+                    ${relay.length} relay transfer(s) / ${fmt(relayTotal)} resources &middot;
+                    ${direct.length} direct transfer(s) / ${fmt(directTotal)} resources &middot;
+                    ${requestGroups.length} grouped request(s) &middot;
                     ${fmt(total)} total planned resources
                 </div>
                 <div class="twsr-small" style="margin-top:6px;">
-                    Relay rows are listed first. Planned relay incoming reserves warehouse space immediately, but does not become outgoing stock until it actually arrives. For multi-hop movement, complete the relay rows and rerun the script after arrival.
+                    Transfers to the same destination are grouped into one Tribal Wars market request. Relay destinations are requested separately from the final target. For multi-hop movement, complete relay requests and rerun after resources arrive.
                 </div>
                 <div class="twsr-buttons" style="margin-top:8px;">
                     <button id="strr-copy-test" type="button" class="btn">Copy test report</button>
@@ -1618,61 +1717,70 @@
         `;
 
         if (!plan.length) {
-            output.innerHTML = html + '<div class="twsr-empty">No sendable resources were found with the current settings and merchant availability.</div>';
+            output.innerHTML = html + '<div class="twsr-empty">No requestable resources were found with the current settings and merchant availability.</div>';
             return;
         }
 
         html += `
-            <div class="twsr-section-title">Transfer plan</div>
+            <div class="twsr-section-title">Grouped request plan</div>
             <div class="twsr-table-wrap">
                 <table class="twsr-table">
                     <thead>
                         <tr>
                             <th>#</th>
-                            <th>Rule</th>
                             <th>Type</th>
-                            <th>Origin</th>
-                            <th>Origin -> final</th>
-                            <th>Send to</th>
-                            <th>Receiver -> final</th>
-                            <th>Leg</th>
+                            <th>Request to</th>
+                            <th>Origins</th>
+                            <th>Max leg</th>
                             <th class="twsr-resource-head"><img src="/graphic/holz.png" alt="Wood">Wood</th>
                             <th class="twsr-resource-head"><img src="/graphic/lehm.png" alt="Clay">Clay</th>
                             <th class="twsr-resource-head"><img src="/graphic/eisen.png" alt="Iron">Iron</th>
                             <th>Total</th>
                             <th>Merch.</th>
-                            <th>Origin WH max</th>
                             <th>Action</th>
                         </tr>
                     </thead>
                     <tbody>
         `;
 
-        plan.forEach((transfer, index) => {
-            const rule = transfer.kind === 'relay' && transfer.receiverPriority
-                ? transfer.rule + ' / P' + transfer.receiverPriority
-                : transfer.rule;
-            const receiverInfo = transfer.kind === 'relay'
-                ? '<div class="twsr-small">' + escapeHtml(transfer.receiverLabel) + '</div>'
-                : '<div class="twsr-small">Final target</div>';
+        requestGroups.forEach((group, groupIndex) => {
+            const originDetails = group.transfers.map(entry => {
+                const transfer = entry.transfer;
+                const rule = transfer.kind === 'relay' && transfer.receiverPriority
+                    ? transfer.rule + '/P' + transfer.receiverPriority
+                    : transfer.rule;
+
+                return '<div class="twsr-origin-line">' +
+                    '<strong>' + escapeHtml(transfer.sourceCoord) + '</strong> ' +
+                    '<span class="twsr-small">' + escapeHtml(transfer.sourceName) + '</span><br>' +
+                    '<span class="twsr-small">' +
+                    escapeHtml(rule) + ' &middot; ' +
+                    fmt(transfer.wood) + '/' + fmt(transfer.stone) + '/' + fmt(transfer.iron) +
+                    ' &middot; ' + transfer.legDistance.toFixed(1) + ' fields' +
+                    '</span></div>';
+            }).join('');
 
             html += `
-                <tr id="strr-row-${index}" class="${transfer.kind === 'relay' ? 'twsr-relay' : ''}">
-                    <td>${index + 1}</td>
-                    <td class="twsr-rule">${escapeHtml(rule)}<div class="twsr-small">${escapeHtml(transfer.note)}</div></td>
-                    <td><strong>${transfer.kind === 'relay' ? 'RELAY' : 'DIRECT'}</strong></td>
-                    <td class="twsr-left"><strong>${escapeHtml(transfer.sourceCoord)}</strong><div class="twsr-small">${escapeHtml(transfer.sourceName)}</div></td>
-                    <td>${transfer.sourceToTarget.toFixed(1)}</td>
-                    <td class="twsr-left"><strong>${escapeHtml(transfer.targetCoord)}</strong>${receiverInfo}</td>
-                    <td>${transfer.targetToFinal.toFixed(1)}</td>
-                    <td>${transfer.legDistance.toFixed(1)}</td>
-                    <td>${fmt(transfer.wood)}</td>
-                    <td>${fmt(transfer.stone)}</td>
-                    <td>${fmt(transfer.iron)}</td>
-                    <td><strong>${fmt(transfer.total)}</strong></td>
-                    <td>${transfer.merchants}</td>
-                    <td>${pct(transfer.sourceBeforePct)} -> ${pct(transfer.sourceAfterPct)}</td>
-                    <td><button class="btn btn-confirm-yes twsr-send-button" data-strr-send="${index}">Send resources</button></td>
+                <tr id="strr-group-row-${groupIndex}" class="${group.kinds.includes('relay') ? 'twsr-relay' : ''}">
+                    <td>${groupIndex + 1}</td>
+                    <td><strong>${escapeHtml(getRequestGroupTypeLabel(group))}</strong></td>
+                    <td class="twsr-left">
+                        <strong>${escapeHtml(group.targetCoord)}</strong>
+                        <div class="twsr-small">${escapeHtml(group.targetName || (group.targetCoord === resolvedTarget.coord ? 'Final target' : 'Relay target'))}</div>
+                    </td>
+                    <td class="twsr-left">
+                        <details>
+                            <summary>${group.transfers.length} origin(s)</summary>
+                            <div class="twsr-origin-list">${originDetails}</div>
+                        </details>
+                    </td>
+                    <td>${group.maxLegDistance.toFixed(1)}</td>
+                    <td>${fmt(group.wood)}</td>
+                    <td>${fmt(group.stone)}</td>
+                    <td>${fmt(group.iron)}</td>
+                    <td><strong>${fmt(group.total)}</strong></td>
+                    <td>${group.merchants}</td>
+                    <td><button class="btn btn-confirm-yes twsr-send-button" data-strr-request-group="${groupIndex}">Request</button></td>
                 </tr>
             `;
         });
@@ -1689,46 +1797,87 @@
         if (firstButton) firstButton.focus();
     }
 
-    async function executeTransfer(index, button) {
-        const transfer = plan[index];
-        if (!transfer || transfer.sent || sendLocked) return;
+    async function executeTargetRequest(groupIndex, button) {
+        const requestGroups = groupTransfersByTarget(plan);
+        const group = requestGroups[groupIndex];
+
+        if (!group || !group.transfers.length || sendLocked) return;
 
         sendLocked = true;
         document.querySelectorAll('.twsr-send-button').forEach(node => { node.disabled = true; });
         const oldText = button.textContent;
-        button.textContent = 'Sending...';
-        setStatus('Sending one manual transfer from ' + transfer.sourceCoord + ' to ' + transfer.targetCoord + '...', 'warn');
+        button.textContent = 'Requesting...';
+
+        setStatus(
+            'Requesting ' + group.transfers.length + ' origin(s) into ' + group.targetCoord + '...',
+            'warn'
+        );
+
+        const payload = buildCallDataForRequestGroup(group);
+
+        console.log('[' + SCRIPT_NAME + '] grouped market request', {
+            target: group.targetCoord,
+            targetId: group.targetId,
+            originCount: group.transfers.length,
+            origins: group.transfers.map(entry => ({
+                sourceId: entry.transfer.sourceId,
+                sourceCoord: entry.transfer.sourceCoord,
+                wood: entry.transfer.wood,
+                stone: entry.transfer.stone,
+                iron: entry.transfer.iron,
+                total: entry.transfer.total,
+                merchants: entry.transfer.merchants
+            })),
+            total: group.total,
+            payload
+        });
 
         try {
-            const payload = {
-                target_id: transfer.targetId,
-                wood: transfer.wood,
-                stone: transfer.stone,
-                iron: transfer.iron
-            };
+            const response = await postMarketRequest(group.targetId, payload);
 
-            const response = await postMarketAction(transfer.sourceId, payload);
-            transfer.sent = true;
+            group.transfers.forEach(entry => {
+                entry.transfer.sent = true;
+            });
 
-            const row = document.querySelector('#strr-row-' + index);
+            const row = document.querySelector('#strr-group-row-' + groupIndex);
             if (row) row.remove();
 
-            const message = response && (response.success || response.message)
-                ? (response.success || response.message)
-                : 'Resources sent.';
+            const message = getResponseMessage(
+                response,
+                'Resources requested from ' + group.transfers.length + ' origin(s).'
+            );
+
+            console.log('[' + SCRIPT_NAME + '] grouped market request response', {
+                target: group.targetCoord,
+                success: true,
+                response
+            });
+
             setStatus(message, 'success');
             if (window.UI?.SuccessMessage) UI.SuccessMessage(message);
         } catch (error) {
-            console.error('[' + SCRIPT_NAME + ']', error);
+            console.error('[' + SCRIPT_NAME + '] grouped request failed:', {
+                target: group.targetCoord,
+                targetId: group.targetId,
+                payload,
+                error
+            });
+
             button.textContent = oldText;
-            setStatus('Send failed. Refresh village data and create the plan again before retrying.', 'error');
-            if (window.UI?.ErrorMessage) UI.ErrorMessage('Send failed. Refresh village data and regenerate the plan.');
+            setStatus(
+                'Request failed for ' + group.targetCoord + '. Refresh village data and create the plan again before retrying.',
+                'error'
+            );
+
+            if (window.UI?.ErrorMessage) {
+                UI.ErrorMessage(getResponseMessage(error, 'Could not request resources.'));
+            }
         } finally {
             sendLocked = false;
             document.querySelectorAll('.twsr-send-button').forEach(node => { node.disabled = false; });
             const next = document.querySelector('.twsr-send-button:not(:disabled)');
             if (next) next.focus();
-            else if (transfer.sent) setStatus('All visible planned transfers have been completed.', 'success');
+            else setStatus('All visible grouped requests have been completed.', 'success');
         }
     }
 
