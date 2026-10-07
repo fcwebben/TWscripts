@@ -85,10 +85,10 @@
 (async function twacticsSmartResourceSender() {
     'use strict';
 
-    console.log('[Twactics Smart Resource Sender] Starting...');
+    console.log('[Twactics Smart Resource Sender v1.0.2] Starting...');
 
     const SCRIPT_NAME = 'Twactics Smart Resource Sender';
-    const SCRIPT_VERSION = '1.0.1';
+    const SCRIPT_VERSION = '1.0.2';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 1;
