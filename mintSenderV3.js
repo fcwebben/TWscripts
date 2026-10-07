@@ -1336,7 +1336,10 @@
             refresh: () => refreshData(true),
             createPlan: generateFromUi,
             getPlan: () => plan.slice(),
-            getVillages: () => villages.slice()
+            getVillages: () => villages.slice(),
+            getDiagnosticSnapshot: buildDiagnosticSnapshot,
+            copyDiagnosticReport,
+            downloadDiagnosticJson
         };
     }
 
@@ -1365,6 +1368,173 @@
         }
     }
 
+    function buildDiagnosticSnapshot() {
+        const direct = plan.filter(item => item.kind === 'direct');
+        const relay = plan.filter(item => item.kind === 'relay');
+
+        return {
+            generatedAt: new Date().toISOString(),
+            script: {
+                name: SCRIPT_NAME,
+                version: SCRIPT_VERSION
+            },
+            world: typeof game_data !== 'undefined' ? game_data.world : null,
+            settings: { ...settings },
+            target: resolvedTarget ? { ...resolvedTarget } : null,
+            summary: {
+                villagesLoaded: villages.length,
+                plannedTransfers: plan.length,
+                uniqueOrigins: new Set(plan.map(item => item.sourceId)).size,
+                directTransfers: direct.length,
+                relayTransfers: relay.length,
+                totalResources: plan.reduce((sum, item) => sum + item.total, 0),
+                directResources: direct.reduce((sum, item) => sum + item.total, 0),
+                relayResources: relay.reduce((sum, item) => sum + item.total, 0)
+            },
+            transfers: plan.map((item, index) => ({
+                index: index + 1,
+                type: item.kind,
+                rule: item.rule,
+                note: item.note,
+                receiverPriority: item.receiverPriority,
+                receiverLabel: item.receiverLabel,
+                sourceId: item.sourceId,
+                sourceName: item.sourceName,
+                sourceCoord: item.sourceCoord,
+                sourceToFinal: item.sourceToTarget,
+                targetId: item.targetId,
+                targetName: item.targetName,
+                targetCoord: item.targetCoord,
+                receiverToFinal: item.targetToFinal,
+                legDistance: item.legDistance,
+                wood: item.wood,
+                clay: item.stone,
+                iron: item.iron,
+                total: item.total,
+                merchantsUsed: item.merchants,
+                sourceWhBeforePct: item.sourceBeforePct,
+                sourceWhAfterPct: item.sourceAfterPct,
+                receiverWhBeforePct: item.receiverBeforePct ?? null,
+                receiverWhAfterPct: item.receiverAfterPct ?? null,
+                sent: item.sent
+            })),
+            villages: villages.map(v => ({
+                id: v.id,
+                name: v.name,
+                coord: v.coord,
+                wood: v.wood,
+                clay: v.stone,
+                iron: v.iron,
+                warehouse: v.warehouse,
+                availableMerchants: v.availableMerchants,
+                totalMerchants: v.totalMerchants,
+                whMaxPct: maxFill(v)
+            }))
+        };
+    }
+
+    function buildDiagnosticText(snapshot) {
+        const lines = [];
+        lines.push('# Twactics Smart Resource Sender - Test Report');
+        lines.push('');
+        lines.push('Generated: ' + snapshot.generatedAt);
+        lines.push('World: ' + (snapshot.world || 'unknown'));
+        lines.push('Script: ' + snapshot.script.name + ' ' + snapshot.script.version);
+        lines.push('');
+        lines.push('## Settings');
+        lines.push(JSON.stringify(snapshot.settings, null, 2));
+        lines.push('');
+        lines.push('## Target');
+        lines.push(JSON.stringify(snapshot.target, null, 2));
+        lines.push('');
+        lines.push('## Summary');
+        lines.push(JSON.stringify(snapshot.summary, null, 2));
+        lines.push('');
+        lines.push('## Transfer plan');
+
+        snapshot.transfers.forEach(t => {
+            lines.push(
+                [
+                    '#' + t.index,
+                    t.type.toUpperCase(),
+                    t.rule + (t.receiverPriority ? '/P' + t.receiverPriority : ''),
+                    t.sourceCoord + ' -> ' + t.targetCoord,
+                    'origin->final ' + Number(t.sourceToFinal).toFixed(1),
+                    'receiver->final ' + Number(t.receiverToFinal).toFixed(1),
+                    'leg ' + Number(t.legDistance).toFixed(1),
+                    'W/C/I ' + t.wood + '/' + t.clay + '/' + t.iron,
+                    'total ' + t.total,
+                    'merchants ' + t.merchantsUsed,
+                    'origin WH ' + (t.sourceWhBeforePct * 100).toFixed(1) + '% -> ' + (t.sourceWhAfterPct * 100).toFixed(1) + '%',
+                    t.receiverWhBeforePct !== null
+                        ? 'receiver WH ' + (t.receiverWhBeforePct * 100).toFixed(1) + '% -> ' + (t.receiverWhAfterPct * 100).toFixed(1) + '%'
+                        : '',
+                    t.note || ''
+                ].filter(Boolean).join(' | ')
+            );
+        });
+
+        lines.push('');
+        lines.push('## Raw JSON');
+        lines.push(JSON.stringify(snapshot, null, 2));
+
+        return lines.join('\n');
+    }
+
+    function logDiagnosticSnapshot() {
+        const snapshot = buildDiagnosticSnapshot();
+        console.group('[Twactics Smart Resource Sender] Routing test');
+        console.log('Settings:', snapshot.settings);
+        console.log('Target:', snapshot.target);
+        console.log('Summary:', snapshot.summary);
+        console.table(snapshot.transfers.map(t => ({
+            '#': t.index,
+            Type: t.type,
+            Rule: t.receiverPriority ? t.rule + '/P' + t.receiverPriority : t.rule,
+            Origin: t.sourceCoord,
+            Destination: t.targetCoord,
+            'Origin->Final': Number(t.sourceToFinal).toFixed(1),
+            'Receiver->Final': Number(t.receiverToFinal).toFixed(1),
+            Leg: Number(t.legDistance).toFixed(1),
+            Wood: t.wood,
+            Clay: t.clay,
+            Iron: t.iron,
+            Total: t.total,
+            Merchants: t.merchantsUsed,
+            'WH before': (t.sourceWhBeforePct * 100).toFixed(1) + '%',
+            'WH after': (t.sourceWhAfterPct * 100).toFixed(1) + '%'
+        })));
+        console.log('Full diagnostic snapshot:', snapshot);
+        console.groupEnd();
+        return snapshot;
+    }
+
+    async function copyDiagnosticReport() {
+        const snapshot = logDiagnosticSnapshot();
+        const report = buildDiagnosticText(snapshot);
+
+        try {
+            await navigator.clipboard.writeText(report);
+            if (window.UI?.SuccessMessage) UI.SuccessMessage('Test report copied to clipboard.');
+        } catch (error) {
+            console.error('[' + SCRIPT_NAME + '] Clipboard export failed:', error);
+            showInfoDialog('Test report', report);
+        }
+    }
+
+    function downloadDiagnosticJson() {
+        const snapshot = logDiagnosticSnapshot();
+        const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'twactics-resource-sender-test-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
     function renderPlan() {
         const output = document.querySelector('#strr-output');
         if (!output || !resolvedTarget) return;
@@ -1388,6 +1558,10 @@
                 </div>
                 <div class="twsr-small" style="margin-top:6px;">
                     Relay rows are listed first. Planned relay incoming reserves warehouse space immediately, but does not become outgoing stock until it actually arrives. For multi-hop movement, complete the relay rows and rerun the script after arrival.
+                </div>
+                <div class="twsr-buttons" style="margin-top:8px;">
+                    <button id="strr-copy-test" type="button" class="btn">Copy test report</button>
+                    <button id="strr-download-test" type="button" class="btn">Download test JSON</button>
                 </div>
             </div>
         `;
@@ -1454,6 +1628,11 @@
 
         html += '</tbody></table></div>';
         output.innerHTML = html;
+
+        output.querySelector('#strr-copy-test')?.addEventListener('click', copyDiagnosticReport);
+        output.querySelector('#strr-download-test')?.addEventListener('click', downloadDiagnosticJson);
+
+        logDiagnosticSnapshot();
 
         const firstButton = output.querySelector('.twsr-send-button:not(:disabled)');
         if (firstButton) firstButton.focus();
