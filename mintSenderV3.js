@@ -85,10 +85,10 @@
 (async function twacticsSmartResourceSender() {
     'use strict';
 
-    console.log('[Twactics Smart Resource Sender v1.0.4] Starting...');
+    console.log('[Twactics Smart Resource Sender v1.0.5] Starting...');
 
     const SCRIPT_NAME = 'Twactics Smart Resource Sender';
-    const SCRIPT_VERSION = '1.0.4';
+    const SCRIPT_VERSION = '1.0.5';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 1;
@@ -291,6 +291,29 @@
 
         return runRateLimitedNetworkRequest(function () {
             return new Promise((resolve, reject) => {
+                let settled = false;
+
+                const finishResolve = value => {
+                    if (settled) return;
+                    settled = true;
+                    window.clearTimeout(timeoutId);
+                    resolve(value);
+                };
+
+                const finishReject = error => {
+                    if (settled) return;
+                    settled = true;
+                    window.clearTimeout(timeoutId);
+                    reject(error);
+                };
+
+                // Never leave the UI permanently locked if Tribal Wars fails to
+                // invoke either callback. The user can safely refresh the plan
+                // before retrying after a timeout.
+                const timeoutId = window.setTimeout(() => {
+                    finishReject(new Error('Market request timed out after 15 seconds.'));
+                }, 15000);
+
                 try {
                     TribalWars.post(
                         'market',
@@ -298,15 +321,15 @@
                         payload,
                         response => {
                             if (responseHasError(response)) {
-                                reject(response);
+                                finishReject(response);
                                 return;
                             }
-                            resolve(response);
+                            finishResolve(response);
                         },
-                        error => reject(error)
+                        error => finishReject(error)
                     );
                 } catch (error) {
-                    reject(error);
+                    finishReject(error);
                 }
             });
         }, 'POST market call');
@@ -1400,9 +1423,9 @@
             });
         });
         box.addEventListener('click', async event => {
-            const button = event.target.closest('[data-strr-request-group]');
+            const button = event.target.closest('[data-strr-request-target]');
             if (!button) return;
-            await executeTargetRequest(Number(button.dataset.strrRequestGroup), button);
+            await executeTargetRequest(button.dataset.strrRequestTarget, button);
         });
 
         makeDraggable(box, box.querySelector('.twsr-header'));
@@ -1761,7 +1784,7 @@
             }).join('');
 
             html += `
-                <tr id="strr-group-row-${groupIndex}" class="${group.kinds.includes('relay') ? 'twsr-relay' : ''}">
+                <tr id="strr-group-row-${escapeHtml(String(group.targetId))}" class="${group.kinds.includes('relay') ? 'twsr-relay' : ''}">
                     <td>${groupIndex + 1}</td>
                     <td><strong>${escapeHtml(getRequestGroupTypeLabel(group))}</strong></td>
                     <td class="twsr-left">
@@ -1780,7 +1803,7 @@
                     <td>${fmt(group.iron)}</td>
                     <td><strong>${fmt(group.total)}</strong></td>
                     <td>${group.merchants}</td>
-                    <td><button class="btn btn-confirm-yes twsr-send-button" data-strr-request-group="${groupIndex}">Request</button></td>
+                    <td><button class="btn btn-confirm-yes twsr-send-button" data-strr-request-target="${escapeHtml(String(group.targetId))}">Request</button></td>
                 </tr>
             `;
         });
@@ -1797,11 +1820,23 @@
         if (firstButton) firstButton.focus();
     }
 
-    async function executeTargetRequest(groupIndex, button) {
+    async function executeTargetRequest(targetId, button) {
         const requestGroups = groupTransfersByTarget(plan);
-        const group = requestGroups[groupIndex];
+        const group = requestGroups.find(item => String(item.targetId) === String(targetId));
 
-        if (!group || !group.transfers.length || sendLocked) return;
+        if (!group || !group.transfers.length) {
+            console.warn('[' + SCRIPT_NAME + '] Request group no longer exists. Re-rendering plan.', { targetId });
+            renderPlan();
+            return;
+        }
+
+        if (sendLocked) {
+            console.warn('[' + SCRIPT_NAME + '] Request ignored because another request is still in progress.', {
+                targetId: group.targetId,
+                targetCoord: group.targetCoord
+            });
+            return;
+        }
 
         sendLocked = true;
         document.querySelectorAll('.twsr-send-button').forEach(node => { node.disabled = true; });
@@ -1839,7 +1874,7 @@
                 entry.transfer.sent = true;
             });
 
-            const row = document.querySelector('#strr-group-row-' + groupIndex);
+            const row = document.getElementById('strr-group-row-' + String(group.targetId));
             if (row) row.remove();
 
             const message = getResponseMessage(
@@ -1882,6 +1917,10 @@
     }
 
     async function refreshData(showMessage = false) {
+        // Refresh is also a recovery path for any stale UI lock.
+        sendLocked = false;
+        document.querySelectorAll('.twsr-send-button').forEach(node => { node.disabled = false; });
+
         const build = document.querySelector('#strr-build');
         const refresh = document.querySelector('#strr-refresh');
         if (build) build.disabled = true;
