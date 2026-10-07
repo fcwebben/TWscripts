@@ -25,7 +25,7 @@
  *
  * Routing overview:
  * - <= direct radius: always DIRECT to final target
- * - Side rule: outside direct radius, if a hypothetical direct send leaves <50% WH, DIRECT
+ * - Side rule: outside direct radius, if a hypothetical direct send leaves <50% WH, try P5-P10 relay first, then DIRECT fallback
  * - P1: >70% WH, <=18 fields, hypothetical direct leaves <70% -> DIRECT
  * - P2: >70% WH, <=18 fields, hypothetical direct leaves >=70% -> P5/P6 relay, else DIRECT
  * - P3: >70% WH, 18-24 fields, hypothetical direct leaves 50-70% -> P5/P6 relay, else DIRECT
@@ -85,10 +85,10 @@
 (async function twacticsSmartResourceSender() {
     'use strict';
 
-    console.log('[Twactics Smart Resource Sender v1.0.2] Starting...');
+    console.log('[Twactics Smart Resource Sender v1.0.3] Starting...');
 
     const SCRIPT_NAME = 'Twactics Smart Resource Sender';
-    const SCRIPT_VERSION = '1.0.2';
+    const SCRIPT_VERSION = '1.0.3';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 1;
@@ -619,13 +619,21 @@
         const need = receiverNeed(target, priority, cfg);
         const amount = { wood: 0, stone: 0, iron: 0 };
 
-        // Fill the receiver's lowest resource first. If equal, use the resource
-        // with the largest absolute deficit first.
+        // Prioritize the source's fullest/most urgent resource first.
+        // Receiver need still acts as a hard ceiling, so we relieve overflow risk
+        // without overfilling the relay village.
         const order = [...RESOURCE_KEYS].sort((a, b) => {
-            const ar = projectedValue(target, a) / target.warehouse;
-            const br = projectedValue(target, b) / target.warehouse;
-            if (Math.abs(ar - br) > 0.000001) return ar - br;
-            return need[b] - need[a];
+            const sourceWh = Math.max(1, source.warehouse);
+            const ar = Math.max(0, source[a]) / sourceWh;
+            const br = Math.max(0, source[b]) / sourceWh;
+
+            if (Math.abs(ar - br) > 0.000001) return br - ar;
+
+            // If source fullness is equal, prefer the resource for which the
+            // receiver has the largest safe deficit.
+            if (need[a] !== need[b]) return need[b] - need[a];
+
+            return RESOURCE_KEYS.indexOf(a) - RESOURCE_KEYS.indexOf(b);
         });
 
         for (const key of order) {
@@ -808,9 +816,32 @@
                 continue;
             }
 
-            // Side rule overrides the routing priorities.
+            // Outside the direct radius, prefer a useful closer relay first.
+            // The <50% side rule is now a DIRECT fallback rather than an override,
+            // so distant villages do not bypass an available short relay route.
             if (afterDirectFill < SIDE_DIRECT_FLOOR) {
-                addDirectTransfer(transfers, source, finalTarget, 'DIRECT', 'Side rule: hypothetical direct leaves <50%', cfg);
+                const relayed = routeThroughRelays(
+                    transfers,
+                    source,
+                    state,
+                    finalTarget,
+                    'SIDE',
+                    [5, 6, 7, 8, 9, 10],
+                    cfg
+                );
+
+                if (!relayed || source.availableMerchants > 0) {
+                    addDirectTransfer(
+                        transfers,
+                        source,
+                        finalTarget,
+                        relayed ? 'SIDE' : 'DIRECT',
+                        relayed
+                            ? 'No more useful closer relay room -> direct remainder'
+                            : 'Side rule fallback: no useful closer relay -> direct',
+                        cfg
+                    );
+                }
                 continue;
             }
 
