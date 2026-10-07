@@ -142,6 +142,19 @@
         return world + ':' + name;
     }
 
+    function getCurrentVillageCoord() {
+        if (typeof game_data === 'undefined' || !game_data.village) return '';
+
+        const direct = parseCoord(game_data.village.coord || '');
+        if (direct) return direct.coord;
+
+        const x = Number(game_data.village.x);
+        const y = Number(game_data.village.y);
+        if (Number.isFinite(x) && Number.isFinite(y)) return x + '|' + y;
+
+        return '';
+    }
+
     function getScriptDataObject() {
         if (typeof TribalWars === 'undefined' || TribalWars.scriptData === undefined || TribalWars.scriptData === null) {
             return null;
@@ -183,7 +196,14 @@
         const scriptData = getScriptDataObject();
         const scriptSettings = scriptData && scriptData.settings ? scriptData.settings : null;
 
-        return sanitizeSettings(Object.assign({}, DEFAULTS, localSettings || {}, scriptSettings || {}));
+        const merged = sanitizeSettings(Object.assign({}, DEFAULTS, localSettings || {}, scriptSettings || {}));
+        const currentVillageCoord = getCurrentVillageCoord();
+
+        // Target always starts as the village currently open in Tribal Wars.
+        // Do not reuse a cached target coordinate from an earlier run.
+        if (currentVillageCoord) merged.targetCoord = currentVillageCoord;
+
+        return merged;
     }
 
     function saveSettings(value) {
