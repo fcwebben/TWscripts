@@ -94,7 +94,7 @@
     'use strict';
 
     const SCRIPT_NAME = 'Twactics Smart Mint Resource Sender';
-    const SCRIPT_VERSION = '1.6.2';
+    const SCRIPT_VERSION = '1.6.1';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 4;
@@ -384,78 +384,13 @@
         return response.success || response.message || response.error || response.warning || fallback;
     }
 
-    function collectErrorText(value, depth = 0, seen = new Set()) {
-        if (value === undefined || value === null || depth > 5) return [];
-        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-            return [String(value)];
-        }
-
-        if (typeof value !== 'object') return [];
-        if (seen.has(value)) return [];
-        seen.add(value);
-
-        const texts = [];
-
-        if (value instanceof Error && value.message) {
-            texts.push(String(value.message));
-        }
-
-        const priorityKeys = [
-            'message',
-            'error',
-            'errors',
-            'warning',
-            'warnings',
-            'responseJSON',
-            'responseText',
-            'statusText',
-            'detail',
-            'details'
-        ];
-
-        for (const key of priorityKeys) {
-            if (!(key in value)) continue;
-            const nested = value[key];
-
-            if (key === 'responseText' && typeof nested === 'string') {
-                texts.push(nested);
-
-                try {
-                    const parsed = JSON.parse(nested);
-                    texts.push(...collectErrorText(parsed, depth + 1, seen));
-                } catch (_) {}
-                continue;
-            }
-
-            texts.push(...collectErrorText(nested, depth + 1, seen));
-        }
-
-        if (Array.isArray(value)) {
-            value.forEach(item => {
-                texts.push(...collectErrorText(item, depth + 1, seen));
-            });
-        }
-
-        return texts;
-    }
-
     function isResourceAvailabilityError(error) {
-        const texts = collectErrorText(error);
-        const directMessage = getResponseMessage(error, error?.message || '');
-        if (directMessage !== undefined && directMessage !== null) {
-            texts.push(String(directMessage));
-        }
-
-        const message = cleanText(texts.join(' ')).toLowerCase();
+        const message = cleanText(getResponseMessage(error, error?.message || '')).toLowerCase();
         if (!message) return false;
 
         return (
-            /not[\s_-]*enough[\s\S]{0,120}(resource|wood|clay|stone|iron|merchant|trader|transport)/i.test(message) ||
-            /(resource|wood|clay|stone|iron|merchant|trader|transport)[\s\S]{0,120}not[\s_-]*enough/i.test(message) ||
-            /insufficient[\s\S]{0,120}(resource|wood|clay|stone|iron|merchant|trader|transport)/i.test(message) ||
-            /(resource|wood|clay|stone|iron|merchant|trader|transport)[\s\S]{0,120}insufficient/i.test(message) ||
-            /do not have enough[\s\S]{0,120}(resource|wood|clay|stone|iron|merchant|trader|transport)/i.test(message) ||
-            /don't have enough[\s\S]{0,120}(resource|wood|clay|stone|iron|merchant|trader|transport)/i.test(message)
+            /(not enough|insufficient|do not have enough|don't have enough).*(resource|wood|clay|stone|iron|merchant|trader|transport)/i.test(message) ||
+            /(resource|wood|clay|stone|iron|merchant|trader|transport).*(not enough|insufficient)/i.test(message)
         );
     }
 
