@@ -1,0 +1,4921 @@
+/*
+ * Copyright (c) 2026 Twactics
+ * License: MIT
+ *
+ * Twactics Relic Planner
+ *
+ * Helps players evaluate relic placement plans using visible/loaded village data,
+ * relic inventory data and current relic overview data.
+ *
+ * This script:
+ * - Reads village coordinates from Overview pages
+ * - Reads farm, merchant and building-level data from Overview pages when needed for planning
+ * - Reads relic data from Treasury -> Inventory
+ * - Reads placed relics from Treasury -> Overview
+ * - Calculates suggested relic placements after a manual user click
+ * - Can focus Offensive strength, Defensive strength or Recruitment output scoring on one village group while still placing relics on any owned village
+ * - Can optionally read Account Manager troop targets/current counts for recruitment-demand scoring
+ * - Uses diminishing-return scoring for Offense/Defense/Recruitment so balanced useful bonuses are preferred over one-stat stacking
+ *
+ * v1.3.1 notes:
+ * - Routes every script GET through one shared request queue/rate limiter.
+ * - Caches world/static reads for at least 60 minutes.
+ * - Caches parsed Account Manager troop reads and caps fallback pagination.
+ * - Removes parallel GET bursts from planner loading.
+ *
+ * v1.3.0 notes:
+ * - Adds Defensive strength with Focus Group scoring.
+ * - Reduces large-account UI stalls with candidate-center pruning, browser yielding and bounded local search.
+ * - Copy plan now includes a direct Inventory link for each recommended placement village.
+ * - Focus Group remains a scoring filter only; relics may still be placed on any eligible owned village whose range reaches scored villages.
+ * - Optional AM demand mode remains read-only and only loads when enabled.
+ *
+ * This script does NOT:
+ * - Send attacks, support, or troops
+ * - Auto-click game actions
+ * - Equip, remove, upgrade, trade, or reroll relics
+ * - Use external servers or external files
+ */
+
+/*
+ * Disclaimer:
+ * By uploading a user-generated mod for use with Tribal Wars, the creator grants
+ * InnoGames a perpetual, irrevocable, worldwide, royalty-free, non-exclusive
+ * license to use, reproduce, distribute, publicly display, modify, and create
+ * derivative works of the mod. This license permits InnoGames to incorporate the
+ * mod into any aspect of the game and its related services, including promotional
+ * and commercial endeavors, without any requirement for compensation or
+ * attribution to the uploader. The uploader represents and warrants that they
+ * have the legal right to grant this license and that the mod does not infringe
+ * upon any third-party rights. German law applies.
+ */
+
+(function () {
+  "use strict";
+
+  if (window.twacticsRelicPlannerV2Loaded) {
+    console.log("Twactics Relic Planner v2 already loaded");
+    return;
+  }
+
+  window.twacticsRelicPlannerV2Loaded = true;
+
+  const SCRIPT_NAME = "Twactics Relic Planner";
+  const SCRIPT_VERSION = "v1.3.1";
+  const BOX_ID = "twactics-relic-planner-v2";
+  const STYLE_ID = "twactics-relic-planner-v2-style";
+  const DEFAULT_BENEFIT_CAP = 20;
+  const BALANCE_POWER = 0.65;
+  const OPTIMIZATION_YIELD_EVERY = 350;
+  const LOCAL_SEARCH_MAX_ESTIMATED_EVALUATIONS = 120000;
+  const LOCAL_SEARCH_MAX_VILLAGES = 120;
+
+  // Network safety / review compliance.
+  // All GET requests made by this script must pass through the same queue.
+  const GET_MIN_INTERVAL_MS = 1000;
+  const WORLD_CACHE_TTL_MS = 60 * 60 * 1000;
+  const GROUP_CACHE_TTL_MS = 10 * 60 * 1000;
+  const AM_CACHE_TTL_MS = 10 * 60 * 1000;
+  const MAX_AM_PAGE_READS = 10;
+  const CACHE_PREFIX = "twactics_relic_planner_v1_3_1:";
+  const getRequestQueue = [];
+  const inFlightGetRequests = new Map();
+  let getQueueRunning = false;
+  let lastGetStartedAt = 0;
+
+  const AM_TROOP_UNITS = ["spear", "sword", "axe", "archer", "spy", "light", "marcher", "heavy", "ram", "catapult"];
+  const AM_UNIT_BUILDING = {
+    spear: "barracks",
+    sword: "barracks",
+    axe: "barracks",
+    archer: "barracks",
+    spy: "stable",
+    light: "stable",
+    marcher: "stable",
+    heavy: "stable",
+    ram: "workshop",
+    catapult: "workshop"
+  };
+
+  const QUALITY_RANGE_LABELS = {
+    2: "Shoddy / Sturdy",
+    3: "Enhanced / Superior",
+    4: "Renowned"
+  };
+
+  const OFFENSE_WEIGHTS = {
+    axe_attack: 1.0,
+    axe_offdef: 1.0,
+    light_attack: 1.0,
+    light_offdef: 1.0,
+    ram_attack: 0.45,
+    ram_offdef: 0.45,
+    ram_damage: 0.45,
+    marcher_attack: 0.35,
+    marcher_offdef: 0.35,
+    heavy_attack: 0.15,
+    heavy_offdef: 0.15,
+    catapult_attack: 0.10,
+    catapult_offdef: 0.10,
+    catapult_damage: 0.10
+  };
+
+  const DEFENSE_WEIGHTS = {
+    spear_offdef: 1.0,
+    spear_defense: 1.0,
+    sword_offdef: 1.0,
+    sword_defense: 1.0,
+    archer_offdef: 1.0,
+    archer_defense: 1.0,
+    heavy_offdef: 1.0,
+    heavy_defense: 1.0,
+    catapult_offdef: 0.10,
+    catapult_defense: 0.10
+  };
+
+  const RECRUITMENT_WEIGHTS = {
+    barracks_speed: 1.10,
+    stable_speed: 1.00,
+    barracks_cost: 0.38,
+    stable_cost: 0.35,
+    workshop_speed: 0.40,
+    workshop_cost: 0.24,
+    academy_speed: 0.10
+  };
+
+  const MERCHANT_WEIGHTS = {
+    merchant_travel_speed: 1.0,
+    merchant_capacity: 1.0
+  };
+
+  const HAUL_WEIGHTS = {
+    haul_capacity: 1.0
+  };
+
+  const PRODUCTION_WEIGHTS = {
+    wood_production: 1.0,
+    clay_production: 1.0,
+    iron_production: 1.0
+  };
+
+  const CONSTRUCTION_WEIGHTS = {
+    construction_speed: 1.0
+  };
+
+  const NOBLE_WEIGHTS = {
+    academy_speed: 1.0,
+    noble_refund: 0.75
+  };
+
+  const RELEVANT_INTERNAL_STAT_KEYS = {
+    barracks_speed: true,
+    stable_speed: true,
+    workshop_speed: true,
+    academy_speed: true,
+    barracks_cost: true,
+    stable_cost: true,
+    workshop_cost: true,
+    merchant_travel_speed: true,
+    merchant_capacity: true,
+    haul_capacity: true,
+    wood_production: true,
+    clay_production: true,
+    iron_production: true,
+    construction_speed: true,
+    noble_refund: true,
+    spear_attack: true,
+    spear_offdef: true,
+    spear_defense: true,
+    sword_attack: true,
+    sword_offdef: true,
+    sword_defense: true,
+    axe_attack: true,
+    axe_offdef: true,
+    axe_defense: true,
+    archer_attack: true,
+    archer_offdef: true,
+    archer_defense: true,
+    light_attack: true,
+    light_offdef: true,
+    light_defense: true,
+    marcher_attack: true,
+    marcher_offdef: true,
+    marcher_defense: true,
+    heavy_attack: true,
+    heavy_offdef: true,
+    heavy_defense: true,
+    ram_attack: true,
+    ram_offdef: true,
+    ram_defense: true,
+    ram_damage: true,
+    catapult_attack: true,
+    catapult_offdef: true,
+    catapult_defense: true,
+    catapult_damage: true
+  };
+
+  const INTERNAL_STAT_LABELS = {
+    barracks_speed: "Barracks speed",
+    stable_speed: "Stable speed",
+    workshop_speed: "Workshop speed",
+    academy_speed: "Academy speed",
+    barracks_cost: "Barracks cost reduction",
+    stable_cost: "Stable cost reduction",
+    workshop_cost: "Workshop cost reduction",
+    merchant_travel_speed: "Merchant travel speed",
+    merchant_capacity: "Merchant capacity",
+    haul_capacity: "Haul capacity",
+    wood_production: "Wood production",
+    clay_production: "Clay production",
+    iron_production: "Iron production",
+    construction_speed: "Construction speed",
+    noble_refund: "Nobleman refund",
+    spear_attack: "Spear fighter attack",
+    spear_offdef: "Spear fighter off/def",
+    spear_defense: "Spear fighter defense",
+    sword_attack: "Swordsman attack",
+    sword_offdef: "Swordsman off/def",
+    sword_defense: "Swordsman defense",
+    axe_attack: "Axeman attack",
+    axe_offdef: "Axeman off/def",
+    axe_defense: "Axeman defense",
+    archer_attack: "Archer attack",
+    archer_offdef: "Archer off/def",
+    archer_defense: "Archer defense",
+    light_attack: "Light cavalry attack",
+    light_offdef: "Light cavalry off/def",
+    light_defense: "Light cavalry defense",
+    marcher_attack: "Mounted archer attack",
+    marcher_offdef: "Mounted archer off/def",
+    marcher_defense: "Mounted archer defense",
+    heavy_attack: "Heavy cavalry attack",
+    heavy_offdef: "Heavy cavalry off/def",
+    heavy_defense: "Heavy cavalry defense",
+    ram_attack: "Ram attack",
+    ram_offdef: "Ram off/def",
+    ram_defense: "Ram defense",
+    ram_damage: "Ram building damage",
+    catapult_attack: "Catapult attack",
+    catapult_offdef: "Catapult off/def",
+    catapult_defense: "Catapult defense",
+    catapult_damage: "Catapult building damage"
+  };
+
+  const RELIC_TYPE_UNIT_KEYS = {
+    halberd: "spear",
+    longsword: "sword",
+    greataxe: "axe",
+    shortspear: "light",
+    longbow: "archer",
+    shortbow: "marcher",
+    banner: "heavy",
+    morningstar: "ram",
+    bonfire: "catapult"
+  };
+
+  const MAIN_RELIC_STAT_KEYS = {
+    halberd: { b_unitstat: "spear_offdef" },
+    longsword: { b_unitstat: "sword_offdef" },
+    greataxe: { b_unitstat: "axe_offdef" },
+    shortspear: { b_unitstat: "light_offdef" },
+    longbow: { b_unitstat: "archer_offdef" },
+    shortbow: { b_unitstat: "marcher_offdef" },
+    banner: { b_unitstat: "heavy_offdef" },
+    morningstar: { b_unitstat: "ram_damage" },
+    bonfire: { b_unitstat: "catapult_damage" },
+    dummy: { b_recruitment_building: "barracks_speed" },
+    horseshoe: { b_recruitment_building: "stable_speed" },
+    wheel: { b_recruitment_building: "workshop_speed" },
+    handsaw: { b_recruitment_cost: "workshop_cost" },
+    axe: { b_wood: "wood_production" },
+    chisel: { b_stone: "clay_production" },
+    pickaxe: { b_iron: "iron_production" }
+  };
+
+  const SUB_STAT_KEYS_BY_ID = {
+    1: "spear_offdef",
+    2: "sword_offdef",
+    3: "axe_offdef",
+    4: "archer_offdef",
+    5: "light_offdef",
+    6: "marcher_offdef",
+    7: "heavy_offdef",
+    8: "catapult_damage",
+    9: "ram_damage",
+    10: "barracks_speed",
+    11: "stable_speed",
+    12: "workshop_speed",
+    13: "haul_capacity",
+    14: "clay_production",
+    15: "wood_production",
+    16: "iron_production",
+    19: "barracks_cost",
+    20: "stable_cost",
+    21: "workshop_cost",
+    22: "spear_attack",
+    23: "sword_attack",
+    24: "axe_attack",
+    25: "archer_attack",
+    26: "marcher_attack",
+    27: "light_attack",
+    28: "heavy_attack",
+    29: "catapult_attack",
+    30: "ram_attack",
+    31: "spear_defense",
+    32: "sword_defense",
+    33: "axe_defense",
+    34: "archer_defense",
+    35: "light_defense",
+    36: "marcher_defense",
+    37: "heavy_defense",
+    38: "catapult_defense",
+    39: "ram_defense",
+    40: "construction_speed",
+    41: "merchant_travel_speed",
+    42: "merchant_capacity",
+    43: "academy_speed",
+    44: "noble_refund"
+  };
+
+  const UNIT_ALIASES = {
+    spear: ["spear fighter", "spear", "spearman", "pikinier", "piquier", "lancero", "lanceiro", "lanciere", "lancier", "lancnik", "kopjas", "kopjanik", "spyd", "spjut", "speervechter", "pikeman", "bộ binh giáo", "mızrak", "mızrakçı", "pikás", "lándzsás", "槍", "копей", "спис", "пик"],
+    sword: ["swordsman", "sword", "epee", "sabre", "espadachin", "espadachim", "espadassin", "szermierz", "swords", "svaerd", "svärd", "zwaard", "šermiar", "kard", "espada", "miecz", "меч"],
+    axe: ["axeman", "axe", "bárdos", "bardos", "baltas", "topór", "topor", "hache", "hacha", "machado", "axt", "bijl", "secur", "balta", "sjekira", "sekera", "кирка", "топор"],
+    archer: ["archer", "bowman", "íjász", "ijasz", "bogenschutze", "bogenschütze", "archer", "arquero", "arqueiro", "arcier", "łucznik", "lucznik", "boogschutter", "bågskytt", "bueskytte", "стрелец", "лучник"],
+    light: ["light cavalry", "light", "könnyűlovas", "konnyulovas", "leichte kavallerie", "cavalerie legere", "cavalerie légère", "caballeria ligera", "cavalaria leve", "lekka kawaleria", "lichte cavalerie", "lätt kavalleri", "let kavalerie", "kavalérie", "hafif süvari", "легкая кавалерия", "лёгкая кавалерия"],
+    marcher: ["mounted archer", "horse archer", "lovas íjász", "lovas ijasz", "berittener bogenschutze", "berittener bogenschütze", "archer monte", "archer monté", "arquero a caballo", "arqueiro montado", "łucznik konny", "lucznik konny", "bereden boogschutter", "beriden bågskytt", "atli okcu", "atlı okçu", "конный лучник"],
+    heavy: ["heavy cavalry", "heavy", "nehézlovas", "nehezlovas", "schwere kavallerie", "cavalerie lourde", "caballeria pesada", "cavalaria pesada", "ciezka kawaleria", "ciężka kawaleria", "zware cavalerie", "tungt kavalleri", "tung kavalerie", "agir suvari", "ağır süvari", "тяжелая кавалерия", "тяжёлая кавалерия"],
+    ram: ["ram", "battering ram", "faltörő kos", "faltoro kos", "rammbock", "belier", "bélier", "ariete", "aríete", "ariete", "taran", "stormram", "murbräcka", "koçbaşı", "таран"],
+    catapult: ["catapult", "katapult", "catapulta", "catapulte", "katapulta", "mancınık", "mancinik", "катапульта"],
+    spy: ["scout", "spy", "felderito", "felderítő", "espion", "explorador", "scout", "zwiadowca", "verkenner", "spion", "kaşif", "kashif", "разведчик", "шпион"]
+  };
+
+  const BUILDING_ALIASES = {
+    barracks: ["barracks", "barakk", "caserne", "cuartel", "quartel", "caserma", "koszary", "kaserne", "kazárna", "kazaro", "kasarna", "barak", "kışla", "kisla", "казарма"],
+    stable: ["stable", "istálló", "istallo", "ecurie", "écurie", "establo", "estabulo", "estábulo", "scuderia", "stajnia", "stal", "stall", "stalla", "ahır", "ahir", "конюшня"],
+    workshop: ["workshop", "műhely", "muhely", "atelier", "taller", "oficina", "officina", "warsztat", "werkplaats", "verkstad", "værksted", "dielna", "radionica", "atölye", "atolye", "мастерская"],
+    academy: ["academy", "akadémia", "akademia", "academie", "académie", "academia", "accademia", "akademie", "akademi", "академия"]
+  };
+
+  const MERCHANT_ALIASES = {
+    merchant: ["merchant", "merchants", "trader", "traders", "market merchant", "handlare", "köpman", "kopman", "handelsman", "kereskedo", "kereskedő", "kereskedok", "kereskedők", "händler", "haendler", "marchand", "marchands", "comerciante", "comerciantes", "mercador", "mercadores", "mercante", "mercanti", "kupiec", "kupcy", "handelaar", "handelaars", "tüccar", "tuccar", "торговец", "торговцы"],
+    travelSpeed: ["merchant travel speed", "merchant speed", "trader speed", "travel speed", "movement speed", "resehastighet", "utazási sebesség", "utazasi sebesseg", "vitesse de déplacement", "vitesse de deplacement", "velocidad de viaje", "velocidade de viagem", "reisegeschwindigkeit", "szybkość podróży", "szybkosc podrozy"],
+    capacity: ["merchant capacity", "trader capacity", "carry capacity", "carrying capacity", "transport capacity", "kapacitet", "bärkapacitet", "barkapacitet", "teherbírás", "teherbiras", "capacité", "capacite", "capacidad", "capacidade", "kapazität", "kapazitaet", "pojemność", "pojemnosc", "draagcapaciteit"]
+  };
+
+  const ECONOMY_STAT_ALIASES = {
+    haul: ["haul capacity", "loot capacity", "carry capacity", "plunder capacity", "bärkapacitet", "barkapacitet", "teherbírás", "teherbiras"],
+    wood: ["wood production", "timber production", "wood", "timber", "fakiter", "fakitermelés", "holzproduktion", "production de bois", "producción de madera", "producao de madeira", "produkcja drewna"],
+    clay: ["clay production", "stone production", "clay", "stone", "agyagkitermelés", "agyagkiter", "lehmproduktion", "production d'argile", "producción de arcilla", "producao de argila", "produkcja gliny"],
+    iron: ["iron production", "iron", "vaskitermelés", "vaskiter", "eisenproduktion", "production de fer", "producción de hierro", "producao de ferro", "produkcja żelaza", "produkcja zelaza"],
+    constructionSpeed: ["construction speed", "building speed", "build speed", "építési sebesség", "epitesi sebesseg", "baugeschwindigkeit", "vitesse de construction", "velocidad de construcción", "velocidade de construção", "szybkość budowy", "szybkosc budowy"],
+    nobleRefund: ["refund on nobleman production", "nobleman production", "nobleman refund", "noble refund", "refund", "snob", "academy refund"]
+  };
+
+  const STAT_ACTION_ALIASES = {
+    speed: ["recruit speed", "training speed", "toborzasi sebesseg", "toborzási sebesség", "vitesse de recrutement", "velocidad de reclutamiento", "velocidade de recrutamento", "velocita di reclutamento", "rekrutierungsgeschwindigkeit", "rekrutierungs", "szybkosc rekrutacji", "szybkość rekrutacji", "rekruteringssnelheid", "rekryteringshastighet", "tabor hızı", "tabor hizi", "скорость найма", "швидкість найму"],
+    cost: ["recruit costs", "recruit cost", "toborzasi koltseg", "toborzási költség", "cout de recrutement", "coût de recrutement", "coste de reclutamiento", "custo de recrutamento", "costo di reclutamento", "rekrutierungskosten", "koszt rekrutacji", "rekruteringskostnad", "kosten rekrutering", "tabor maliyeti", "стоимость найма", "вартість найму"],
+    offdef: ["offense and defense power", "offence and defence power", "offense/defense", "offence/defence", "attack and defense", "attack and defence", "tamadas es vedelem", "támadás és védelem", "attaque et defense", "attaque et défense", "ataque y defensa", "ataque e defesa", "attacco e difesa", "angriff und verteidigung", "atak i obrona", "aanval en verdediging", "anfall och forsvar", "anfall och försvar", "saldiri ve savunma", "saldırı ve savunma", "атака и защита"],
+    attack: ["attack power", "offense power", "offence power", "tamadoero", "támadóerő", "tamadas", "támadás", "attaque", "ataque", "attacco", "angriff", "atak", "aanval", "anfall", "saldiri", "saldırı", "атака"],
+    defense: ["defense power", "defence power", "vedelem", "védelmi", "defense", "defense", "défense", "defensa", "defesa", "difesa", "verteidigung", "obrona", "verdediging", "forsvar", "försvar", "savunma", "защита", "оборона"],
+    damage: ["damage against buildings", "building damage", "epuletsebzes", "épületsebzés", "degats contre les batiments", "dégâts contre les bâtiments", "dano contra edificios", "dano contra edificios", "danni agli edifici", "gebaedeschaden", "gebäudeschaden", "obrazenia budynkow", "obrażenia budynków", "schade aan gebouwen", "byggnadsskada", "bina hasari", "bina hasarı", "урон по зданиям"]
+  };
+
+
+  const state = {
+		villages: [],
+		villagesById: new Map(),
+		villagesByCoord: new Map(),
+		inventoryRelics: [],
+		placedRelics: [],
+    inactiveRelicPlacements: [],
+    blockedPlacementCoords: new Set(),
+    blockedPlacementVillageIds: new Set(),
+		plan: [],
+		unlockedRelicSlots: 10,
+    worldRelicSettings: {
+      benefitCap: DEFAULT_BENEFIT_CAP,
+      benefitCapSource: "fallback",
+      detectedRanges: []
+    },
+    targetCoords: new Set(),
+    focusGroups: [],
+    focusGroupId: "0",
+    focusGroupName: "All villages",
+    focusCoords: new Set(),
+    lastGoal: "",
+    recruitmentDemandRequested: false,
+    recruitmentDemandActive: false,
+    amTemplates: [],
+    amRecruitmentDemandByCoord: new Map(),
+    amRecruitmentDemandMax: 0,
+    amRecruitmentDemandScoringMax: 0,
+    amRecruitmentDemandScoringRows: 0,
+    amRecruitmentMeta: { rows: 0, timedRows: 0, timingSource: "none", note: "" },
+    unitBuildTimes: {},
+		logs: []
+	};
+
+  const ui = {};
+
+  window.twacticsRelicPlannerV2 = {
+    close: closeDialog,
+    state: state
+  };
+
+  function cleanText(value) {
+    return String(value || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\r/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function escapeHtml(value) {
+    return String(value || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function parseNumber(value) {
+    const normalized = String(value || "")
+      .replace(/\./g, "")
+      .replace(/,/g, "")
+      .replace(/[^\d-]/g, "");
+
+    const parsed = parseInt(normalized, 10);
+    return isNaN(parsed) ? 0 : parsed;
+  }
+
+  function parseCoord(text) {
+    const match = String(text || "").match(/(\d{1,3})\|(\d{1,3})/);
+
+    if (!match) return null;
+
+    return {
+      x: parseInt(match[1], 10),
+      y: parseInt(match[2], 10),
+      coord: match[1] + "|" + match[2]
+    };
+  }
+
+  function getParam(name, url) {
+    try {
+      return new URL(url || window.location.href, window.location.origin).searchParams.get(name);
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function getCurrentVillageId() {
+    if (
+      typeof game_data !== "undefined" &&
+      game_data.village &&
+      game_data.village.id
+    ) {
+      return String(game_data.village.id);
+    }
+
+    return getParam("village") || "";
+  }
+
+  function buildGameUrl(params) {
+	  const url = new URL("/game.php", window.location.origin);
+	  const villageId = getCurrentVillageId();
+	  const currentGroup = getParam("group");
+
+	  if (
+		typeof game_data !== "undefined" &&
+		game_data.player &&
+		parseInt(game_data.player.sitter || 0, 10) > 0
+	  ) {
+		url.searchParams.set("t", String(game_data.player.id));
+	  }
+
+	  if (villageId) {
+		url.searchParams.set("village", villageId);
+	  }
+
+	  if (currentGroup && params && params.screen === "overview_villages") {
+		url.searchParams.set("group", currentGroup);
+	  }
+
+	  Object.keys(params || {}).forEach(key => {
+		if (params[key] !== undefined && params[key] !== null) {
+		  url.searchParams.set(key, String(params[key]));
+		}
+	  });
+
+	  return url.pathname + url.search;
+	}
+	
+	function getVillageDataUrl(goal) {
+	  if (goal === "offense" || goal === "defense") {
+		return buildGameUrl({
+		  screen: "overview_villages",
+		  mode: "combined",
+        group: 0,
+		  page: -1
+		});
+	  }
+
+    if (goal === "production") {
+      return buildGameUrl({
+        screen: "overview_villages",
+        mode: "buildings",
+        group: 0,
+        page: -1
+      });
+    }
+
+	  return buildGameUrl({
+		screen: "overview_villages",
+		mode: "prod",
+      group: 0,
+		page: -1
+	  });
+	}
+
+  function getFocusGroupVillageUrl(groupId) {
+    return buildGameUrl({
+      screen: "overview_villages",
+      mode: "combined",
+      group: String(groupId || "0"),
+      page: -1
+    });
+  }
+
+  function getRelicOffsets(range) {
+    const radius = Math.max(0, parseInt(range || 0, 10));
+    const offsets = [];
+
+    if (!radius) return offsets;
+
+    for (let dy = -radius; dy <= radius; dy++) {
+      const halfWidth = Math.floor(Math.sqrt(Math.max(0, radius * radius - dy * dy)));
+
+      for (let dx = -halfWidth; dx <= halfWidth; dx++) {
+        offsets.push({ dx: dx, dy: dy });
+      }
+    }
+
+    return offsets;
+  }
+
+  function getRelicMaxTiles(range) {
+    return getRelicOffsets(range).length;
+  }
+
+  function getRelicRangeLabel(range) {
+    const parsed = Math.max(0, parseInt(range || 0, 10));
+    const tiles = getRelicMaxTiles(parsed);
+
+    if (!parsed) return "Range unknown";
+    return "Range " + parsed + " / " + tiles + " tile area";
+  }
+
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, Math.max(0, ms || 0)));
+  }
+
+  function getCacheScope() {
+    const playerId =
+      typeof game_data !== "undefined" && game_data.player && game_data.player.id
+        ? String(game_data.player.id)
+        : "anonymous";
+    return window.location.host + ":" + playerId;
+  }
+
+  function makeCacheKey(kind, identity) {
+    return CACHE_PREFIX + getCacheScope() + ":" + kind + ":" + String(identity || "default");
+  }
+
+  function readPersistentCache(key, ttlMs) {
+    if (!key || !ttlMs) return null;
+
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      const savedAt = Number(parsed && parsed.savedAt || 0);
+
+      if (!savedAt || Date.now() - savedAt >= ttlMs) {
+        window.localStorage.removeItem(key);
+        return null;
+      }
+
+      return parsed.value;
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " cache read failed:", err);
+      return null;
+    }
+  }
+
+  function writePersistentCache(key, value) {
+    if (!key) return;
+
+    try {
+      window.localStorage.setItem(key, JSON.stringify({
+        savedAt: Date.now(),
+        value: value
+      }));
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " cache write failed:", err);
+    }
+  }
+
+  async function drainGetRequestQueue() {
+    if (getQueueRunning) return;
+    getQueueRunning = true;
+
+    try {
+      while (getRequestQueue.length) {
+        const request = getRequestQueue.shift();
+        const elapsed = Date.now() - lastGetStartedAt;
+        const waitMs = Math.max(0, GET_MIN_INTERVAL_MS - elapsed);
+
+        if (waitMs > 0) {
+          await delay(waitMs);
+        }
+
+        lastGetStartedAt = Date.now();
+
+        try {
+          const response = await fetch(request.url, {
+            method: "GET",
+            credentials: "same-origin",
+            headers: request.headers || {}
+          });
+          request.resolve(response);
+        } catch (err) {
+          request.reject(err);
+        }
+      }
+    } finally {
+      getQueueRunning = false;
+    }
+  }
+
+  function queuedGet(url, headers) {
+    const requestKey = String(url);
+
+    if (inFlightGetRequests.has(requestKey)) {
+      return inFlightGetRequests.get(requestKey);
+    }
+
+    const promise = new Promise((resolve, reject) => {
+      getRequestQueue.push({
+        url: url,
+        headers: headers || {},
+        resolve: resolve,
+        reject: reject
+      });
+      drainGetRequestQueue();
+    });
+
+    inFlightGetRequests.set(requestKey, promise);
+    promise.then(
+      () => inFlightGetRequests.delete(requestKey),
+      () => inFlightGetRequests.delete(requestKey)
+    );
+
+    return promise;
+  }
+
+  async function fetchGetText(url, options) {
+    const config = options || {};
+    const cacheTtlMs = Math.max(0, Number(config.cacheTtlMs || 0));
+    const cacheKey = config.cacheKey || "";
+
+    if (cacheKey && cacheTtlMs > 0) {
+      const cached = readPersistentCache(cacheKey, cacheTtlMs);
+      if (typeof cached === "string") {
+        return cached;
+      }
+    }
+
+    const response = await queuedGet(url, {
+      "Accept": config.accept || "text/html, */*; q=0.01"
+    });
+
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status + " while loading " + url);
+    }
+
+    const text = await response.text();
+
+    if (cacheKey && cacheTtlMs > 0) {
+      writePersistentCache(cacheKey, text);
+    }
+
+    return text;
+  }
+
+  async function fetchHtml(url, options) {
+    return fetchGetText(url, Object.assign({
+      accept: "text/html, */*; q=0.01"
+    }, options || {}));
+  }
+
+  function parseHtml(html) {
+    return new DOMParser().parseFromString(html, "text/html");
+  }
+
+  function uniqueBy(items, getKey) {
+    const seen = new Set();
+    return (items || []).filter(item => {
+      const key = String(getKey(item));
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function extractGroupMenuCandidates(payload) {
+    if (!payload) return [];
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload.result)) return payload.result;
+    if (Array.isArray(payload.groups)) return payload.groups;
+    if (payload.result && Array.isArray(payload.result.groups)) return payload.result.groups;
+    return [];
+  }
+
+  function normalizeGroupMenuItems(items) {
+    return uniqueBy((items || []).map(item => {
+      const id = item && (item.group_id !== undefined ? item.group_id : item.id);
+      const name = cleanText(item && (item.name || item.label || item.title));
+      if (id === undefined || id === null || !name) return null;
+      return { id: String(id), name: name };
+    }).filter(Boolean), item => item.id);
+  }
+
+  function extractGroupsFromHtml(html) {
+    const doc = parseHtml(html);
+    const groups = [];
+    const options = doc.querySelectorAll(
+      '#group_select option, select[name="group"] option, select[id*="group"] option, select[class*="group"] option'
+    );
+
+    Array.from(options).forEach(option => {
+      const value = cleanText(option.value);
+      const name = cleanText(option.textContent);
+      if (!/^\d+$/.test(value) || !name) return;
+      groups.push({ id: value, name: name });
+    });
+
+    Array.from(doc.querySelectorAll('a[href*="group="]')).forEach(link => {
+      const href = link.getAttribute("href") || "";
+      const groupId = getParam("group", href);
+      const name = cleanText(link.textContent);
+      if (!groupId || !/^\d+$/.test(groupId) || !name) return;
+      groups.push({ id: groupId, name: name });
+    });
+
+    return uniqueBy(groups, item => item.id);
+  }
+
+  async function fetchFocusGroups() {
+    const menuUrl = buildGameUrl({ screen: "groups", mode: "overview", ajax: "load_group_menu" });
+
+    try {
+      const text = await fetchGetText(menuUrl, {
+        accept: "application/json, text/html, */*; q=0.01",
+        cacheTtlMs: GROUP_CACHE_TTL_MS,
+        cacheKey: makeCacheKey("focus-groups", menuUrl)
+      });
+      let groups = [];
+
+      try {
+        const payload = JSON.parse(text);
+        groups = normalizeGroupMenuItems(extractGroupMenuCandidates(payload));
+      } catch (err) {
+        groups = extractGroupsFromHtml(text);
+      }
+
+      if (groups.length) return groups.filter(group => group.id !== "0");
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " group menu endpoint failed; using overview fallback:", err);
+    }
+
+    const fallbackUrl = buildGameUrl({
+      screen: "overview_villages",
+      mode: "combined",
+      group: 0,
+      page: 0
+    });
+    const fallbackHtml = await fetchHtml(fallbackUrl, {
+      cacheTtlMs: GROUP_CACHE_TTL_MS,
+      cacheKey: makeCacheKey("focus-groups-fallback", fallbackUrl)
+    });
+    return extractGroupsFromHtml(fallbackHtml).filter(group => group.id !== "0");
+  }
+
+  async function populateFocusGroupSelect() {
+    if (!ui.focusGroupSelect) return;
+    ui.focusGroupSelect.disabled = true;
+
+    try {
+      const groups = await fetchFocusGroups();
+      state.focusGroups = groups;
+      const currentValue = ui.focusGroupSelect.value || "0";
+      ui.focusGroupSelect.innerHTML = "";
+
+      const allOption = document.createElement("option");
+      allOption.value = "0";
+      allOption.textContent = "All villages";
+      ui.focusGroupSelect.appendChild(allOption);
+
+      groups.forEach(group => {
+        const option = document.createElement("option");
+        option.value = group.id;
+        option.textContent = group.name;
+        ui.focusGroupSelect.appendChild(option);
+      });
+
+      if (Array.from(ui.focusGroupSelect.options).some(option => option.value === currentValue)) {
+        ui.focusGroupSelect.value = currentValue;
+      }
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not load groups:", err);
+      state.focusGroups = [];
+    } finally {
+      ui.focusGroupSelect.disabled = false;
+    }
+  }
+
+  function extractBalancedValue(source, startIndex) {
+    const opening = source[startIndex];
+    const closing = opening === "{" ? "}" : opening === "[" ? "]" : null;
+
+    if (!closing) {
+      throw new Error("Expected balanced JSON value.");
+    }
+
+    let depth = 0;
+    let insideString = false;
+    let escaped = false;
+
+    for (let i = startIndex; i < source.length; i++) {
+      const char = source[i];
+
+      if (insideString) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+
+        if (char === "\\") {
+          escaped = true;
+          continue;
+        }
+
+        if (char === '"') {
+          insideString = false;
+        }
+
+        continue;
+      }
+
+      if (char === '"') {
+        insideString = true;
+        continue;
+      }
+
+      if (char === opening) {
+        depth++;
+      } else if (char === closing) {
+        depth--;
+
+        if (depth === 0) {
+          return source.slice(startIndex, i + 1);
+        }
+      }
+    }
+
+    throw new Error("Could not find end of JSON value.");
+  }
+
+  function extractInventoryRelicsFromHtml(html) {
+    const doc = parseHtml(html);
+    const scripts = Array.from(doc.querySelectorAll("script"));
+    const relics = [];
+
+    scripts.forEach(script => {
+      const source = script.textContent || "";
+      const marker = "RelicSystem.Inventory.init";
+
+      if (!source.includes(marker)) return;
+
+      const markerIndex = source.indexOf(marker);
+      const callStart = source.indexOf("(", markerIndex);
+      const arrayStart = source.indexOf("[", callStart);
+
+      if (arrayStart === -1) return;
+
+      try {
+        const jsonText = extractBalancedValue(source, arrayStart);
+        const parsed = JSON.parse(jsonText);
+
+        if (Array.isArray(parsed)) {
+          parsed.forEach(item => relics.push(item));
+        }
+      } catch (err) {
+        console.warn(SCRIPT_NAME + " could not parse inventory relic JSON:", err);
+      }
+    });
+
+    return dedupeRelics(relics.map(normalizeInventoryRelic).filter(Boolean));
+  }
+
+  function dedupeRelics(relics) {
+    const map = new Map();
+
+    relics.forEach(relic => {
+      map.set(String(relic.id), relic);
+    });
+
+    return Array.from(map.values());
+  }
+
+  function normalizeInventoryRelic(raw) {
+    if (!raw || raw.id === undefined || raw.id === null) return null;
+
+    const stats = [];
+    const relicType = raw.type || "";
+
+    if (raw.main_stat) {
+      const normalizedMain = normalizeRelicStat(raw.main_stat, relicType);
+
+      stats.push({
+        source: "main",
+        rawName: cleanText(raw.main_stat.name || raw.main_stat.benefit && raw.main_stat.benefit.description),
+        normalized: normalizedMain
+      });
+    }
+
+    (raw.sub_stats || []).forEach(subStat => {
+      if (!subStat) return;
+
+      const normalizedSub = normalizeRelicStat(subStat, relicType);
+
+      stats.push({
+        source: "sub",
+        rawName: cleanText(subStat.name || subStat.benefit && subStat.benefit.description),
+        normalized: normalizedSub,
+        perfect: subStat.perfect === true
+      });
+    });
+
+    return {
+      id: String(raw.id),
+      name: cleanText(raw.name || ("Relic " + raw.id)),
+      type: relicType,
+      quality: raw.quality || "",
+      range: parseInt(raw.range || 0, 10),
+      villageId: raw.village_id ? String(raw.village_id) : "",
+      equippedAt: raw.equipped_at || null,
+      raw: raw,
+      stats: stats.filter(stat => stat.normalized)
+    };
+  }
+
+  function normalizeSearchText(value) {
+    return cleanText(value)
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+  }
+
+  function includesAny(text, aliases) {
+    const haystack = normalizeSearchText(text);
+
+    return (aliases || []).some(alias => {
+      return haystack.indexOf(normalizeSearchText(alias)) >= 0;
+    });
+  }
+
+  function getPercentValue(text) {
+    const valueMatch = cleanText(text).match(/([+-]?\d+(?:[.,]\d+)?)\s*%/);
+
+    if (!valueMatch) return null;
+
+    return Math.abs(parseFloat(valueMatch[1].replace(",", ".")));
+  }
+
+  function formatSettingNumber(value) {
+    const rounded = Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+    if (Number.isInteger(rounded)) return String(rounded);
+    return String(rounded).replace(/0+$/, "").replace(/\.$/, "");
+  }
+
+  function getBenefitCap() {
+    const settings = state.worldRelicSettings || {};
+    const cap = Number(settings.benefitCap);
+
+    if (!isNaN(cap) && cap > 0) return cap;
+    return DEFAULT_BENEFIT_CAP;
+  }
+
+  function getBenefitCapSourceLabel() {
+    const source = state.worldRelicSettings && state.worldRelicSettings.benefitCapSource;
+
+    if (source === "help") return "detected";
+    if (source === "manual") return "manual";
+    if (source === "game-data") return "game data";
+    return "fallback";
+  }
+
+  function getBenefitCapPillText() {
+    return "Cap: " + formatSettingNumber(getBenefitCap()) + "% (" + getBenefitCapSourceLabel() + ")";
+  }
+
+  function extractNumericPercentValues(text) {
+    const values = [];
+    const matches = String(text || "").matchAll(/(\d+(?:[.,]\d+)?)\s*%/g);
+
+    Array.from(matches).forEach(match => {
+      const value = parseFloat(String(match[1]).replace(",", "."));
+
+      if (!isNaN(value) && value > 0 && value <= 100) {
+        values.push(value);
+      }
+    });
+
+    return values;
+  }
+
+  function detectBenefitCapFromHelpHtml(html) {
+    if (!html) return null;
+
+    const doc = parseHtml(html);
+    const candidates = [];
+    const capAliases = [
+      "cap", "maximum", "max", "limit", "exceed", "cannot exceed", "may not exceed",
+      "haladhatjak", "haladhatják", "maximum", "hatar", "határ",
+      "ueberschreiten", "überschreiten", "maximal", "maximum",
+      "depasser", "dépasser", "maximum", "limite",
+      "superar", "maximo", "máximo", "limite",
+      "superare", "massimo", "limite",
+      "overstiga", "överstiga", "max", "grans", "gräns",
+      "overschrijden", "maximaal", "limiet",
+      "przekroczyc", "przekroczyć", "maksimum", "limit",
+      "depasi", "depăși", "maxim", "limita", "limită",
+      "перевищ", "превыш", "максим", "обмеж", "огранич",
+      "υπερβ", "μέγισ", "μεγισ", "حد", "اقصى", "أقصى"
+    ];
+    const relicAliases = [
+      "relic", "relics", "relikvia", "relikviak", "relikviák", "ereklye", "erekl",
+      "benefit", "bonus", "haszna", "hasznanak", "hasznának", "effet", "bono", "bonus",
+      "relikt", "relikwia", "reliquia", "reliquie", "релик", "relică", "relicva"
+    ];
+    const exampleAliases = [
+      "possible values", "following values", "következő értékek", "kovetkezo ertekek",
+      "werte", "valeurs", "valores", "valori", "wartosci", "wartości"
+    ];
+    const elements = Array.from(doc.querySelectorAll("p, li, div, td"));
+
+    function addCandidate(text) {
+      const clean = cleanText(text);
+      if (!clean || clean.length > 900) return;
+      if (!includesAny(clean, capAliases)) return;
+      if (!includesAny(clean, relicAliases)) return;
+      if (includesAny(clean, exampleAliases)) return;
+
+      const values = extractNumericPercentValues(clean).filter(value => value >= 5 && value <= 50);
+      if (!values.length) return;
+
+      let score = 0;
+      if (includesAny(clean, capAliases)) score += 10;
+      if (includesAny(clean, relicAliases)) score += 5;
+      if (/\+\s*\d+(?:[.,]\d+)?\s*%/.test(clean)) score -= 5;
+
+      values.forEach(value => {
+        candidates.push({ value: value, score: score, text: clean });
+      });
+    }
+
+    elements.forEach(element => addCandidate(element.textContent));
+
+    candidates.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (a.value === 20 && b.value !== 20) return -1;
+      if (b.value === 20 && a.value !== 20) return 1;
+      if (a.value === 10 && b.value !== 10) return -1;
+      if (b.value === 10 && a.value !== 10) return 1;
+      return b.value - a.value;
+    });
+
+    if (!candidates.length || candidates[0].score < 10) {
+      return null;
+    }
+
+    return {
+      benefitCap: candidates[0].value,
+      benefitCapSource: "help",
+      sourceText: candidates[0].text
+    };
+  }
+
+  function detectWorldRelicSettings(data) {
+    const settings = {
+      benefitCap: DEFAULT_BENEFIT_CAP,
+      benefitCapSource: "fallback",
+      detectedRanges: []
+    };
+    const helpSettings = detectBenefitCapFromHelpHtml(data && data.helpHtml);
+    const ranges = new Set();
+
+    if (helpSettings && helpSettings.benefitCap) {
+      settings.benefitCap = helpSettings.benefitCap;
+      settings.benefitCapSource = helpSettings.benefitCapSource || "help";
+      settings.benefitCapSourceText = helpSettings.sourceText || "";
+    }
+
+    ((data && data.inventoryRelics) || []).forEach(relic => {
+      const range = parseInt(relic && relic.range || 0, 10);
+      if (range > 0) ranges.add(range);
+    });
+
+    ((data && data.placedRelics) || []).forEach(relic => {
+      const range = parseInt(relic && relic.range || 0, 10);
+      if (range > 0) ranges.add(range);
+    });
+
+    settings.detectedRanges = Array.from(ranges).sort((a, b) => a - b);
+    return settings;
+  }
+
+  function applyWorldRelicSettings(settings) {
+    const current = state.worldRelicSettings || {};
+
+    state.worldRelicSettings = Object.assign({}, current, settings || {});
+  }
+
+  function syncBenefitCapInputFromState() {
+    if (!ui.capInput || ui.capInputWasEdited) return;
+    ui.capInput.value = formatSettingNumber(getBenefitCap());
+  }
+
+  function applyBenefitCapInputToState() {
+    if (!ui.capInput) return;
+
+    const cap = parseFloat(String(ui.capInput.value || "").replace(",", "."));
+
+    if (!isNaN(cap) && cap > 0) {
+      state.worldRelicSettings.benefitCap = cap;
+
+      if (ui.capInputWasEdited) {
+        state.worldRelicSettings.benefitCapSource = "manual";
+      }
+    }
+  }
+
+  function getInternalStatLabel(key, fallbackText) {
+    return INTERNAL_STAT_LABELS[key] || cleanText(fallbackText) || key.replace(/_/g, " ");
+  }
+
+  function normalizeKeyValue(key, value, fallbackText) {
+    if (!key || !RELEVANT_INTERNAL_STAT_KEYS[key]) return null;
+    if (value === null || value === undefined || isNaN(value)) return null;
+
+    return {
+      key: key,
+      value: Math.abs(Number(value)),
+      label: getInternalStatLabel(key, fallbackText)
+    };
+  }
+
+  function getKeyFromRelicStatData(stat, relicType, text) {
+    const effectType = stat && stat.effect_type ? String(stat.effect_type) : "";
+    const statId = stat && stat.id !== undefined && stat.id !== null ? String(stat.id) : "";
+    const type = cleanText((stat && stat.type) || relicType).toLowerCase();
+
+    if (statId && SUB_STAT_KEYS_BY_ID[statId]) {
+      return SUB_STAT_KEYS_BY_ID[statId];
+    }
+
+    if (MAIN_RELIC_STAT_KEYS[type] && MAIN_RELIC_STAT_KEYS[type][effectType]) {
+      return MAIN_RELIC_STAT_KEYS[type][effectType];
+    }
+
+    if (effectType === "b_haul") return "haul_capacity";
+    if (effectType === "b_wood") return "wood_production";
+    if (effectType === "b_stone") return "clay_production";
+    if (effectType === "b_iron") return "iron_production";
+    if (effectType === "b_building") return "construction_speed";
+    if (effectType === "b_merchant" && includesAny(text, MERCHANT_ALIASES.capacity)) return "merchant_capacity";
+    if (effectType === "b_merchant") return "merchant_travel_speed";
+    if (effectType === "b_noblerefund") return "noble_refund";
+
+    if (effectType === "b_unitstat" && RELIC_TYPE_UNIT_KEYS[type]) {
+      const unit = RELIC_TYPE_UNIT_KEYS[type];
+
+      if (includesAny(text, STAT_ACTION_ALIASES.damage)) return unit + "_damage";
+      if (includesAny(text, STAT_ACTION_ALIASES.attack)) return unit + "_attack";
+      if (includesAny(text, STAT_ACTION_ALIASES.defense)) return unit + "_defense";
+      return unit + "_offdef";
+    }
+
+    return "";
+  }
+
+  function normalizeRelicStat(stat, relicType) {
+    const text = cleanText((stat && stat.name) || (stat && stat.benefit && stat.benefit.description) || "");
+    const value = getPercentValue(text);
+
+    if (value === null) return null;
+
+    const internalKey = getKeyFromRelicStatData(stat, relicType, text);
+    const normalizedInternal = normalizeKeyValue(internalKey, value, text);
+
+    if (normalizedInternal) return normalizedInternal;
+
+    return normalizeStat(text);
+  }
+
+  function normalizeStat(name) {
+    const text = cleanText(name);
+    const value = getPercentValue(text);
+
+    if (value === null) return null;
+
+    function unitPrefix() {
+      const keys = ["light", "marcher", "heavy", "catapult", "spear", "sword", "axe", "archer", "ram", "spy"];
+
+      for (let i = 0; i < keys.length; i++) {
+        if (includesAny(text, UNIT_ALIASES[keys[i]])) return keys[i];
+      }
+
+      return "";
+    }
+
+    if (includesAny(text, MERCHANT_ALIASES.merchant)) {
+      if (includesAny(text, MERCHANT_ALIASES.capacity)) return normalizeKeyValue("merchant_capacity", value, text);
+      if (includesAny(text, MERCHANT_ALIASES.travelSpeed)) return normalizeKeyValue("merchant_travel_speed", value, text);
+    }
+
+    if (includesAny(text, ECONOMY_STAT_ALIASES.haul)) return normalizeKeyValue("haul_capacity", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.wood)) return normalizeKeyValue("wood_production", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.clay)) return normalizeKeyValue("clay_production", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.iron)) return normalizeKeyValue("iron_production", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.constructionSpeed)) return normalizeKeyValue("construction_speed", value, text);
+    if (includesAny(text, ECONOMY_STAT_ALIASES.nobleRefund)) return normalizeKeyValue("noble_refund", value, text);
+
+    if (includesAny(text, STAT_ACTION_ALIASES.speed)) {
+      if (includesAny(text, BUILDING_ALIASES.barracks)) return normalizeKeyValue("barracks_speed", value, text);
+      if (includesAny(text, BUILDING_ALIASES.stable)) return normalizeKeyValue("stable_speed", value, text);
+      if (includesAny(text, BUILDING_ALIASES.workshop)) return normalizeKeyValue("workshop_speed", value, text);
+      if (includesAny(text, BUILDING_ALIASES.academy)) return normalizeKeyValue("academy_speed", value, text);
+    }
+
+    if (includesAny(text, STAT_ACTION_ALIASES.cost)) {
+      if (includesAny(text, BUILDING_ALIASES.barracks)) return normalizeKeyValue("barracks_cost", value, text);
+      if (includesAny(text, BUILDING_ALIASES.stable)) return normalizeKeyValue("stable_cost", value, text);
+      if (includesAny(text, BUILDING_ALIASES.workshop)) return normalizeKeyValue("workshop_cost", value, text);
+    }
+
+    const unit = unitPrefix();
+
+    if (unit) {
+      if (includesAny(text, STAT_ACTION_ALIASES.damage)) return normalizeKeyValue(unit + "_damage", value, text);
+      if (includesAny(text, STAT_ACTION_ALIASES.offdef)) return normalizeKeyValue(unit + "_offdef", value, text);
+      if (includesAny(text, STAT_ACTION_ALIASES.attack)) return normalizeKeyValue(unit + "_attack", value, text);
+      if (includesAny(text, STAT_ACTION_ALIASES.defense)) return normalizeKeyValue(unit + "_defense", value, text);
+    }
+
+    return null;
+  }
+
+  function getRelevantWeights(goal) {
+    if (goal === "offense") return OFFENSE_WEIGHTS;
+    if (goal === "defense") return DEFENSE_WEIGHTS;
+    if (goal === "merchants") return MERCHANT_WEIGHTS;
+    if (goal === "haul") return HAUL_WEIGHTS;
+    if (goal === "production") return PRODUCTION_WEIGHTS;
+    if (goal === "construction") return CONSTRUCTION_WEIGHTS;
+    if (goal === "noble") return NOBLE_WEIGHTS;
+    return RECRUITMENT_WEIGHTS;
+  }
+
+  function getRelevantStats(relic, goal) {
+    const weights = getRelevantWeights(goal);
+
+    return (relic.stats || [])
+      .map(stat => stat.normalized)
+      .filter(Boolean)
+      .filter(stat => weights[stat.key] !== undefined);
+  }
+
+  function parseFarmText(value) {
+    const text = cleanText(value);
+    const match = text.match(/([\d.,]+)\s*\/\s*([\d.,]+)/);
+
+    if (!match) {
+      return {
+        used: 0,
+        max: 0,
+        free: 0
+      };
+    }
+
+    const used = parseNumber(match[1]);
+    const max = parseNumber(match[2]);
+
+    return {
+      used: used,
+      max: max,
+      free: Math.max(0, max - used)
+    };
+  }
+
+  function looksLikeFarmText(value) {
+    const farm = parseFarmText(value);
+    return farm.max > 0;
+  }
+
+  function parseMerchantText(value) {
+    const ratio = parseFarmText(value);
+
+    return {
+      available: ratio.used,
+      total: ratio.max
+    };
+  }
+
+  function looksLikeMerchantText(value) {
+    const merchants = parseMerchantText(value);
+    return merchants.total > 0;
+  }
+
+  function getBuildingLevelFromRow(row, buildingKey) {
+    if (!row || !buildingKey) return 0;
+
+    const cell = row.querySelector(".b_" + buildingKey);
+    if (!cell) return 0;
+
+    const hidden = cell.querySelector(".hidden");
+    const text = hidden ? hidden.textContent : cell.textContent;
+    return parseNumber(text);
+  }
+
+  function findFarmColumnIndex(table) {
+    const aliases = [
+      "farm", "farm space", "population", "pop", "tanya", "ferme", "granja", "fazenda", "fattoria", "bauernhof", "zagroda", "boerderij", "bondgård", "gård", "gård", "çiftlik", "ciftlik", "ферма", "ферма", "ฟาร์ม"
+    ];
+
+    for (let i = 0; i < aliases.length; i++) {
+      const index = getColumnIndexByHeader(table, aliases[i]);
+      if (index >= 0) return index;
+    }
+
+    return -1;
+  }
+
+  function findMerchantColumnIndex(table) {
+    const aliases = [
+      "merchant", "merchants", "trader", "traders", "market", "handlare", "köpman", "kopman", "kereskedő", "kereskedo", "kereskedők", "kereskedok", "händler", "haendler", "marchand", "marchands", "comerciante", "comerciantes", "mercador", "mercadores", "mercante", "mercanti", "kupiec", "kupcy", "handelaar", "handelaars", "tüccar", "tuccar", "торговец", "торговцы"
+    ];
+
+    for (let i = 0; i < aliases.length; i++) {
+      const index = getColumnIndexByHeader(table, aliases[i]);
+      if (index >= 0) return index;
+    }
+
+    return -1;
+  }
+
+  function getFarmCellFromRow(row, farmIndex) {
+    const cells = Array.from(row.children);
+
+    if (farmIndex >= 0 && cells[farmIndex] && looksLikeFarmText(cells[farmIndex].textContent)) {
+      return cells[farmIndex];
+    }
+
+    for (let i = 0; i < cells.length; i++) {
+      if (looksLikeFarmText(cells[i].textContent)) {
+        return cells[i];
+      }
+    }
+
+    return null;
+  }
+
+  function getMerchantCellFromRow(row, merchantIndex, farmIndex) {
+    const cells = Array.from(row.children);
+
+    if (merchantIndex >= 0 && cells[merchantIndex] && looksLikeMerchantText(cells[merchantIndex].textContent)) {
+      return cells[merchantIndex];
+    }
+
+    for (let i = 0; i < cells.length; i++) {
+      if (i === farmIndex) continue;
+
+      const merchants = parseMerchantText(cells[i].textContent);
+      if (merchants.total > 0 && merchants.total <= 1000) {
+        return cells[i];
+      }
+    }
+
+    return null;
+  }
+
+  function getHeaderSearchText(header) {
+    const parts = [
+      header && header.textContent,
+      header && header.getAttribute && header.getAttribute("title"),
+      header && header.getAttribute && header.getAttribute("aria-label")
+    ];
+
+    if (header && header.querySelectorAll) {
+      Array.from(header.querySelectorAll("[title], [data-title], img[alt]")).forEach(element => {
+        parts.push(element.getAttribute("title"));
+        parts.push(element.getAttribute("data-title"));
+        parts.push(element.getAttribute("alt"));
+      });
+    }
+
+    return normalizeSearchText(parts.filter(Boolean).join(" "));
+  }
+
+  function getColumnIndexByHeader(table, label) {
+    const headers = Array.from(table.querySelectorAll("thead th"));
+    const normalizedLabel = normalizeSearchText(label);
+
+    for (let i = 0; i < headers.length; i++) {
+      if (getHeaderSearchText(headers[i]).includes(normalizedLabel)) {
+        return i;
+      }
+    }
+
+    return -1;
+  }
+
+  function extractVillagesFromProductionHtml(html) {
+    const doc = parseHtml(html);
+    const table =
+			doc.querySelector("#production_table") ||
+			doc.querySelector("#combined_table") ||
+			doc.querySelector("table.overview_table") ||
+			doc.querySelector("#content_value table.vis");
+    const villages = [];
+    const seen = new Set();
+
+    if (!table) return villages;
+
+    const farmIndex = findFarmColumnIndex(table);
+    const merchantIndex = findMerchantColumnIndex(table);
+
+    Array.from(table.querySelectorAll("tbody tr")).forEach(row => {
+      if (row.querySelector("th")) return;
+
+      const link =
+        row.querySelector('a[href*="screen=overview"][href*="village="]') ||
+        row.querySelector('a[href*="screen=place"][href*="village="]') ||
+        row.querySelector('a[href*="village="]');
+
+      if (!link) return;
+
+      const name = cleanText(link.textContent);
+      const coordData = parseCoord(name);
+
+      if (!coordData) return;
+
+      const villageId = getParam("village", link.getAttribute("href")) || coordData.coord;
+      const key = String(villageId);
+
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      const farmCell = getFarmCellFromRow(row, farmIndex);
+      const farm = parseFarmText(farmCell ? farmCell.textContent : "");
+      const merchantCell = getMerchantCellFromRow(row, merchantIndex, farmIndex);
+      const merchants = parseMerchantText(merchantCell ? merchantCell.textContent : "");
+      const woodLevel = getBuildingLevelFromRow(row, "wood");
+      const clayLevel = getBuildingLevelFromRow(row, "stone");
+      const ironLevel = getBuildingLevelFromRow(row, "iron");
+      const academyLevel = getBuildingLevelFromRow(row, "snob");
+      const barracksLevel = getBuildingLevelFromRow(row, "barracks");
+      const stableLevel = getBuildingLevelFromRow(row, "stable");
+      const workshopLevel = getBuildingLevelFromRow(row, "garage");
+
+      villages.push({
+        id: String(villageId),
+        name: name,
+        x: coordData.x,
+        y: coordData.y,
+        coord: coordData.coord,
+        href: link.getAttribute("href") || "",
+        farmUsed: farm.used,
+        farmMax: farm.max,
+        farmFree: farm.free,
+        merchantsAvailable: merchants.available,
+        merchantsTotal: merchants.total,
+        woodLevel: woodLevel,
+        clayLevel: clayLevel,
+        ironLevel: ironLevel,
+        academyLevel: academyLevel,
+        barracksLevel: barracksLevel,
+        stableLevel: stableLevel,
+        workshopLevel: workshopLevel,
+        pitsTotal: woodLevel + clayLevel + ironLevel
+      });
+    });
+
+    return villages;
+  }
+
+  function extractAmTemplatesFromHtml(html) {
+    const templates = [];
+    const doc = parseHtml(html);
+    const scripts = Array.from(doc.querySelectorAll("script"));
+
+    scripts.forEach(script => {
+      const source = script.textContent || "";
+      const marker = "Accountmanager.initTroopManagement";
+      const markerIndex = source.indexOf(marker);
+      if (markerIndex < 0) return;
+      const callStart = source.indexOf("(", markerIndex);
+      const arrayStart = source.indexOf("[", callStart);
+      if (arrayStart < 0) return;
+
+      try {
+        const parsed = JSON.parse(extractBalancedValue(source, arrayStart));
+        if (Array.isArray(parsed)) parsed.forEach(template => templates.push(template));
+      } catch (err) {
+        console.warn(SCRIPT_NAME + " could not parse AM template JSON:", err);
+      }
+    });
+
+    if (!templates.length) {
+      Array.from(doc.querySelectorAll("#template_selection option[data-json]")).forEach(option => {
+        try {
+          templates.push(JSON.parse(option.getAttribute("data-json")));
+        } catch (err) {}
+      });
+    }
+
+    return uniqueBy(templates.filter(Boolean), template => template.id || template.template);
+  }
+
+  function getAmRowVillageId(row) {
+    const anchor = row.querySelector(".village_anchor[data-id]");
+    const edit = row.querySelector(".am_troops_edit[value]");
+    return cleanText((anchor && anchor.getAttribute("data-id")) || (edit && edit.value) || "");
+  }
+
+  function getAmCurrentCount(targetElement) {
+    const cell = targetElement && targetElement.closest ? targetElement.closest("td") : null;
+    if (!cell) return 0;
+
+    const candidates = Array.from(cell.querySelectorAll("span"))
+      .filter(span => span !== targetElement && !span.hasAttribute("data-field"))
+      .filter(span => /\d/.test(cleanText(span.textContent)));
+
+    if (!candidates.length) {
+      const firstLine = cleanText(cell.textContent).split(/\s+/)[0];
+      return parseNumber(firstLine);
+    }
+
+    return parseNumber(candidates[0].textContent);
+  }
+
+  function getTemplateNameForTargets(targets, templates) {
+    let best = null;
+    let bestDiff = Infinity;
+
+    (templates || []).forEach(template => {
+      let diff = 0;
+      AM_TROOP_UNITS.forEach(unit => {
+        diff += Math.abs((parseNumber(template[unit]) || 0) - (targets[unit] || 0));
+      });
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = template;
+      }
+    });
+
+    if (!best || bestDiff !== 0) return "";
+    return cleanText(best.template || best.name || ("Template " + best.id));
+  }
+
+  function extractAmTroopRowsFromHtml(html, templates) {
+    const doc = parseHtml(html);
+    const rows = [];
+
+    Array.from(doc.querySelectorAll("tr")).forEach(row => {
+      const villageId = getAmRowVillageId(row);
+      if (!villageId) return;
+
+      const anchor = row.querySelector(".village_anchor");
+      const coordData = parseCoord(anchor ? anchor.textContent : "");
+      const targetElements = Array.from(row.querySelectorAll("[data-field]"))
+        .filter(element => AM_TROOP_UNITS.indexOf(element.getAttribute("data-field")) >= 0);
+
+      if (!targetElements.length) return;
+
+      const targets = {};
+      const current = {};
+      AM_TROOP_UNITS.forEach(unit => {
+        targets[unit] = 0;
+        current[unit] = 0;
+      });
+
+      targetElements.forEach(element => {
+        const unit = element.getAttribute("data-field");
+        targets[unit] = parseNumber(element.textContent);
+        current[unit] = getAmCurrentCount(element);
+      });
+
+      const village = state.villagesById.get(String(villageId));
+      rows.push({
+        villageId: String(villageId),
+        coord: coordData ? coordData.coord : (village ? village.coord : ""),
+        targets: targets,
+        current: current,
+        templateName: getTemplateNameForTargets(targets, templates)
+      });
+    });
+
+    return uniqueBy(rows.filter(row => row.coord), row => row.villageId || row.coord);
+  }
+
+  async function fetchUnitBuildTimes() {
+    const unitInfoUrl = "/interface.php?func=get_unit_info";
+    const text = await fetchGetText(unitInfoUrl, {
+      accept: "application/xml, text/xml, */*; q=0.01",
+      cacheTtlMs: WORLD_CACHE_TTL_MS,
+      cacheKey: makeCacheKey("world-unit-info", unitInfoUrl)
+    });
+    const doc = new DOMParser().parseFromString(text, "application/xml");
+    const result = {};
+
+    AM_TROOP_UNITS.forEach(unit => {
+      const node = doc.querySelector(unit + " > build_time");
+      const value = node ? parseFloat(cleanText(node.textContent).replace(",", ".")) : NaN;
+      if (!isNaN(value) && value > 0) result[unit] = value;
+    });
+
+    return result;
+  }
+
+  function buildAmRecruitmentDemand(rows, templates, unitBuildTimes) {
+    const demandMap = new Map();
+    let maxTotal = 0;
+    let timedRows = 0;
+    const hasTiming = Object.keys(unitBuildTimes || {}).length > 0;
+
+    (rows || []).forEach(row => {
+      const remaining = {};
+      const byBuilding = { barracks: 0, stable: 0, workshop: 0 };
+      let total = 0;
+      let remainingUnits = 0;
+
+      AM_TROOP_UNITS.forEach(unit => {
+        const target = Math.max(0, row.targets[unit] || 0);
+        const current = Math.max(0, row.current[unit] || 0);
+        const missing = Math.max(0, target - current);
+        const buildTime = Number((unitBuildTimes || {})[unit] || 1);
+        const work = missing * buildTime;
+        const building = AM_UNIT_BUILDING[unit];
+
+        remaining[unit] = missing;
+        remainingUnits += missing;
+        total += work;
+        if (building) byBuilding[building] += work;
+      });
+
+      if (total > 0 && hasTiming) timedRows += 1;
+      maxTotal = Math.max(maxTotal, total);
+
+      demandMap.set(row.coord, {
+        coord: row.coord,
+        villageId: row.villageId,
+        templateName: row.templateName,
+        targets: row.targets,
+        current: row.current,
+        remaining: remaining,
+        remainingUnits: remainingUnits,
+        byBuilding: byBuilding,
+        total: total,
+        baseHours: hasTiming ? total / 3600 : null
+      });
+    });
+
+    return {
+      map: demandMap,
+      maxTotal: maxTotal,
+      meta: {
+        rows: demandMap.size,
+        timedRows: timedRows,
+        timingSource: hasTiming ? "unit_info" : "unit_counts",
+        note: hasTiming
+          ? "Workload uses target minus current units multiplied by world unit build times. Queued units are not separately subtracted."
+          : "Unit build times were unavailable; demand falls back to remaining unit counts."
+      }
+    };
+  }
+
+  function extractAmPaginationUrls(html) {
+    const doc = parseHtml(html);
+    const urls = new Set();
+
+    Array.from(doc.querySelectorAll('a[href*="screen=am_troops"][href*="page="]')).forEach(link => {
+      const href = link.getAttribute("href");
+      if (!href) return;
+      try {
+        const url = new URL(href, window.location.origin);
+        url.searchParams.set("group", "0");
+        urls.add(url.pathname + url.search);
+      } catch (err) {}
+    });
+
+    return Array.from(urls);
+  }
+
+  async function loadAllAmTroopPages() {
+    const amUrl = buildGameUrl({ screen: "am_troops", group: 0, page: -1 });
+    const amCacheKey = makeCacheKey("am-troops", "group-0");
+    const cached = readPersistentCache(amCacheKey, AM_CACHE_TTL_MS);
+
+    if (cached && Array.isArray(cached.templates) && Array.isArray(cached.rows)) {
+      return {
+        amUrl: amUrl,
+        templates: cached.templates,
+        rows: cached.rows,
+        pageCount: Number(cached.pageCount || 0),
+        fromCache: true
+      };
+    }
+
+    const firstHtml = await fetchHtml(amUrl);
+    const expectedVillages = state.villages.length || (typeof game_data !== "undefined" && game_data.player ? parseInt(game_data.player.villages || 0, 10) : 0);
+    const templates = extractAmTemplatesFromHtml(firstHtml);
+    let rows = extractAmTroopRowsFromHtml(firstHtml, templates);
+    const pages = [firstHtml];
+
+    if (expectedVillages > 0 && rows.length < expectedVillages) {
+      const pageUrls = extractAmPaginationUrls(firstHtml)
+        .filter(url => getParam("page", url) !== "-1")
+        .slice(0, Math.max(0, MAX_AM_PAGE_READS - 1));
+
+      for (let i = 0; i < pageUrls.length; i++) {
+        try {
+          const html = await fetchHtml(pageUrls[i]);
+          pages.push(html);
+        } catch (err) {
+          console.warn(SCRIPT_NAME + " could not load AM page " + pageUrls[i] + ":", err);
+        }
+      }
+
+      rows = uniqueBy(
+        pages.flatMap(html => extractAmTroopRowsFromHtml(html, templates)),
+        row => row.villageId || row.coord
+      );
+    }
+
+    const result = {
+      amUrl: amUrl,
+      templates: templates,
+      rows: rows,
+      pageCount: pages.length,
+      fromCache: false
+    };
+
+    writePersistentCache(amCacheKey, {
+      templates: templates,
+      rows: rows,
+      pageCount: pages.length
+    });
+
+    return result;
+  }
+
+  async function loadAmRecruitmentDemand() {
+    const amData = await loadAllAmTroopPages();
+    let unitBuildTimes = {};
+
+    try {
+      unitBuildTimes = await fetchUnitBuildTimes();
+    } catch (err) {
+      console.warn(SCRIPT_NAME + " could not load cached world unit info; using unit-count fallback:", err);
+    }
+
+    const templates = amData.templates;
+    const rows = amData.rows;
+    const demand = buildAmRecruitmentDemand(rows, templates, unitBuildTimes);
+    demand.meta.pageCount = amData.pageCount;
+    demand.meta.fromCache = !!amData.fromCache;
+    demand.meta.cacheMinutes = Math.round(AM_CACHE_TTL_MS / 60000);
+    demand.meta.maxPageReads = MAX_AM_PAGE_READS;
+
+    state.amTemplates = templates;
+    state.unitBuildTimes = unitBuildTimes;
+    state.amRecruitmentDemandByCoord = demand.map;
+    state.amRecruitmentDemandMax = demand.maxTotal;
+    state.amRecruitmentMeta = demand.meta;
+    state.recruitmentDemandActive = demand.map.size > 0 && demand.maxTotal > 0;
+    refreshRecruitmentDemandScoringScope();
+
+    return { amUrl: amData.amUrl, templates: templates, rows: rows, demand: demand };
+  }
+
+  function extractRangeFromElement(root) {
+    if (!root) return 0;
+
+    const rangeAliases = "Range|Tartom[aá]ny|Reichweite|Port[eé]e|Alcance|R[aä]ckvidd|Zasi[eę]g|Gama|Raggio|Bereik|Dost[eę]p|Afstand|Menzil|Дальность|Діапазон";
+    const rangeElement = root.querySelector && root.querySelector(".range");
+
+    function parseRangeText(text, requireLabel) {
+      const clean = cleanText(text);
+      const labeledMatch = clean.match(new RegExp("(?:" + rangeAliases + ")\\s*:?\\s*(\\d{1,2})", "i"));
+
+      if (labeledMatch) {
+        const labeledRange = parseInt(labeledMatch[1], 10);
+        if (!isNaN(labeledRange) && labeledRange > 0 && labeledRange <= 20) return labeledRange;
+      }
+
+      if (!requireLabel) {
+        const numericMatch = clean.match(/(?:^|\D)(\d{1,2})(?:\D|$)/);
+        if (numericMatch) {
+          const numericRange = parseInt(numericMatch[1], 10);
+          if (!isNaN(numericRange) && numericRange > 0 && numericRange <= 20) return numericRange;
+        }
+      }
+
+      return 0;
+    }
+
+    if (rangeElement) {
+      return parseRangeText(rangeElement.textContent || "", false);
+    }
+
+    return parseRangeText(root.textContent || "", true);
+  }
+
+  function getOverviewRelicId(slot) {
+    const link = slot && slot.querySelector ? slot.querySelector("[data-relic-id]") : null;
+    const value = cleanText(link ? link.getAttribute("data-relic-id") : "");
+
+    if (/^\d+$/.test(value)) {
+      return value;
+    }
+
+    return "";
+  }
+
+  function extractInactiveRelicPlacementsFromOverviewHtml(html) {
+    const doc = parseHtml(html);
+    const blocked = [];
+
+    Array.from(doc.querySelectorAll("table.inactive-relics-table tr")).forEach(row => {
+      if (row.querySelector("th")) return;
+
+      const locationCell = row.querySelector('[data-label="Location"]');
+      if (!locationCell) return;
+
+      const villageAnchor =
+        locationCell.querySelector(".village_anchor[data-id]") ||
+        row.querySelector(".village_anchor[data-id]");
+      const locationLink =
+        locationCell.querySelector('a[href*="screen=info_village"]') ||
+        locationCell.querySelector('a[href*="id="]');
+      const locationText = cleanText(locationLink ? locationLink.textContent : locationCell.textContent);
+      const coordData = parseCoord(locationText);
+      const villageId = cleanText(
+        (villageAnchor && villageAnchor.getAttribute("data-id")) ||
+        (locationLink && getParam("id", locationLink.getAttribute("href"))) ||
+        ""
+      );
+
+      if (!coordData && !villageId) return;
+
+      const relicNameEl = row.querySelector(".inactive-relic-name strong") || row.querySelector("td strong");
+      const inactiveUntilCell = row.querySelector('[data-label="Inactive until"]');
+
+      blocked.push({
+        villageId: villageId,
+        coord: coordData ? coordData.coord : "",
+        x: coordData ? coordData.x : null,
+        y: coordData ? coordData.y : null,
+        locationName: locationText,
+        relicName: cleanText(relicNameEl ? relicNameEl.textContent : "Inactive relic"),
+        inactiveUntil: cleanText(inactiveUntilCell ? inactiveUntilCell.textContent : "")
+      });
+    });
+
+    return uniqueBy(blocked, item => item.coord || ("id:" + item.villageId));
+  }
+
+  function rebuildBlockedPlacementVillages(inactiveRelics) {
+    state.inactiveRelicPlacements = (inactiveRelics || []).slice();
+    state.blockedPlacementCoords = new Set();
+    state.blockedPlacementVillageIds = new Set();
+
+    state.inactiveRelicPlacements.forEach(item => {
+      const villageId = cleanText(item && item.villageId);
+      const coord = cleanText(item && item.coord);
+
+      if (villageId) state.blockedPlacementVillageIds.add(villageId);
+      if (coord) state.blockedPlacementCoords.add(coord);
+
+      if (villageId && state.villagesById.has(villageId)) {
+        const village = state.villagesById.get(villageId);
+        if (village && village.coord) state.blockedPlacementCoords.add(village.coord);
+      }
+    });
+  }
+
+  function isPlacementVillageBlocked(village) {
+    if (!village) return false;
+
+    const villageId = cleanText(village.id);
+    const coord = cleanText(village.coord);
+
+    return !!(
+      (coord && state.blockedPlacementCoords && state.blockedPlacementCoords.has(coord)) ||
+      (villageId && state.blockedPlacementVillageIds && state.blockedPlacementVillageIds.has(villageId))
+    );
+  }
+
+  function extractPlacedRelicsFromOverviewHtml(html) {
+    const doc = parseHtml(html);
+    const relics = [];
+
+    Array.from(doc.querySelectorAll("#relic_slots .relic-slot.used")).forEach((slot, index) => {
+      const description = slot.querySelector(".description-container");
+      if (!description) return;
+
+      const nameEl = description.querySelector("strong");
+      const name = cleanText(nameEl ? nameEl.textContent : "Placed relic");
+      const overviewRelicId = getOverviewRelicId(slot);
+
+      const locationLink = description.querySelector(".location a[href*='screen=info_village']");
+      const locationText = cleanText(locationLink ? locationLink.textContent : "");
+      const coordData = parseCoord(locationText);
+      const villageId =
+        locationLink
+          ? getParam("id", locationLink.getAttribute("href")) || ""
+          : "";
+
+      const divs = Array.from(description.children);
+      const statTexts = [];
+      let range = 0;
+
+      divs.forEach(div => {
+        const text = cleanText(div.textContent);
+
+        if (!text) return;
+
+        if (div.classList && div.classList.contains("range")) {
+          range = extractRangeFromElement(div) || range;
+          return;
+        }
+
+        const rangeMatch = text.match(/(?:Range|Tartom[aá]ny|Reichweite|Port[eé]e|Alcance|R[aä]ckvidd|Zasi[eę]g|Gama|Raggio)\s*:?\s*(\d+)/i);
+        if (rangeMatch) {
+          range = parseInt(rangeMatch[1], 10);
+          return;
+        }
+
+        if (div.classList && div.classList.contains("location")) return;
+        if (div.querySelector && div.querySelector(".effected-other-villages-list")) return;
+
+        if (text !== name) {
+          statTexts.push(text);
+        }
+      });
+
+      if (!range) {
+        range = extractRangeFromElement(description);
+      }
+
+      const stats = statTexts
+        .map(text => ({
+          source: "placed",
+          rawName: text,
+          normalized: normalizeStat(text)
+        }))
+        .filter(stat => stat.normalized);
+
+      if (!coordData || !range || !stats.length) {
+        return;
+      }
+
+      relics.push({
+        id: overviewRelicId || ("placed-" + index + "-" + coordData.coord + "-" + name),
+        overviewRelicId: overviewRelicId,
+        name: name,
+        range: range,
+        villageId: String(villageId),
+        coord: coordData.coord,
+        x: coordData.x,
+        y: coordData.y,
+        locationName: locationText,
+        stats: stats
+      });
+    });
+
+    return relics;
+  }
+	
+
+  function relicSignature(relic) {
+    return [
+      cleanText(relic && relic.name).toLowerCase(),
+      String((relic && relic.range) || ""),
+      (relic && relic.stats || [])
+        .map(stat => stat.normalized)
+        .filter(Boolean)
+        .map(stat => stat.key + ":" + stat.value)
+        .sort()
+        .join("|")
+    ].join("::");
+  }
+
+  function getRelicIdentityKey(relic) {
+    const id = String(relic && relic.id || "");
+
+    if (id) {
+      return (id.indexOf("placed-") === 0 ? "placed:" : "id:") + id;
+    }
+
+    return "sig:" + relicSignature(relic);
+  }
+
+  function enrichPlacedInventoryRelic(relic) {
+    const village =
+      state.villagesById.get(String(relic.villageId)) ||
+      state.villagesByCoord.get(relic.coord);
+
+    return Object.assign({}, relic, {
+      fromInventory: true,
+      fromOverview: false,
+      coord: village ? village.coord : relic.coord,
+      x: village ? village.x : relic.x,
+      y: village ? village.y : relic.y,
+      locationName: village ? village.name : relic.locationName
+    });
+  }
+
+  function getPlacedRelicsFromBestSource(inventoryRelics, overviewRelics) {
+    const placedFromOverview = (overviewRelics || []).map(relic => {
+      return Object.assign({}, relic, {
+        fromOverview: true,
+        fromInventory: false
+      });
+    });
+
+    if (placedFromOverview.length) {
+      return placedFromOverview;
+    }
+
+    return (inventoryRelics || [])
+      .filter(relic => relic.villageId || relic.equippedAt)
+      .map(enrichPlacedInventoryRelic);
+  }
+
+	function countUnlockedRelicSlotsFromOverviewHtml(html) {
+		const doc = parseHtml(html);
+		const slots = Array.from(doc.querySelectorAll("#relic_slots .relic-slot"));
+
+		if (!slots.length) {
+			return 10;
+		}
+
+		const unlockedSlots = slots.filter(slot => {
+			return !slot.classList.contains("locked");
+		});
+
+		return Math.max(1, Math.min(10, unlockedSlots.length || 10));
+	}
+
+  function rebuildVillageIndexes() {
+    state.villagesById = new Map();
+    state.villagesByCoord = new Map();
+
+    state.villages.forEach(village => {
+      state.villagesById.set(String(village.id), village);
+      state.villagesByCoord.set(village.coord, village);
+    });
+  }
+
+  function getCoveredVillages(center, range) {
+    const coveredByCoord = new Map();
+    const offsets = getRelicOffsets(range);
+
+    offsets.forEach(offset => {
+      const targetCoord = (center.x + offset.dx) + "|" + (center.y + offset.dy);
+      const village = state.villagesByCoord.get(targetCoord);
+
+      if (village) {
+        coveredByCoord.set(village.coord, village);
+      }
+    });
+
+    if (state.villagesByCoord.has(center.coord)) {
+      coveredByCoord.set(center.coord, state.villagesByCoord.get(center.coord));
+    }
+
+    return Array.from(coveredByCoord.values()).sort((a, b) => {
+      if (a.y !== b.y) return a.y - b.y;
+      return a.x - b.x;
+    });
+  }
+
+	function getHighestFarmMax() {
+	  return Math.max(0, ...state.villages.map(village => village.farmMax || 0));
+	}
+
+	function getHighestFarmFree() {
+	  return Math.max(0, ...state.villages.map(village => village.farmFree || 0));
+	}
+
+  function getHighestFarmUsed() {
+    return Math.max(0, ...state.villages.map(village => village.farmUsed || 0));
+  }
+
+  function getHighestMerchantTotal() {
+    return Math.max(0, ...state.villages.map(village => village.merchantsTotal || 0));
+  }
+
+  function getHighestPitsTotal() {
+    return Math.max(0, ...state.villages.map(village => village.pitsTotal || 0));
+  }
+
+	function getVillageWeight(village, weighting) {
+	  if (weighting === "freeFarm") {
+		const highestFreeFarm = getHighestFarmFree();
+
+		if (highestFreeFarm > 0) {
+		  return (village.farmFree || 0) / highestFreeFarm;
+		}
+
+		return 1;
+	  }
+
+	  if (weighting === "farmCap") {
+		const highestFarmMax = getHighestFarmMax();
+
+		if (highestFarmMax > 0) {
+		  return (village.farmMax || 0) / highestFarmMax;
+		}
+
+		return 1;
+	  }
+
+    if (weighting === "fullFarm") {
+      const highestFarmUsed = getHighestFarmUsed();
+
+      if (highestFarmUsed > 0) {
+        return (village.farmUsed || 0) / highestFarmUsed;
+      }
+
+      return 1;
+    }
+
+    if (weighting === "merchantTotal") {
+      const highestMerchantTotal = getHighestMerchantTotal();
+
+      if (highestMerchantTotal > 0) {
+        return (village.merchantsTotal || 0) / highestMerchantTotal;
+      }
+
+      return 1;
+    }
+
+    if (weighting === "highestPits") {
+      const highestPitsTotal = getHighestPitsTotal();
+
+      if (highestPitsTotal > 0) {
+        return (village.pitsTotal || 0) / highestPitsTotal;
+      }
+
+      return 1;
+    }
+
+	  return 1;
+	}
+
+  function createEmptyBonusMap() {
+    return new Map();
+  }
+
+  function getVillageBonusObject(bonusMap, village) {
+    const key = village.coord;
+
+    if (!bonusMap.has(key)) {
+      bonusMap.set(key, {});
+    }
+
+    return bonusMap.get(key);
+  }
+
+  function cloneBonusMap(source) {
+    const clone = new Map();
+
+    source.forEach((value, key) => {
+      clone.set(key, Object.assign({}, value));
+    });
+
+    return clone;
+  }
+
+  function buildOptimizationContext(weighting, goal) {
+    const coverageCache = new Map();
+    const weightCache = new Map();
+    const candidateCentersByRange = new Map();
+    const highestFreeFarm = getHighestFarmFree();
+    const highestFarmMax = getHighestFarmMax();
+    const highestFarmUsed = getHighestFarmUsed();
+    const highestMerchantTotal = getHighestMerchantTotal();
+    const highestPitsTotal = getHighestPitsTotal();
+
+    state.villages.forEach(village => {
+      [2, 3, 4].forEach(range => {
+        coverageCache.set(village.coord + ":" + range, getCoveredVillages(village, range));
+      });
+
+      let weight = 1;
+
+      if (weighting === "freeFarm" && highestFreeFarm > 0) {
+        weight = (village.farmFree || 0) / highestFreeFarm;
+      } else if (weighting === "farmCap" && highestFarmMax > 0) {
+        weight = (village.farmMax || 0) / highestFarmMax;
+      } else if (weighting === "fullFarm" && highestFarmUsed > 0) {
+        weight = (village.farmUsed || 0) / highestFarmUsed;
+      } else if (weighting === "merchantTotal" && highestMerchantTotal > 0) {
+        weight = (village.merchantsTotal || 0) / highestMerchantTotal;
+      } else if (weighting === "highestPits" && highestPitsTotal > 0) {
+        weight = (village.pitsTotal || 0) / highestPitsTotal;
+      }
+
+      weightCache.set(village.coord, weight);
+    });
+
+    [2, 3, 4].forEach(range => {
+      candidateCentersByRange.set(range, state.villages.filter(center => {
+        if (isPlacementVillageBlocked(center)) return false;
+        const covered = coverageCache.get(center.coord + ":" + range) || [];
+        return covered.some(village => isVillageIncludedInGoalImpact(village, goal));
+      }));
+    });
+
+    return {
+      goal: goal,
+      weighting: weighting,
+      coverageCache: coverageCache,
+      weightCache: weightCache,
+      candidateCentersByRange: candidateCentersByRange
+    };
+  }
+
+  function getCandidateCentersForRelic(relic, goal, optimizationContext) {
+    const range = Math.max(0, parseInt(relic && relic.range || 0, 10));
+
+    if (
+      optimizationContext &&
+      optimizationContext.candidateCentersByRange &&
+      optimizationContext.candidateCentersByRange.has(range)
+    ) {
+      return optimizationContext.candidateCentersByRange.get(range) || [];
+    }
+
+    return state.villages.filter(center => {
+      if (isPlacementVillageBlocked(center)) return false;
+      const covered = getCachedCoveredVillages(center, range, optimizationContext);
+      return covered.some(village => isVillageIncludedInGoalImpact(village, goal));
+    });
+  }
+
+  function yieldToBrowser() {
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  function getCachedCoveredVillages(center, range, optimizationContext) {
+    const key = center.coord + ":" + range;
+
+    if (optimizationContext && optimizationContext.coverageCache && optimizationContext.coverageCache.has(key)) {
+      return optimizationContext.coverageCache.get(key) || [];
+    }
+
+    return getCoveredVillages(center, range);
+  }
+
+  function getCachedVillageWeight(village, weighting, optimizationContext) {
+    if (optimizationContext && optimizationContext.weightCache && optimizationContext.weightCache.has(village.coord)) {
+      return optimizationContext.weightCache.get(village.coord);
+    }
+
+    return getVillageWeight(village, weighting);
+  }
+
+  function getRecruitmentDemandForVillage(village) {
+    return state.amRecruitmentDemandByCoord && state.amRecruitmentDemandByCoord.get(village.coord);
+  }
+
+  function refreshRecruitmentDemandScoringScope() {
+    let maxTotal = 0;
+    let rows = 0;
+
+    if (!state.amRecruitmentDemandByCoord) {
+      state.amRecruitmentDemandScoringMax = 0;
+      state.amRecruitmentDemandScoringRows = 0;
+      return;
+    }
+
+    state.amRecruitmentDemandByCoord.forEach((demand, coord) => {
+      if (!demand || demand.total <= 0) return;
+      if (state.focusGroupId !== "0" && (!state.focusCoords || !state.focusCoords.has(coord))) return;
+      rows += 1;
+      maxTotal = Math.max(maxTotal, Number(demand.total || 0));
+    });
+
+    state.amRecruitmentDemandScoringMax = maxTotal;
+    state.amRecruitmentDemandScoringRows = rows;
+  }
+
+  function getScoringVillageWeight(village, goal, weighting, optimizationContext) {
+    if (goal === "noble" && state.targetCoords && state.targetCoords.size) {
+      return state.targetCoords.has(village.coord) ? 1 : 0;
+    }
+
+    if ((goal === "offense" || goal === "defense" || goal === "recruitment") && state.focusGroupId !== "0") {
+      if (!state.focusCoords || !state.focusCoords.has(village.coord)) return 0;
+    }
+
+    let weight = getCachedVillageWeight(village, weighting, optimizationContext);
+
+    if (goal === "recruitment" && state.recruitmentDemandActive) {
+      const demand = getRecruitmentDemandForVillage(village);
+      const scoringMax = Number(state.amRecruitmentDemandScoringMax || 0);
+      if (!demand || demand.total <= 0 || scoringMax <= 0) return 0;
+      const urgency = Math.sqrt(Math.min(1, demand.total / scoringMax));
+      weight *= 0.35 + 0.65 * urgency;
+    }
+
+    return weight;
+  }
+
+  function getScoringBucketKey(goal, statKey) {
+    const key = String(statKey || "");
+
+    if (goal === "offense") {
+      const offenseUnits = ["axe", "light", "marcher", "heavy", "ram", "catapult"];
+      for (let i = 0; i < offenseUnits.length; i++) {
+        if (key.indexOf(offenseUnits[i] + "_") === 0) return "offense:" + offenseUnits[i];
+      }
+    }
+
+    if (goal === "defense") {
+      const defenseUnits = ["spear", "sword", "archer", "heavy", "catapult"];
+      for (let i = 0; i < defenseUnits.length; i++) {
+        if (key.indexOf(defenseUnits[i] + "_") === 0) return "defense:" + defenseUnits[i];
+      }
+    }
+
+    if (goal === "recruitment") {
+      if (key.indexOf("barracks_") === 0) return "recruitment:barracks";
+      if (key.indexOf("stable_") === 0) return "recruitment:stable";
+      if (key.indexOf("workshop_") === 0) return "recruitment:workshop";
+      if (key.indexOf("academy_") === 0) return "recruitment:academy";
+    }
+
+    return key;
+  }
+
+  function getRecruitmentBuildingForStat(statKey) {
+    const key = String(statKey || "");
+    if (key.indexOf("barracks_") === 0) return "barracks";
+    if (key.indexOf("stable_") === 0) return "stable";
+    if (key.indexOf("workshop_") === 0) return "workshop";
+    if (key.indexOf("academy_") === 0) return "academy";
+    return "";
+  }
+
+  function getDynamicStatWeight(village, goal, statKey, baseWeight) {
+    if (goal !== "recruitment" || !state.recruitmentDemandActive) return baseWeight;
+
+    const building = getRecruitmentBuildingForStat(statKey);
+    if (!building || building === "academy") return 0;
+
+    const demand = getRecruitmentDemandForVillage(village);
+    if (!demand || demand.total <= 0) return 0;
+
+    const buildingWork = Number(demand.byBuilding[building] || 0);
+    if (buildingWork <= 0) return 0;
+
+    const share = Math.min(1, buildingWork / demand.total);
+    const demandMultiplier = 0.40 + 1.20 * share;
+    return baseWeight * demandMultiplier;
+  }
+
+  function buildScoringBucketTotals(bonuses, goal, weights) {
+    const totals = {};
+    Object.keys(weights || {}).forEach(key => {
+      const value = Math.max(0, Number((bonuses || {})[key] || 0));
+      if (!value) return;
+      const bucket = getScoringBucketKey(goal, key);
+      totals[bucket] = (totals[bucket] || 0) + value;
+    });
+    return totals;
+  }
+
+  function getBalancedUtility(value, benefitCap) {
+    const cap = Math.max(1, Number(benefitCap || DEFAULT_BENEFIT_CAP));
+    const normalized = Math.max(0, Number(value || 0)) / cap;
+    return cap * Math.pow(normalized, BALANCE_POWER);
+  }
+
+  function getBalancedMarginalGain(currentBucket, effectiveGain, benefitCap, goal) {
+    if (goal !== "offense" && goal !== "defense" && goal !== "recruitment") return effectiveGain;
+    if (effectiveGain <= 0) return 0;
+    return Math.max(0, getBalancedUtility(currentBucket + effectiveGain, benefitCap) - getBalancedUtility(currentBucket, benefitCap));
+  }
+
+  function isVillageIncludedInGoalImpact(village, goal) {
+    if (!village) return false;
+    if (goal === "noble" && state.targetCoords && state.targetCoords.size) return state.targetCoords.has(village.coord);
+
+    if ((goal === "offense" || goal === "defense" || goal === "recruitment") && state.focusGroupId !== "0") {
+      if (!state.focusCoords || !state.focusCoords.has(village.coord)) return false;
+    }
+
+    if (goal === "recruitment" && state.recruitmentDemandActive) {
+      const demand = getRecruitmentDemandForVillage(village);
+      return !!(demand && demand.total > 0);
+    }
+    return true;
+  }
+
+  function applyRelicToBonuses(relic, center, bonusMap, goalAgnostic, optimizationContext) {
+    const covered = getCachedCoveredVillages(center, relic.range, optimizationContext);
+    const stats = (relic.stats || [])
+      .map(stat => stat.normalized)
+      .filter(Boolean);
+    const benefitCap = getBenefitCap();
+
+    covered.forEach(village => {
+      const bonuses = getVillageBonusObject(bonusMap, village);
+
+      stats.forEach(stat => {
+        const current = bonuses[stat.key] || 0;
+        bonuses[stat.key] = Math.min(benefitCap, current + stat.value);
+      });
+    });
+
+    return covered;
+  }
+
+  function buildCurrentBonuses(mode, optimizationContext) {
+    const bonusMap = createEmptyBonusMap();
+
+    if (mode !== "fixed") {
+      return bonusMap;
+    }
+
+    state.placedRelics.forEach(relic => {
+      const center =
+        state.villagesById.get(String(relic.villageId)) ||
+        state.villagesByCoord.get(relic.coord) ||
+        {
+          x: relic.x,
+          y: relic.y,
+          coord: relic.coord
+        };
+
+      if (center && relic.range) {
+        applyRelicToBonuses(relic, center, bonusMap, true, optimizationContext);
+      }
+    });
+
+    return bonusMap;
+  }
+
+  function calculatePlacementScore(relic, center, bonusMap, goal, weighting, optimizationContext) {
+    const weights = getRelevantWeights(goal);
+    const relevantStats = getRelevantStats(relic, goal);
+    const covered = getCachedCoveredVillages(center, relic.range, optimizationContext);
+    const benefitCap = getBenefitCap();
+
+    let score = 0;
+    let rawScore = 0;
+    let wastedScore = 0;
+    let scoredCoverageCount = 0;
+    const scoreByStat = {};
+
+    if (!relevantStats.length || !covered.length) {
+      return {
+        score: 0,
+        rawScore: 0,
+        wastedScore: 0,
+        covered: covered,
+        scoredCoverageCount: 0,
+        relevantStats: relevantStats,
+        scoreByStat: scoreByStat
+      };
+    }
+
+    covered.forEach(village => {
+      const villageWeight = getScoringVillageWeight(village, goal, weighting, optimizationContext);
+      if (villageWeight <= 0) return;
+
+      scoredCoverageCount += 1;
+      const bonuses = bonusMap.get(village.coord) || {};
+      const bucketTotals = buildScoringBucketTotals(bonuses, goal, weights);
+
+      relevantStats.forEach(stat => {
+        const baseWeight = weights[stat.key] || 0;
+        const statWeight = getDynamicStatWeight(village, goal, stat.key, baseWeight);
+        if (!statWeight) return;
+
+        const current = bonuses[stat.key] || 0;
+        const capped = Math.min(benefitCap, current + stat.value);
+        const effectiveGain = Math.max(0, capped - current);
+        const wastedGain = Math.max(0, stat.value - effectiveGain);
+        const bucketKey = getScoringBucketKey(goal, stat.key);
+        const bucketCurrent = bucketTotals[bucketKey] || 0;
+        const marginalGain = getBalancedMarginalGain(bucketCurrent, effectiveGain, benefitCap, goal);
+
+        const statScore = marginalGain * statWeight * villageWeight;
+        const statRawScore = stat.value * statWeight * villageWeight;
+        const statWastedScore = wastedGain * statWeight * villageWeight;
+
+        score += statScore;
+        rawScore += statRawScore;
+        wastedScore += statWastedScore;
+        bucketTotals[bucketKey] = bucketCurrent + effectiveGain;
+        scoreByStat[stat.key] = (scoreByStat[stat.key] || 0) + statScore;
+      });
+    });
+
+    return {
+      score: score,
+      rawScore: rawScore,
+      wastedScore: wastedScore,
+      covered: covered,
+      scoredCoverageCount: scoredCoverageCount,
+      relevantStats: relevantStats,
+      scoreByStat: scoreByStat
+    };
+  }
+
+  function getPlacedOverviewRelicIds() {
+    const ids = new Set();
+
+    (state.placedRelics || []).forEach(relic => {
+      const id = String((relic && (relic.overviewRelicId || relic.id)) || "");
+
+      if (id && id.indexOf("placed-") !== 0) {
+        ids.add(id);
+      }
+    });
+
+    return ids;
+  }
+
+  function isLooseInventoryRelic(relic) {
+    return !(relic && (relic.villageId || relic.equippedAt || (relic.raw && relic.raw.inactive_until)));
+  }
+
+  function isInventoryRelicAvailableForRebuild(relic, overviewRelicIds) {
+    const id = String((relic && relic.id) || "");
+
+    if (isLooseInventoryRelic(relic)) {
+      return true;
+    }
+
+    if (id && overviewRelicIds && overviewRelicIds.has(id)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function getAvailableRelics(mode) {
+    if (mode === "rebuild") {
+      const overviewRelicIds = getPlacedOverviewRelicIds();
+      const inventoryRelics = state.inventoryRelics
+        .filter(relic => isInventoryRelicAvailableForRebuild(relic, overviewRelicIds))
+        .map(relic => {
+          return Object.assign({}, relic, {
+            fromInventory: true,
+            fromOverview: false
+          });
+        });
+
+      const placedRelics = state.placedRelics.map(relic => {
+        return Object.assign({}, relic, {
+          fromOverview: true
+        });
+      });
+
+      return dedupeAvailableRelics(inventoryRelics.concat(placedRelics));
+    }
+
+    return state.inventoryRelics.filter(isLooseInventoryRelic);
+  }
+
+  function dedupeAvailableRelics(relics) {
+    const result = [];
+    const seenKeys = new Set();
+
+    (relics || []).forEach(relic => {
+      const key = getRelicIdentityKey(relic);
+
+      if (seenKeys.has(key)) return;
+
+      seenKeys.add(key);
+      result.push(relic);
+    });
+
+    return result;
+  }
+
+  function isBetterMove(candidate, best) {
+    const EPSILON = 0.000001;
+
+    if (!best) return true;
+    if (candidate.score > best.score + EPSILON) return true;
+    if (candidate.score < best.score - EPSILON) return false;
+
+    if (candidate.wastedScore < best.wastedScore - EPSILON) return true;
+    if (candidate.wastedScore > best.wastedScore + EPSILON) return false;
+
+    if ((candidate.scoredCoverageCount || 0) !== (best.scoredCoverageCount || 0)) {
+      return (candidate.scoredCoverageCount || 0) > (best.scoredCoverageCount || 0);
+    }
+
+    return candidate.covered.length > best.covered.length;
+  }
+
+  function buildMove(step, relic, center, scored) {
+    return {
+      step: step,
+      relic: relic,
+      center: center,
+      score: scored.score,
+      rawScore: scored.rawScore,
+      wastedScore: scored.wastedScore,
+      covered: scored.covered,
+      scoredCoverageCount: scored.scoredCoverageCount || 0,
+      relevantStats: scored.relevantStats,
+      scoreByStat: scored.scoreByStat
+    };
+  }
+
+  function scorePlanPlacements(placements, baseBonuses, goal, weighting, optimizationContext) {
+    const workingBonuses = cloneBonusMap(baseBonuses);
+    const usedRelics = new Set();
+    const usedCenters = new Set();
+    const scoredPlan = [];
+    let totalScore = 0;
+    let totalWaste = 0;
+
+    for (let i = 0; i < placements.length; i++) {
+      const placement = placements[i];
+      const relicKey = getRelicIdentityKey(placement.relic);
+      const centerKey = placement.center.coord;
+
+      if (usedRelics.has(relicKey) || usedCenters.has(centerKey) || isPlacementVillageBlocked(placement.center)) {
+        return { valid: false, totalScore: -Infinity, totalWaste: Infinity, plan: [] };
+      }
+
+      usedRelics.add(relicKey);
+      usedCenters.add(centerKey);
+
+      const scored = calculatePlacementScore(placement.relic, placement.center, workingBonuses, goal, weighting, optimizationContext);
+      const move = buildMove(i + 1, placement.relic, placement.center, scored);
+
+      scoredPlan.push(move);
+      totalScore += scored.score;
+      totalWaste += scored.wastedScore;
+      applyRelicToBonuses(placement.relic, placement.center, workingBonuses, true, optimizationContext);
+    }
+
+    return {
+      valid: true,
+      totalScore: totalScore,
+      totalWaste: totalWaste,
+      plan: scoredPlan
+    };
+  }
+
+  function isBetterPlan(candidate, current) {
+    const EPSILON = 0.000001;
+
+    if (!candidate.valid) return false;
+    if (!current || !current.valid) return true;
+    if (candidate.totalScore > current.totalScore + EPSILON) return true;
+    if (candidate.totalScore < current.totalScore - EPSILON) return false;
+
+    return candidate.totalWaste < current.totalWaste - EPSILON;
+  }
+
+  function improvePlanWithLocalSearch(plan, availableRelics, baseBonuses, goal, weighting, optimizationContext) {
+    const candidateCenterEvaluations = availableRelics.reduce((total, relic) => {
+      return total + getCandidateCentersForRelic(relic, goal, optimizationContext).length;
+    }, 0);
+    const workEstimate = plan.length * candidateCenterEvaluations * Math.max(1, plan.length);
+
+    if (
+      !plan.length ||
+      state.villages.length > LOCAL_SEARCH_MAX_VILLAGES ||
+      workEstimate > LOCAL_SEARCH_MAX_ESTIMATED_EVALUATIONS
+    ) {
+      console.log(SCRIPT_NAME + " local-search refinement skipped for performance:", {
+        villages: state.villages.length,
+        estimatedEvaluations: workEstimate
+      });
+      return plan;
+    }
+
+    let current = scorePlanPlacements(plan.map(item => ({ relic: item.relic, center: item.center })), baseBonuses, goal, weighting, optimizationContext);
+    let improved = true;
+    let passes = 0;
+
+    while (improved && passes < 2) {
+      improved = false;
+      passes += 1;
+
+      for (let index = 0; index < current.plan.length; index++) {
+        const currentPlacements = current.plan.map(item => ({ relic: item.relic, center: item.center }));
+
+        for (let relicIndex = 0; relicIndex < availableRelics.length; relicIndex++) {
+          const relic = availableRelics[relicIndex];
+          const candidateCenters = getCandidateCentersForRelic(relic, goal, optimizationContext);
+
+          for (let centerIndex = 0; centerIndex < candidateCenters.length; centerIndex++) {
+            const center = candidateCenters[centerIndex];
+
+            if (
+              getRelicIdentityKey(relic) === getRelicIdentityKey(currentPlacements[index].relic) &&
+              center.coord === currentPlacements[index].center.coord
+            ) {
+              continue;
+            }
+
+            const testPlacements = currentPlacements.slice();
+            testPlacements[index] = { relic: relic, center: center };
+            const candidate = scorePlanPlacements(testPlacements, baseBonuses, goal, weighting, optimizationContext);
+
+            if (isBetterPlan(candidate, current)) {
+              current = candidate;
+              improved = true;
+            }
+          }
+        }
+      }
+    }
+
+    return current.plan;
+  }
+
+  async function optimizePlan(goal, mode, weighting, maxPlacements) {
+    const optimizationContext = buildOptimizationContext(weighting, goal);
+    const baseBonuses = buildCurrentBonuses(mode, optimizationContext);
+    const workingBonuses = cloneBonusMap(baseBonuses);
+    const availableRelics = getAvailableRelics(mode).filter(relic => getRelevantStats(relic, goal).length > 0);
+    const remainingRelics = availableRelics.slice();
+    const usedCenters = new Set();
+    const plan = [];
+    let evaluatedCandidates = 0;
+
+    for (let step = 0; step < maxPlacements; step++) {
+      let bestMove = null;
+      setStatus("Optimizing relic placements... " + (step + 1) + "/" + maxPlacements, "warn");
+
+      for (let relicIndex = 0; relicIndex < remainingRelics.length; relicIndex++) {
+        const relic = remainingRelics[relicIndex];
+        const candidateCenters = getCandidateCentersForRelic(relic, goal, optimizationContext);
+
+        for (let centerIndex = 0; centerIndex < candidateCenters.length; centerIndex++) {
+          const center = candidateCenters[centerIndex];
+          if (usedCenters.has(center.coord)) continue;
+
+          const scored = calculatePlacementScore(relic, center, workingBonuses, goal, weighting, optimizationContext);
+          evaluatedCandidates += 1;
+
+          if (scored.score > 0) {
+            const candidate = buildMove(step + 1, relic, center, scored);
+
+            if (isBetterMove(candidate, bestMove)) {
+              bestMove = candidate;
+            }
+          }
+
+          if (evaluatedCandidates % OPTIMIZATION_YIELD_EVERY === 0) {
+            await yieldToBrowser();
+          }
+        }
+      }
+
+      if (!bestMove) {
+        break;
+      }
+
+      applyRelicToBonuses(bestMove.relic, bestMove.center, workingBonuses, true, optimizationContext);
+      usedCenters.add(bestMove.center.coord);
+
+      const relicKey = getRelicIdentityKey(bestMove.relic);
+      const index = remainingRelics.findIndex(relic => getRelicIdentityKey(relic) === relicKey);
+      if (index >= 0) {
+        remainingRelics.splice(index, 1);
+      }
+
+      plan.push(bestMove);
+      await yieldToBrowser();
+    }
+
+    return improvePlanWithLocalSearch(plan, availableRelics, baseBonuses, goal, weighting, optimizationContext);
+  }
+
+  async function loadFocusGroupForScoring(goal) {
+    state.focusCoords = new Set();
+    state.focusGroupId = "0";
+    state.focusGroupName = "All villages";
+
+    if ((goal !== "offense" && goal !== "defense" && goal !== "recruitment") || !ui.focusGroupSelect) return null;
+
+    const groupId = String(ui.focusGroupSelect.value || "0");
+    state.focusGroupId = groupId;
+    const selectedOption = ui.focusGroupSelect.options[ui.focusGroupSelect.selectedIndex];
+    state.focusGroupName = cleanText(selectedOption ? selectedOption.textContent : "All villages") || "All villages";
+
+    if (groupId === "0") {
+      state.villages.forEach(village => state.focusCoords.add(village.coord));
+      return null;
+    }
+
+    const url = getFocusGroupVillageUrl(groupId);
+    const html = await fetchHtml(url);
+    const focusVillages = extractVillagesFromProductionHtml(html);
+    focusVillages.forEach(village => state.focusCoords.add(village.coord));
+
+    if (!state.focusCoords.size) {
+      throw new Error("Focus Group '" + state.focusGroupName + "' loaded 0 villages. Try reloading the group list or selecting All villages.");
+    }
+
+    return url;
+  }
+
+  function resetRecruitmentDemandState() {
+    state.recruitmentDemandActive = false;
+    state.amTemplates = [];
+    state.amRecruitmentDemandByCoord = new Map();
+    state.amRecruitmentDemandMax = 0;
+    state.amRecruitmentDemandScoringMax = 0;
+    state.amRecruitmentDemandScoringRows = 0;
+    state.amRecruitmentMeta = { rows: 0, timedRows: 0, timingSource: "none", note: "" };
+    state.unitBuildTimes = {};
+  }
+
+  async function loadAllData(goal) {
+	  const villageUrl = getVillageDataUrl(goal);
+
+	  const inventoryUrl = buildGameUrl({
+		screen: "relic_system",
+		mode: "inventory"
+	  });
+
+	  const overviewUrl = buildGameUrl({
+		screen: "relic_system",
+		mode: "overview"
+	  });
+
+    const helpUrl = buildGameUrl({
+      screen: "relic_system",
+      mode: "help"
+    });
+
+    state.recruitmentDemandRequested = goal === "recruitment" && !!(ui.recruitmentDemandCheckbox && ui.recruitmentDemandCheckbox.checked);
+    resetRecruitmentDemandState();
+
+	  if (goal === "offense" || goal === "defense") {
+		setStatus("Loading ALL villages for placement, relic data and selected Focus Group...", "warn");
+	  } else if (goal === "production") {
+      setStatus("Loading all village building levels, inventory and overview data...", "warn");
+	  } else if (goal === "recruitment" && state.recruitmentDemandRequested) {
+      setStatus("Loading all villages, relic data, selected Focus Group and Account Manager troop demand...", "warn");
+    } else if (goal === "recruitment") {
+      setStatus("Loading all villages, relic data and selected Focus Group...", "warn");
+    } else {
+		setStatus("Loading all villages, inventory and overview data...", "warn");
+	  }
+
+      // Intentionally sequential. fetchHtml/fetchGetText also use the shared GET queue,
+      // so no code path in this script can create a burst of parallel GET requests.
+      const villageHtml = await fetchHtml(villageUrl);
+      const inventoryHtml = await fetchHtml(inventoryUrl);
+      const overviewHtml = await fetchHtml(overviewUrl);
+      const helpHtml = await fetchHtml(helpUrl, {
+        cacheTtlMs: WORLD_CACHE_TTL_MS,
+        cacheKey: makeCacheKey("world-relic-help", helpUrl)
+      });
+      const responses = [villageHtml, inventoryHtml, overviewHtml, helpHtml];
+
+	  state.villages = extractVillagesFromProductionHtml(responses[0]);
+	  rebuildVillageIndexes();
+
+	  state.inventoryRelics = extractInventoryRelicsFromHtml(responses[1]);
+    state.placedRelics = getPlacedRelicsFromBestSource(
+      state.inventoryRelics,
+      extractPlacedRelicsFromOverviewHtml(responses[2])
+    );
+    rebuildBlockedPlacementVillages(extractInactiveRelicPlacementsFromOverviewHtml(responses[2]));
+		state.unlockedRelicSlots = countUnlockedRelicSlotsFromOverviewHtml(responses[2]);
+    applyWorldRelicSettings(detectWorldRelicSettings({
+      inventoryRelics: state.inventoryRelics,
+      placedRelics: state.placedRelics,
+      helpHtml: responses[3]
+    }));
+    syncBenefitCapInputFromState();
+    applyBenefitCapInputToState();
+
+    const focusGroupUrl = await loadFocusGroupForScoring(goal);
+    let amData = null;
+
+    if (state.recruitmentDemandRequested) {
+      try {
+        amData = await loadAmRecruitmentDemand();
+        if (!state.recruitmentDemandActive) {
+          state.amRecruitmentMeta.note = "AM demand was requested, but no remaining template workload could be parsed. Balanced recruitment scoring is used instead.";
+        }
+      } catch (err) {
+        console.warn(SCRIPT_NAME + " could not load AM recruitment demand:", err);
+        resetRecruitmentDemandState();
+        state.amRecruitmentMeta.note = "AM demand could not be loaded; balanced recruitment scoring is used instead. " + (err.message || String(err));
+      }
+    }
+
+	  console.log(SCRIPT_NAME + " villages (placement universe):", state.villages);
+    console.log(SCRIPT_NAME + " focus group:", { id: state.focusGroupId, name: state.focusGroupName, coords: Array.from(state.focusCoords) });
+	  console.log(SCRIPT_NAME + " inventory relics:", state.inventoryRelics);
+	  console.log(SCRIPT_NAME + " placed relics:", state.placedRelics);
+    console.log(SCRIPT_NAME + " blocked placement villages (inactive/captured relics):", state.inactiveRelicPlacements);
+    console.log(SCRIPT_NAME + " AM recruitment demand:", { active: state.recruitmentDemandActive, meta: state.amRecruitmentMeta, data: Array.from(state.amRecruitmentDemandByCoord.entries()) });
+    console.log(SCRIPT_NAME + " world relic settings:", state.worldRelicSettings);
+
+	  return {
+		villageUrl: villageUrl,
+		inventoryUrl: inventoryUrl,
+		overviewUrl: overviewUrl,
+      helpUrl: helpUrl,
+      focusGroupUrl: focusGroupUrl,
+      amUrl: amData && amData.amUrl
+	  };
+	}
+
+  function parseTargetCoordsInput(value) {
+    const matches = String(value || "").match(/\d{1,3}\|\d{1,3}/g) || [];
+    return Array.from(new Set(matches));
+  }
+
+  async function loadAndOptimize() {
+    try {
+      ui.loadButton.disabled = true;
+
+      const goal = ui.goalSelect.value;
+			const mode = ui.modeSelect.value;
+			const weighting = ui.weightSelect.value;
+      state.lastGoal = goal;
+
+      state.targetCoords = new Set(parseTargetCoordsInput(ui.nobleTargetInput ? ui.nobleTargetInput.value : ""));
+      if (goal === "noble" && state.targetCoords.size < 1) {
+        setStatus("Choose at least one target village coordinate for Noble Recruitment, for example 510|510.", "error");
+        ui.loadButton.disabled = false;
+        return;
+      }
+
+			const urls = await loadAllData(goal);
+			const maxPlacements = Math.max(1, Math.min(10, parseInt(ui.countInput.value, 10) || state.unlockedRelicSlots || 10));
+
+      state.plan = await optimizePlan(goal, mode, weighting, maxPlacements);
+
+      renderResults({
+        goal: goal,
+        mode: mode,
+        weighting: weighting,
+        maxPlacements: maxPlacements,
+        urls: urls
+      });
+
+      const focusStatus = goal === "offense" || goal === "defense" || goal === "recruitment"
+        ? " Focus: " + state.focusGroupName + " (" + (state.focusGroupId === "0" ? state.villages.length : state.focusCoords.size) + " scoring villages; placement can use all villages)."
+        : "";
+      const amStatus = goal === "recruitment" && state.recruitmentDemandRequested
+        ? (state.recruitmentDemandActive
+            ? " AM demand: active for " + state.amRecruitmentDemandScoringRows + " scoring village(s)."
+            : " AM demand: unavailable/empty; balanced fallback used.")
+        : "";
+      const blockedStatus = state.inactiveRelicPlacements.length
+        ? " Blocked placement villages: " + state.inactiveRelicPlacements.length + " (inactive/captured relics)."
+        : "";
+
+      setStatus(
+        "Loaded " +
+          state.villages.length +
+          " village(s), " +
+          state.inventoryRelics.length +
+          " inventory relic(s), " +
+          state.placedRelics.length +
+          " placed relic(s). Plan rows: " +
+          state.plan.length +
+          ". Cap: " +
+          formatSettingNumber(getBenefitCap()) +
+          "% (" +
+          getBenefitCapSourceLabel() +
+          ")." + focusStatus + amStatus + blockedStatus,
+        "success"
+      );
+    } catch (err) {
+      console.error(SCRIPT_NAME + " failed:", err);
+      setStatus(err.message || String(err), "error");
+    } finally {
+      ui.loadButton.disabled = false;
+    }
+  }
+
+  function formatStatList(stats) {
+	  return (stats || [])
+		.map(stat => {
+		  if (/%/.test(stat.label)) {
+			return stat.label;
+		  }
+
+		  return stat.label + " +" + stat.value + "%";
+		})
+		.join(", ");
+	}
+
+  function formatScore(value) {
+    return Number(value || 0).toFixed(2);
+  }
+	
+	const STAT_LABELS = {
+  barracks_speed: "Barracks speed",
+  stable_speed: "Stable speed",
+  workshop_speed: "Workshop speed",
+  academy_speed: "Academy speed",
+
+  barracks_cost: "Barracks cost reduction",
+  stable_cost: "Stable cost reduction",
+  workshop_cost: "Workshop cost reduction",
+  merchant_travel_speed: "Merchant travel speed",
+  merchant_capacity: "Merchant capacity",
+  haul_capacity: "Haul capacity",
+  wood_production: "Wood production",
+  clay_production: "Clay production",
+  iron_production: "Iron production",
+  construction_speed: "Construction speed",
+  noble_refund: "Nobleman refund",
+
+  spear_attack: "Spear fighter attack",
+  spear_offdef: "Spear fighter off/def",
+  spear_defense: "Spear fighter defense",
+  sword_attack: "Swordsman attack",
+  sword_offdef: "Swordsman off/def",
+  sword_defense: "Swordsman defense",
+  axe_attack: "Axeman attack",
+  axe_offdef: "Axeman off/def",
+  axe_defense: "Axeman defense",
+  archer_attack: "Archer attack",
+  archer_offdef: "Archer off/def",
+  archer_defense: "Archer defense",
+  light_attack: "Light cavalry attack",
+  light_offdef: "Light cavalry off/def",
+  light_defense: "Light cavalry defense",
+  marcher_attack: "Mounted archer attack",
+  marcher_offdef: "Mounted archer off/def",
+  marcher_defense: "Mounted archer defense",
+  heavy_attack: "Heavy cavalry attack",
+  heavy_offdef: "Heavy cavalry off/def",
+  heavy_defense: "Heavy cavalry defense",
+  ram_attack: "Ram attack",
+  ram_offdef: "Ram off/def",
+  ram_defense: "Ram defense",
+  ram_damage: "Ram building damage",
+  catapult_attack: "Catapult attack",
+  catapult_offdef: "Catapult off/def",
+  catapult_defense: "Catapult defense",
+  catapult_damage: "Catapult building damage"
+};
+
+function getStatDisplayName(key) {
+  return STAT_LABELS[key] || key.replace(/_/g, " ");
+}
+
+function formatImpactStats(stats) {
+  const keys = Object.keys(stats || {}).sort();
+
+  if (!keys.length) {
+    return "-";
+  }
+
+  return keys
+    .map(key => {
+      return getStatDisplayName(key) + " " + formatScore(stats[key]) + "%";
+    })
+    .join(", ");
+}
+
+
+const STAT_COPY_ORDER = {
+  barracks_speed: 10,
+  barracks_cost: 11,
+  stable_speed: 20,
+  stable_cost: 21,
+  workshop_speed: 30,
+  workshop_cost: 31,
+  academy_speed: 40,
+  academy_cost: 41,
+  noble_refund: 42,
+  construction_speed: 50,
+  merchant_travel_speed: 60,
+  merchant_capacity: 61,
+  haul_capacity: 70,
+  wood_production: 80,
+  clay_production: 81,
+  iron_production: 82,
+  axe_attack: 100,
+  axe_offdef: 101,
+  axe_defense: 102,
+  spear_attack: 110,
+  spear_offdef: 111,
+  spear_defense: 112,
+  sword_attack: 120,
+  sword_offdef: 121,
+  sword_defense: 122,
+  archer_attack: 130,
+  archer_offdef: 131,
+  archer_defense: 132,
+  light_attack: 200,
+  light_offdef: 201,
+  light_defense: 202,
+  marcher_attack: 210,
+  marcher_offdef: 211,
+  marcher_defense: 212,
+  heavy_attack: 220,
+  heavy_offdef: 221,
+  heavy_defense: 222,
+  ram_attack: 300,
+  ram_offdef: 301,
+  ram_defense: 302,
+  ram_damage: 303,
+  catapult_attack: 310,
+  catapult_offdef: 311,
+  catapult_defense: 312,
+  catapult_damage: 313
+};
+
+const STAT_COPY_LABELS = {
+  barracks_speed: "Barracks speed",
+  barracks_cost: "Barracks cost",
+  stable_speed: "Stable speed",
+  stable_cost: "Stable cost",
+  workshop_speed: "Workshop speed",
+  workshop_cost: "Workshop cost",
+  academy_speed: "Academy speed",
+  academy_cost: "Academy cost",
+  noble_refund: "Nobleman refund",
+  construction_speed: "Construction speed",
+  merchant_travel_speed: "Merchant travel speed",
+  merchant_capacity: "Merchant capacity",
+  haul_capacity: "Haul capacity",
+  wood_production: "Wood production",
+  clay_production: "Clay production",
+  iron_production: "Iron production"
+};
+
+function getStatCopyOrder(key) {
+  return STAT_COPY_ORDER[key] !== undefined ? STAT_COPY_ORDER[key] : 999;
+}
+
+function sortStatsForCopy(stats) {
+  return (stats || []).slice().sort((a, b) => {
+    const keyA = a.key || "";
+    const keyB = b.key || "";
+    const orderA = getStatCopyOrder(keyA);
+    const orderB = getStatCopyOrder(keyB);
+
+    if (orderA !== orderB) return orderA - orderB;
+    return getStatCopyLabel(keyA).localeCompare(getStatCopyLabel(keyB));
+  });
+}
+
+function getStatBuildingIcon(key) {
+  const normalized = String(key || "");
+
+  if (
+    normalized.indexOf("barracks_") === 0 ||
+    normalized.indexOf("axe_") === 0 ||
+    normalized.indexOf("spear_") === 0 ||
+    normalized.indexOf("sword_") === 0 ||
+    normalized.indexOf("archer_") === 0
+  ) {
+    return "barracks";
+  }
+
+  if (
+    normalized.indexOf("stable_") === 0 ||
+    normalized.indexOf("light_") === 0 ||
+    normalized.indexOf("marcher_") === 0 ||
+    normalized.indexOf("heavy_") === 0 ||
+    normalized.indexOf("spy_") === 0
+  ) {
+    return "stable";
+  }
+
+  if (
+    normalized.indexOf("workshop_") === 0 ||
+    normalized.indexOf("ram_") === 0 ||
+    normalized.indexOf("catapult_") === 0
+  ) {
+    return "garage";
+  }
+
+  if (normalized.indexOf("academy_") === 0 || normalized.indexOf("noble_") === 0) {
+    return "snob";
+  }
+
+  if (normalized.indexOf("merchant_") === 0 || normalized.indexOf("haul_") === 0) {
+    return "market";
+  }
+
+  if (normalized.indexOf("wood_") === 0) {
+    return "wood";
+  }
+
+  if (normalized.indexOf("clay_") === 0) {
+    return "stone";
+  }
+
+  if (normalized.indexOf("iron_") === 0) {
+    return "iron";
+  }
+
+  if (normalized.indexOf("construction_") === 0) {
+    return "main";
+  }
+
+  return "main";
+}
+
+function getStatCopyLabel(key) {
+  return STAT_COPY_LABELS[key] || getStatDisplayName(key);
+}
+
+function isCostStat(key) {
+  return /_cost$/.test(String(key || ""));
+}
+
+function formatPercentCompact(value) {
+  const rounded = Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+  if (Number.isInteger(rounded)) {
+    return String(rounded);
+  }
+
+  return String(rounded).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function formatStatLineForCopy(stat, showPlusForPositive) {
+  if (!stat) return "-";
+
+  const key = stat.key || "";
+  const icon = getStatBuildingIcon(key);
+  const label = getStatCopyLabel(key);
+  const value = formatPercentCompact(stat.value);
+  const sign = isCostStat(key) ? "-" : (showPlusForPositive ? "+" : "");
+
+  return "[building]" + icon + "[/building] " + label + " " + sign + value + "%";
+}
+
+function formatStatsForCopy(stats, showPlusForPositive) {
+  const sorted = sortStatsForCopy(stats);
+
+  if (!sorted.length) {
+    return "-";
+  }
+
+  return sorted.map(stat => formatStatLineForCopy(stat, showPlusForPositive)).join("; ");
+}
+
+function formatImpactStatsForCopy(stats) {
+  const sorted = Object.keys(stats || {})
+    .sort((a, b) => {
+      const orderA = getStatCopyOrder(a);
+      const orderB = getStatCopyOrder(b);
+
+      if (orderA !== orderB) return orderA - orderB;
+      return getStatCopyLabel(a).localeCompare(getStatCopyLabel(b));
+    });
+
+  if (!sorted.length) {
+    return "-";
+  }
+
+  return sorted.map(key => {
+    return formatStatLineForCopy({
+      key: key,
+      value: stats[key]
+    }, false);
+  }).join("; ");
+}
+
+function getRelicQualityColor(relic) {
+  const text = cleanText((relic && (relic.quality || relic.name)) || "").toLowerCase();
+
+  if (text.indexOf("renowned") >= 0) return "#b7791f";
+  if (text.indexOf("superior") >= 0) return "#6a3bb4";
+  if (text.indexOf("enhanced") >= 0) return "#3b4cb4";
+  if (text.indexOf("sturdy") >= 0) return "#2f855a";
+  if (text.indexOf("shoddy") >= 0) return "#777777";
+
+  return "#3b4cb4";
+}
+
+function getRelicBuildingIcon(relic, stats) {
+  const sortedStats = sortStatsForCopy(stats || []);
+
+  if (sortedStats.length) {
+    return getStatBuildingIcon(sortedStats[0].key);
+  }
+
+  const name = cleanText(relic && relic.name).toLowerCase();
+
+  if (name.indexOf("horse") >= 0) return "stable";
+  if (name.indexOf("dummy") >= 0) return "barracks";
+  if (name.indexOf("workshop") >= 0) return "garage";
+  if (name.indexOf("academy") >= 0 || name.indexOf("noble") >= 0) return "snob";
+  if (name.indexOf("merchant") >= 0 || name.indexOf("haul") >= 0) return "market";
+  if (name.indexOf("axe") >= 0) return "wood";
+  if (name.indexOf("chisel") >= 0) return "stone";
+  if (name.indexOf("pickaxe") >= 0) return "iron";
+
+  return "main";
+}
+
+function bbEscape(value) {
+  return String(value || "")
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")");
+}
+
+function formatRelicForCopy(relic, stats) {
+  const icon = getRelicBuildingIcon(relic, stats);
+  const color = getRelicQualityColor(relic);
+
+  return "[building]" + icon + "[/building] [b][color=" + color + "]" + bbEscape(relic.name) + "[/color][/b]";
+}
+
+function formatVillageCoordForCopy(village) {
+  const coord = village && village.coord ? village.coord : "";
+
+  return coord ? "[coord]" + coord + "[/coord]" : "-";
+}
+
+function getRelicInventoryUrlForVillage(village) {
+  const villageId = cleanText(village && village.id);
+  if (!villageId) return "";
+
+  const url = new URL("/game.php", window.location.origin);
+
+  if (
+    typeof game_data !== "undefined" &&
+    game_data.player &&
+    parseInt(game_data.player.sitter || 0, 10) > 0
+  ) {
+    url.searchParams.set("t", String(game_data.player.id));
+  }
+
+  url.searchParams.set("village", villageId);
+  url.searchParams.set("screen", "relic_system");
+  return url.href;
+}
+
+function formatRelicInventoryLinkForCopy(village) {
+  const url = getRelicInventoryUrlForVillage(village);
+  return url ? "[url=" + url + "]Open[/url]" : "-";
+}
+
+function buildVillageImpactSummary(plan) {
+  const impactMap = new Map();
+  const benefitCap = getBenefitCap();
+
+  (plan || []).forEach(item => {
+    item.covered.forEach(village => {
+      if (!isVillageIncludedInGoalImpact(village, state.lastGoal)) return;
+
+      if (!impactMap.has(village.coord)) {
+        impactMap.set(village.coord, {
+          village: village,
+          relicCount: 0,
+          stats: {}
+        });
+      }
+
+      const entry = impactMap.get(village.coord);
+      entry.relicCount += 1;
+
+      item.relevantStats.forEach(stat => {
+        const current = entry.stats[stat.key] || 0;
+        entry.stats[stat.key] = Math.min(benefitCap, current + stat.value);
+      });
+    });
+  });
+
+  return Array.from(impactMap.values()).sort((a, b) => {
+    if (b.relicCount !== a.relicCount) {
+      return b.relicCount - a.relicCount;
+    }
+
+    if (a.village.y !== b.village.y) {
+      return a.village.y - b.village.y;
+    }
+
+    return a.village.x - b.village.x;
+  });
+}
+
+  function createUiElement(tagName, className, text) {
+    const element = document.createElement(tagName);
+
+    if (className) {
+      element.className = className;
+    }
+
+    if (text !== undefined && text !== null) {
+      element.textContent = String(text);
+    }
+
+    return element;
+  }
+
+  function getGoalLabel(goal) {
+    if (goal === "offense") return "Offense";
+    if (goal === "defense") return "Defense";
+    if (goal === "merchants") return "Merchant logistics";
+    if (goal === "haul") return "Haul capacity";
+    if (goal === "production") return "Resource production";
+    if (goal === "construction") return "Construction speed";
+    if (goal === "noble") return "Noble Recruitment";
+    return "Recruitment";
+  }
+
+  function getModeLabel(mode) {
+    if (mode === "fixed") return "Keep current";
+    if (mode === "inventory") return "Inventory only";
+    return "Full rebuild";
+  }
+
+  function getWeightingLabel(weighting) {
+    if (weighting === "freeFarm") return "Free farm";
+    if (weighting === "farmCap") return "Farm cap";
+    if (weighting === "fullFarm") return "Full farm";
+    if (weighting === "merchantTotal") return "Merchant count";
+    if (weighting === "highestPits") return "Highest pits";
+    return "Equal";
+  }
+
+  function getRelicQualityClass(relic) {
+    const text = cleanText((relic && (relic.quality || relic.name)) || "").toLowerCase();
+
+    if (text.indexOf("renowned") >= 0) return "twrp-quality-renowned";
+    if (text.indexOf("superior") >= 0) return "twrp-quality-superior";
+    if (text.indexOf("enhanced") >= 0) return "twrp-quality-enhanced";
+    if (text.indexOf("sturdy") >= 0) return "twrp-quality-sturdy";
+    if (text.indexOf("shoddy") >= 0) return "twrp-quality-shoddy";
+
+    return "twrp-quality-enhanced";
+  }
+
+  function getUiStatLabel(key) {
+    return getStatCopyLabel(key);
+  }
+
+  function formatUiStatValue(stat, showPlusForPositive) {
+    const sign = isCostStat(stat.key) ? "-" : (showPlusForPositive ? "+" : "");
+    return sign + formatPercentCompact(stat.value) + "%";
+  }
+
+  function createStatPills(stats, showPlusForPositive) {
+    const wrap = createUiElement("div", "twrp-stat-pills");
+    const sorted = sortStatsForCopy(stats || []);
+
+    if (!sorted.length) {
+      wrap.appendChild(createUiElement("span", "twrp-stat-pill", "No relevant stats"));
+      return wrap;
+    }
+
+    sorted.forEach(stat => {
+      const pill = createUiElement("span", "twrp-stat-pill twrp-stat-" + getStatBuildingIcon(stat.key));
+      const label = createUiElement("span", "twrp-stat-label", getUiStatLabel(stat.key));
+      const value = createUiElement("strong", "", formatUiStatValue(stat, showPlusForPositive));
+      pill.appendChild(label);
+      pill.appendChild(value);
+      wrap.appendChild(pill);
+    });
+
+    return wrap;
+  }
+
+  function createMetricCard(label, value, detail) {
+    const card = createUiElement("div", "twrp-metric-card");
+    card.appendChild(createUiElement("div", "twrp-metric-label", label));
+    card.appendChild(createUiElement("div", "twrp-metric-value", value));
+
+    if (detail) {
+      card.appendChild(createUiElement("div", "twrp-metric-detail", detail));
+    }
+
+    return card;
+  }
+
+  function createSectionHeader(title, subtitle) {
+    const header = createUiElement("div", "twrp-section-head");
+    const left = createUiElement("div", "");
+    left.appendChild(createUiElement("div", "twrp-section-title", title));
+
+    if (subtitle) {
+      left.appendChild(createUiElement("div", "twrp-section-subtitle", subtitle));
+    }
+
+    header.appendChild(left);
+    return header;
+  }
+
+  function renderSummaryCards(context) {
+    const impactRows = buildVillageImpactSummary(state.plan);
+    const summary = createUiElement("div", "twrp-summary-grid");
+
+    summary.appendChild(createMetricCard("Placements", state.plan.length, "recommended moves"));
+    summary.appendChild(createMetricCard("Villages", state.villages.length, "loaded"));
+    summary.appendChild(createMetricCard("Relics", state.inventoryRelics.length, "inventory"));
+    summary.appendChild(createMetricCard("Impact", impactRows.length, "affected villages"));
+
+    const contextBar = createUiElement("div", "twrp-context-bar");
+    contextBar.appendChild(createUiElement("span", "twrp-context-pill", getGoalLabel(context.goal)));
+    contextBar.appendChild(createUiElement("span", "twrp-context-pill", getModeLabel(context.mode)));
+    contextBar.appendChild(createUiElement("span", "twrp-context-pill", getWeightingLabel(context.weighting)));
+    contextBar.appendChild(createUiElement("span", "twrp-context-pill", getBenefitCapPillText()));
+
+    if (context.goal === "offense" || context.goal === "defense" || context.goal === "recruitment") {
+      contextBar.appendChild(createUiElement(
+        "span",
+        "twrp-context-pill",
+        "Focus: " + state.focusGroupName + " (" + (state.focusGroupId === "0" ? state.villages.length : state.focusCoords.size) + ")"
+      ));
+    }
+
+    if (context.goal === "recruitment" && state.recruitmentDemandRequested) {
+      contextBar.appendChild(createUiElement(
+        "span",
+        "twrp-context-pill",
+        state.recruitmentDemandActive ? ("AM demand: " + state.amRecruitmentDemandScoringRows + " scoring villages") : "AM demand: fallback"
+      ));
+    }
+
+    if (state.inactiveRelicPlacements.length) {
+      contextBar.appendChild(createUiElement(
+        "span",
+        "twrp-context-pill",
+        "Blocked placement villages: " + state.inactiveRelicPlacements.length
+      ));
+    }
+
+    ui.results.appendChild(summary);
+    ui.results.appendChild(contextBar);
+  }
+
+  function formatVillageCoordForUi(village) {
+    return village && village.coord ? village.coord : "-";
+  }
+
+  function formatVillageForUi(village) {
+    const coord = formatVillageCoordForUi(village);
+    const name = cleanText(village && village.name);
+
+    if (!name || name === coord) {
+      return coord;
+    }
+
+    return coord + " - " + name;
+  }
+
+  function createCoveragePreview(item) {
+    const details = document.createElement("details");
+    details.className = "twrp-coverage-details";
+
+    const summary = document.createElement("summary");
+    summary.textContent = item.covered.length + " covered village(s)" +
+      (item.scoredCoverageCount !== undefined && item.scoredCoverageCount !== item.covered.length
+        ? " / " + item.scoredCoverageCount + " scoring"
+        : "");
+    details.appendChild(summary);
+
+    const list = createUiElement("div", "twrp-covered-list");
+    item.covered.forEach(village => {
+      const line = createUiElement("div", "twrp-covered-line", formatVillageForUi(village));
+      list.appendChild(line);
+    });
+
+    details.appendChild(list);
+    return details;
+  }
+
+  function renderPlacementCards() {
+    ui.results.appendChild(createSectionHeader(
+      "Recommended placements",
+      "Main recommendation cards. Open coverage only when needed."
+    ));
+
+    const grid = createUiElement("div", "twrp-placement-grid");
+
+    state.plan.forEach(item => {
+      const card = createUiElement("div", "twrp-placement-card");
+
+      const top = createUiElement("div", "twrp-placement-top");
+      top.appendChild(createUiElement("div", "twrp-step-badge", item.step));
+
+      const relic = createUiElement("div", "twrp-relic-block");
+      const relicName = createUiElement("div", "twrp-relic-name " + getRelicQualityClass(item.relic), item.relic.name);
+      const relicMeta = createUiElement("div", "twrp-relic-meta", getRelicRangeLabel(item.relic.range));
+      relic.appendChild(relicName);
+      relic.appendChild(relicMeta);
+      top.appendChild(relic);
+
+      card.appendChild(top);
+
+      const target = createUiElement("div", "twrp-target-block");
+      target.appendChild(createUiElement("div", "twrp-mini-label", "Place at"));
+      target.appendChild(createUiElement("div", "twrp-target-name", formatVillageForUi(item.center)));
+      card.appendChild(target);
+
+      const scoreRow = createUiElement("div", "twrp-score-row");
+      scoreRow.appendChild(createMetricCard("Score", formatScore(item.score), "value"));
+      if ((state.lastGoal === "offense" || state.lastGoal === "defense" || state.lastGoal === "recruitment") && state.focusGroupId !== "0") {
+        scoreRow.appendChild(createMetricCard("Focus", item.scoredCoverageCount || 0, "of " + item.covered.length + " covered"));
+      } else {
+        scoreRow.appendChild(createMetricCard("Coverage", item.covered.length, "villages"));
+      }
+      scoreRow.appendChild(createMetricCard("Waste", formatScore(item.wastedScore), "lost value"));
+      card.appendChild(scoreRow);
+
+      card.appendChild(createStatPills(item.relevantStats, true));
+      card.appendChild(createCoveragePreview(item));
+
+      grid.appendChild(card);
+    });
+
+    ui.results.appendChild(grid);
+  }
+
+  function renderVillageImpactSummary() {
+    const impactRows = buildVillageImpactSummary(state.plan);
+
+    if (!impactRows.length) {
+      return;
+    }
+
+    ui.results.appendChild(createSectionHeader(
+      "Village impact",
+      "Top affected villages first. Full list is collapsed to keep the UI readable."
+    ));
+
+    const preview = createUiElement("div", "twrp-impact-preview");
+
+    impactRows.slice(0, 8).forEach((item, index) => {
+      const card = createUiElement("div", "twrp-impact-card");
+      const head = createUiElement("div", "twrp-impact-head");
+      head.appendChild(createUiElement("strong", "", (index + 1) + ". " + formatVillageCoordForUi(item.village)));
+      head.appendChild(createUiElement("span", "twrp-count-pill", item.relicCount + " relics"));
+      card.appendChild(head);
+      card.appendChild(createStatPills(Object.keys(item.stats || {}).map(key => ({ key: key, value: item.stats[key] })), false));
+      preview.appendChild(card);
+    });
+
+    ui.results.appendChild(preview);
+
+    const details = document.createElement("details");
+    details.className = "twrp-details twrp-full-impact";
+
+    const summary = document.createElement("summary");
+    summary.textContent = "Show all " + impactRows.length + " affected village(s)";
+    details.appendChild(summary);
+
+    const tableWrap = createUiElement("div", "twrp-table-wrap");
+    const table = createUiElement("table", "twrp-table twrp-compact-table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+
+    ["#", "Village", "Relics", "Stats"].forEach(label => {
+      const th = document.createElement("th");
+      th.textContent = label;
+      headRow.appendChild(th);
+    });
+
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+
+    impactRows.forEach((item, index) => {
+      const row = document.createElement("tr");
+      appendTableCell(row, String(index + 1));
+      appendTableCell(row, formatVillageCoordForUi(item.village), "twrp-left");
+      appendTableCell(row, String(item.relicCount));
+
+      const statsCell = document.createElement("td");
+      statsCell.className = "twrp-left";
+      statsCell.appendChild(createStatPills(Object.keys(item.stats || {}).map(key => ({ key: key, value: item.stats[key] })), false));
+      row.appendChild(statsCell);
+
+      tbody.appendChild(row);
+    });
+
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+    details.appendChild(tableWrap);
+    ui.results.appendChild(details);
+  }
+
+  function appendTableCell(row, text, className) {
+    const cell = document.createElement("td");
+    cell.textContent = text;
+
+    if (className) {
+      cell.className = className;
+    }
+
+    row.appendChild(cell);
+    return cell;
+  }
+
+  function renderScoringInfo() {
+    const details = document.createElement("details");
+    details.className = "twrp-details twrp-scoring-info";
+
+    const summary = document.createElement("summary");
+    summary.textContent = "How score and waste work";
+    details.appendChild(summary);
+
+    const body = createUiElement("div", "twrp-muted-block");
+    const scoringParts = [
+      "Score estimates marginal value after the " + formatSettingNumber(getBenefitCap()) + "% cap per village/stat.",
+      "Offense, Defense and Recruitment use diminishing returns by unit/building family, so balanced useful bonuses can beat stacking one family to the cap.",
+      "Waste estimates value lost because scoring villages are already capped or near capped."
+    ];
+
+    if ((state.lastGoal === "offense" || state.lastGoal === "defense" || state.lastGoal === "recruitment") && state.focusGroupId !== "0") {
+      scoringParts.push("Only villages in Focus Group '" + state.focusGroupName + "' contribute score. Relics may still be placed on any eligible owned village.");
+    }
+
+    if (state.inactiveRelicPlacements.length) {
+      scoringParts.push(state.inactiveRelicPlacements.length + " village(s) with inactive/captured relics are excluded as placement centers while they are locked. They can still receive relic effects from another village's range.");
+    }
+
+    if (state.lastGoal === "recruitment" && state.recruitmentDemandRequested) {
+      scoringParts.push(state.recruitmentDemandActive
+        ? "AM demand mode weights Barracks/Stable/Workshop stats by remaining target-current training workload. " + state.amRecruitmentMeta.note
+        : "AM demand mode was requested but could not provide usable demand data, so normal balanced recruitment scoring was used.");
+    }
+
+    body.textContent = scoringParts.join(" ");
+    details.appendChild(body);
+
+    ui.results.appendChild(details);
+  }
+
+  function formatBaseWorkloadHours(hours) {
+    if (hours === null || hours === undefined || isNaN(hours)) return "n/a";
+    if (hours < 24) return formatPercentCompact(hours) + "h";
+    return formatPercentCompact(hours / 24) + "d";
+  }
+
+  function renderRecruitmentDemandPreview() {
+    if (state.lastGoal !== "recruitment" || !state.recruitmentDemandRequested || !state.recruitmentDemandActive) return;
+
+    const rows = Array.from(state.amRecruitmentDemandByCoord.values())
+      .filter(item => item.total > 0)
+      .filter(item => state.focusGroupId === "0" || (state.focusCoords && state.focusCoords.has(item.coord)))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 12);
+
+    const details = document.createElement("details");
+    details.className = "twrp-details twrp-scoring-info";
+    const summary = document.createElement("summary");
+    summary.textContent = "AM recruitment demand preview (top " + rows.length + ")";
+    details.appendChild(summary);
+
+    const tableWrap = createUiElement("div", "twrp-table-wrap");
+    const table = createUiElement("table", "twrp-table twrp-compact-table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    ["Village", "Template", "Remaining", "Barracks", "Stable", "Workshop"].forEach(label => {
+      const th = document.createElement("th");
+      th.textContent = label;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    rows.forEach(item => {
+      const row = document.createElement("tr");
+      appendTableCell(row, item.coord);
+      appendTableCell(row, item.templateName || "-");
+      appendTableCell(row, item.baseHours !== null ? formatBaseWorkloadHours(item.baseHours) : (item.remainingUnits + " units"));
+      const total = item.total || 1;
+      appendTableCell(row, Math.round((item.byBuilding.barracks || 0) / total * 100) + "%");
+      appendTableCell(row, Math.round((item.byBuilding.stable || 0) / total * 100) + "%");
+      appendTableCell(row, Math.round((item.byBuilding.workshop || 0) / total * 100) + "%");
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+    details.appendChild(tableWrap);
+    ui.results.appendChild(details);
+  }
+
+  function renderResults(context) {
+    ui.results.innerHTML = "";
+
+    renderSummaryCards(context);
+
+    if (!state.plan.length) {
+      const empty = document.createElement("div");
+      empty.className = "twrp-status twrp-status-warn";
+      empty.textContent = "No positive-value placements found for the selected goal/mode.";
+      ui.results.appendChild(empty);
+      return;
+    }
+
+    renderPlacementCards();
+    renderVillageImpactSummary();
+    renderRecruitmentDemandPreview();
+    renderScoringInfo();
+  }
+
+  function copyPlan() {
+    if (!state.plan.length) {
+      setStatus("No plan to copy.", "warn");
+      return;
+    }
+
+    const lines = [];
+
+    lines.push("[size=14]" + SCRIPT_NAME + " " + SCRIPT_VERSION + "[/size]");
+    lines.push("");
+    lines.push("[b][size=12]Relic Placements[/size][/b]");
+    lines.push("");
+    lines.push("[table]");
+    lines.push("[**]#[||]Relic[||]Village[||]Inventory[||]Range[||]Coverage[||]Score[||]Waste[||]Stats[/**]");
+
+    state.plan.forEach(item => {
+      const cells = [
+        item.step,
+        formatRelicForCopy(item.relic, item.relevantStats),
+        formatVillageCoordForCopy(item.center),
+        formatRelicInventoryLinkForCopy(item.center),
+        item.relic.range,
+        item.covered.length,
+        formatScore(item.score),
+        formatScore(item.wastedScore),
+        formatStatsForCopy(item.relevantStats, true)
+      ];
+
+      lines.push("[*]" + cells.join("[|]"));
+    });
+
+    lines.push("[/table]");
+
+    const impactRows = buildVillageImpactSummary(state.plan);
+
+    if (impactRows.length) {
+      lines.push("");
+      lines.push("[b][size=12]Village impact summary[/size][/b]");
+      lines.push("");
+      lines.push("[table]");
+      lines.push("[**]#[||]Village[||]Affecting Relics[||]Stats[/**]");
+
+      impactRows.forEach((item, index) => {
+        const cells = [
+          index + 1,
+          formatVillageCoordForCopy(item.village),
+          item.relicCount,
+          formatImpactStatsForCopy(item.stats)
+        ];
+
+        lines.push("[*]" + cells.join("[|]"));
+      });
+
+      lines.push("[/table]");
+    }
+
+    const text = lines.join("\n");
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text)
+        .then(() => setStatus("BBCode plan copied.", "success"))
+        .catch(() => fallbackCopy(text));
+      return;
+    }
+
+    fallbackCopy(text);
+  }
+
+  function fallbackCopy(text) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    textarea.style.top = "-9999px";
+
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+
+    const copied = document.execCommand("copy");
+    textarea.remove();
+
+    setStatus(copied ? "Plan copied." : "Could not copy plan.", copied ? "success" : "error");
+  }
+
+  function setStatus(message, type) {
+    if (!ui.status) return;
+
+    ui.status.textContent = message || "";
+    ui.status.className = "twrp-status";
+
+    if (type) {
+      ui.status.classList.add("twrp-status-" + type);
+    }
+  }
+	
+	async function setDefaultMaxRelicSlotsFromOverview(countInput, wasEditedFn) {
+		try {
+			const overviewUrl = buildGameUrl({
+				screen: "relic_system",
+				mode: "overview"
+			});
+
+			const html = await fetchHtml(overviewUrl);
+			const unlockedSlots = countUnlockedRelicSlotsFromOverviewHtml(html);
+
+			state.unlockedRelicSlots = unlockedSlots;
+
+			if (!wasEditedFn()) {
+				countInput.value = String(unlockedSlots);
+				setStatus(
+					"Ready. Detected " + unlockedSlots + " unlocked relic slot(s).",
+					"success"
+				);
+			}
+		} catch (err) {
+			console.warn(SCRIPT_NAME + " could not detect unlocked relic slots:", err);
+		}
+	}
+
+  function addStyles() {
+    if (document.getElementById(STYLE_ID)) return;
+
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${BOX_ID} {
+        position: fixed;
+        top: 90px;
+        right: 35px;
+        width: 920px;
+        max-width: 96vw;
+        max-height: 86vh;
+        z-index: 999999;
+        border: 2px solid #7d510f;
+        border-radius: 6px;
+        background: #f4e4bc;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+        color: #2f1b00;
+        font-family: Verdana, Arial, sans-serif;
+        font-size: 12px;
+        overflow: hidden;
+      }
+
+      #${BOX_ID} * {
+        box-sizing: border-box;
+      }
+
+      .twrp-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 9px 11px;
+        background: #cfa95e;
+        border-bottom: 1px solid #7d510f;
+        cursor: move;
+      }
+
+      .twrp-title {
+        font-weight: bold;
+        font-size: 15px;
+      }
+
+      .twrp-close {
+        width: 20px;
+        height: 20px;
+        border: 1px solid #7d510f;
+        background: #f4e4bc;
+        color: #2f1b00;
+        border-radius: 3px;
+        cursor: pointer;
+        font-weight: bold;
+      }
+
+      .twrp-body {
+        padding: 10px;
+        max-height: calc(86vh - 42px);
+        overflow-y: auto;
+      }
+
+      .twrp-help {
+        line-height: 1.35;
+        margin-bottom: 8px;
+      }
+
+      .twrp-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr 90px 80px;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .twrp-wide-option {
+        grid-column: span 2;
+        padding: 6px;
+        border: 1px solid #bd9c5a;
+        border-radius: 4px;
+        background: rgba(255, 250, 240, 0.55);
+      }
+
+      .twrp-checkline {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+        line-height: 1.35;
+      }
+
+      .twrp-checkline input {
+        margin-top: 2px;
+      }
+
+      .twrp-muted {
+        display: block;
+        margin-top: 4px;
+        opacity: 0.78;
+        line-height: 1.35;
+      }
+
+      .twrp-label {
+        display: block;
+        font-weight: bold;
+        margin-bottom: 4px;
+      }
+
+      .twrp-select,
+      .twrp-input {
+        width: 100%;
+        padding: 5px;
+        border: 1px solid #7d510f;
+        border-radius: 4px;
+        background: #fffaf0;
+        color: #2f1b00;
+      }
+
+      .twrp-buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 8px 0;
+      }
+
+      .twrp-buttons .btn {
+        cursor: pointer;
+      }
+
+      .twrp-status {
+        padding: 6px;
+        margin: 8px 0;
+        border: 1px solid #bd9c5a;
+        background: #fff4d5;
+        border-radius: 4px;
+      }
+
+      .twrp-status-success {
+        background: #dff0d8;
+      }
+
+      .twrp-status-warn {
+        background: #fff4d5;
+      }
+
+      .twrp-status-error {
+        background: #f2dede;
+      }
+
+      .twrp-summary {
+        padding: 7px;
+        margin: 8px 0;
+        background: #fff4d5;
+        border: 1px solid #bd9c5a;
+        border-radius: 4px;
+        line-height: 1.45;
+      }
+
+      .twrp-section-title {
+        margin-top: 12px;
+        margin-bottom: 5px;
+        font-weight: bold;
+        font-size: 13px;
+      }
+
+      .twrp-table-wrap {
+        max-height: 430px;
+        overflow: auto;
+        border: 1px solid #bd9c5a;
+      }
+
+      .twrp-table {
+        border-collapse: collapse;
+        width: 100%;
+      }
+
+      .twrp-table th {
+        background: #cfa95e;
+        border: 1px solid #bd9c5a;
+        padding: 5px;
+        text-align: center;
+        position: sticky;
+        top: 0;
+        z-index: 1;
+      }
+
+      .twrp-table td {
+        border: 1px solid #bd9c5a;
+        padding: 5px;
+        text-align: center;
+        background: #fff5da;
+        vertical-align: top;
+      }
+
+      .twrp-table tr:nth-child(even) td {
+        background: #f0e2be;
+      }
+
+      .twrp-left {
+        text-align: left !important;
+      }
+
+      .twrp-small {
+        font-size: 11px;
+        opacity: 0.78;
+        line-height: 1.35;
+      }
+
+      .twrp-covered-list {
+        margin-top: 5px;
+        max-height: 160px;
+        overflow-y: auto;
+        font-size: 11px;
+        line-height: 1.35;
+        text-align: left;
+      }
+
+      .twrp-footer {
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px solid #bd9c5a;
+        font-size: 11px;
+        opacity: 0.8;
+      }
+
+      @media (max-width: 800px) {
+        #${BOX_ID} {
+          top: 50px;
+          left: 5px;
+          right: 5px;
+          width: auto;
+        }
+
+        .twrp-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .twrp-wide-option {
+          grid-column: span 1;
+        }
+      }
+
+
+      .twrp-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+        margin: 8px 0;
+      }
+
+      .twrp-metric-card {
+        padding: 8px;
+        border: 1px solid #c8a765;
+        border-radius: 6px;
+        background: #fffaf0;
+        min-width: 0;
+      }
+
+      .twrp-metric-label,
+      .twrp-mini-label {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        opacity: 0.72;
+        margin-bottom: 3px;
+      }
+
+      .twrp-metric-value {
+        font-size: 18px;
+        font-weight: bold;
+        line-height: 1.1;
+      }
+
+      .twrp-metric-detail {
+        font-size: 11px;
+        opacity: 0.75;
+        margin-top: 2px;
+      }
+
+      .twrp-context-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin: 6px 0 10px;
+      }
+
+      .twrp-context-pill,
+      .twrp-count-pill {
+        display: inline-block;
+        padding: 3px 7px;
+        border: 1px solid #c8a765;
+        border-radius: 999px;
+        background: #fffaf0;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .twrp-section-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        margin: 12px 0 6px;
+      }
+
+      .twrp-section-head .twrp-section-title {
+        margin: 0;
+        font-size: 14px;
+      }
+
+      .twrp-section-subtitle {
+        margin-top: 2px;
+        font-size: 11px;
+        opacity: 0.74;
+      }
+
+      .twrp-placement-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 9px;
+      }
+
+      .twrp-placement-card,
+      .twrp-impact-card {
+        border: 1px solid #c8a765;
+        border-radius: 8px;
+        background: #fff7e5;
+        padding: 9px;
+        box-shadow: 0 1px 0 rgba(0,0,0,0.08);
+      }
+
+      .twrp-placement-top {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        margin-bottom: 8px;
+      }
+
+      .twrp-step-badge {
+        min-width: 24px;
+        height: 24px;
+        padding-top: 4px;
+        border-radius: 50%;
+        background: #7d510f;
+        color: #fffaf0;
+        font-weight: bold;
+        text-align: center;
+        line-height: 16px;
+        flex: 0 0 auto;
+      }
+
+      .twrp-relic-block {
+        min-width: 0;
+      }
+
+      .twrp-relic-name {
+        font-weight: bold;
+        font-size: 13px;
+        line-height: 1.25;
+      }
+
+      .twrp-relic-meta {
+        font-size: 11px;
+        opacity: 0.75;
+        margin-top: 1px;
+      }
+
+      .twrp-quality-renowned { color: #8a5a13; }
+      .twrp-quality-superior { color: #5f34a3; }
+      .twrp-quality-enhanced { color: #2f46a3; }
+      .twrp-quality-sturdy { color: #2f855a; }
+      .twrp-quality-shoddy { color: #666; }
+
+      .twrp-target-block {
+        padding: 7px;
+        border-radius: 6px;
+        background: rgba(255,255,255,0.55);
+        border: 1px solid #ead8b3;
+        margin-bottom: 8px;
+      }
+
+      .twrp-target-name {
+        font-weight: bold;
+        overflow-wrap: anywhere;
+      }
+
+      .twrp-score-row {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+
+      .twrp-score-row .twrp-metric-card {
+        padding: 6px;
+      }
+
+      .twrp-score-row .twrp-metric-value {
+        font-size: 14px;
+      }
+
+      .twrp-stat-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        align-items: flex-start;
+      }
+
+      .twrp-stat-pill {
+        display: inline-flex;
+        gap: 4px;
+        align-items: center;
+        padding: 4px 6px;
+        border-radius: 999px;
+        border: 1px solid #d4bf8f;
+        background: #fffaf0;
+        font-size: 11px;
+        line-height: 1.15;
+      }
+
+      .twrp-stat-label {
+        opacity: 0.82;
+      }
+
+      .twrp-stat-barracks { border-color: #bd8b8b; }
+      .twrp-stat-stable { border-color: #8b9abd; }
+      .twrp-stat-garage { border-color: #bda98b; }
+      .twrp-stat-snob { border-color: #a78bbd; }
+
+      .twrp-coverage-details {
+        margin-top: 8px;
+        font-size: 11px;
+      }
+
+      .twrp-coverage-details > summary {
+        cursor: pointer;
+        opacity: 0.82;
+      }
+
+      .twrp-covered-line {
+        padding: 3px 0;
+        border-bottom: 1px solid rgba(189,156,90,0.25);
+      }
+
+      .twrp-impact-preview {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+
+      .twrp-impact-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 7px;
+      }
+
+      .twrp-full-impact .twrp-table-wrap {
+        margin-top: 8px;
+      }
+
+      .twrp-compact-table td {
+        vertical-align: middle;
+      }
+
+      .twrp-muted-block {
+        margin-top: 8px;
+        padding: 8px;
+        background: #fffaf0;
+        border: 1px solid #ead8b3;
+        border-radius: 6px;
+        line-height: 1.4;
+      }
+
+      .twrp-scoring-info {
+        margin-top: 10px;
+      }
+
+      .twrp-placement-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+      }
+
+      .twrp-placement-card,
+      .twrp-impact-card {
+        padding: 5px;
+        border-radius: 6px;
+      }
+
+      .twrp-placement-top {
+        gap: 6px;
+        margin-bottom: 4px;
+      }
+
+      .twrp-step-badge {
+        min-width: 20px;
+        height: 20px;
+        padding-top: 2px;
+        font-size: 11px;
+        line-height: 16px;
+      }
+
+      .twrp-relic-name {
+        font-size: 12px;
+        line-height: 1.15;
+      }
+
+      .twrp-relic-meta {
+        font-size: 10px;
+      }
+
+      .twrp-target-block {
+        padding: 4px 5px;
+        margin-bottom: 4px;
+      }
+
+      .twrp-target-name {
+        font-size: 10px;
+      }
+
+      .twrp-score-row {
+        gap: 4px;
+        margin-bottom: 5px;
+      }
+
+      .twrp-score-row .twrp-metric-card {
+        padding: 4px;
+      }
+
+      .twrp-score-row .twrp-metric-label {
+        font-size: 9px;
+        margin-bottom: 1px;
+      }
+
+      .twrp-score-row .twrp-metric-value {
+        font-size: 13px;
+      }
+
+      .twrp-score-row .twrp-metric-detail {
+        display: none;
+      }
+
+      .twrp-stat-pill {
+        padding: 3px 5px;
+        font-size: 10px;
+      }
+
+      .twrp-coverage-details {
+        margin-top: 4px;
+      }
+
+      .twrp-covered-line {
+        padding: 2px 0;
+      }
+
+      @media (max-width: 1100px) {
+        .twrp-placement-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 800px) {
+        .twrp-summary-grid,
+        .twrp-placement-grid,
+        .twrp-impact-preview {
+          grid-template-columns: 1fr;
+        }
+      }
+
+    `;
+
+    document.head.appendChild(style);
+  }
+
+  function makeDraggable(box, handle) {
+    let isDragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    handle.addEventListener("mousedown", function (event) {
+      if (event.target.classList.contains("twrp-close")) return;
+
+      isDragging = true;
+
+      const rect = box.getBoundingClientRect();
+
+      offsetX = event.clientX - rect.left;
+      offsetY = event.clientY - rect.top;
+
+      box.style.left = rect.left + "px";
+      box.style.top = rect.top + "px";
+      box.style.right = "auto";
+
+      document.body.style.userSelect = "none";
+    });
+
+    document.addEventListener("mousemove", function (event) {
+      if (!isDragging) return;
+
+      box.style.left = event.clientX - offsetX + "px";
+      box.style.top = event.clientY - offsetY + "px";
+    });
+
+    document.addEventListener("mouseup", function () {
+      isDragging = false;
+      document.body.style.userSelect = "";
+    });
+  }
+
+  function closeDialog() {
+    const box = document.getElementById(BOX_ID);
+    if (box) box.remove();
+
+    const style = document.getElementById(STYLE_ID);
+    if (style) style.remove();
+
+    window.twacticsRelicPlannerV2Loaded = false;
+    delete window.twacticsRelicPlannerV2;
+
+    console.log(SCRIPT_NAME + " closed");
+  }
+
+  function createDialog() {
+    addStyles();
+
+    const old = document.getElementById(BOX_ID);
+    if (old) old.remove();
+
+    const box = document.createElement("div");
+    box.id = BOX_ID;
+
+    const header = document.createElement("div");
+    header.className = "twrp-header";
+
+    const title = document.createElement("div");
+    title.className = "twrp-title";
+    title.textContent = SCRIPT_NAME + " " + SCRIPT_VERSION;
+
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.className = "twrp-close";
+    closeButton.textContent = "x";
+    closeButton.addEventListener("click", closeDialog);
+
+    header.appendChild(title);
+    header.appendChild(closeButton);
+
+    const body = document.createElement("div");
+    body.className = "twrp-body";
+
+    const help = document.createElement("div");
+    help.className = "twrp-help";
+    help.innerHTML =
+      "<strong>Plan relic placements.</strong> Choose goal, simulation mode and weighting. " +
+      "Click optimize, review the cards, then copy the BBCode plan when it looks right.";
+
+    const grid = document.createElement("div");
+    grid.className = "twrp-grid";
+
+    const goalWrap = document.createElement("div");
+    const goalLabel = document.createElement("label");
+    goalLabel.className = "twrp-label";
+    goalLabel.textContent = "Goal";
+
+    const goalSelect = document.createElement("select");
+    goalSelect.className = "twrp-select";
+
+    [
+      { value: "recruitment", text: "Recruitment output" },
+      { value: "offense", text: "Offensive strength" },
+      { value: "defense", text: "Defensive strength" },
+      { value: "merchants", text: "Merchant logistics" },
+      { value: "haul", text: "Haul capacity" },
+      { value: "production", text: "Resource production" },
+      { value: "construction", text: "Construction speed" },
+      { value: "noble", text: "Noble Recruitment" }
+    ].forEach(optionData => {
+      const option = document.createElement("option");
+      option.value = optionData.value;
+      option.textContent = optionData.text;
+      goalSelect.appendChild(option);
+    });
+
+    goalWrap.appendChild(goalLabel);
+    goalWrap.appendChild(goalSelect);
+
+    const modeWrap = document.createElement("div");
+    const modeLabel = document.createElement("label");
+    modeLabel.className = "twrp-label";
+    modeLabel.textContent = "Simulation mode";
+
+    const modeSelect = document.createElement("select");
+    modeSelect.className = "twrp-select";
+
+    [
+      { value: "fixed", text: "Keep current placements fixed" },
+      { value: "inventory", text: "Inventory only" },
+      { value: "rebuild", text: "Full rebuild simulation" }
+    ].forEach(optionData => {
+      const option = document.createElement("option");
+      option.value = optionData.value;
+      option.textContent = optionData.text;
+      modeSelect.appendChild(option);
+    });
+		
+		modeSelect.value = "rebuild";
+
+    modeWrap.appendChild(modeLabel);
+    modeWrap.appendChild(modeSelect);
+
+    const weightWrap = document.createElement("div");
+    const weightLabel = document.createElement("label");
+    weightLabel.className = "twrp-label";
+    weightLabel.textContent = "Village weighting";
+
+    const weightSelect = document.createElement("select");
+    weightSelect.className = "twrp-select";
+
+    [
+      { value: "farmCap", text: "Farm capacity" },
+      { value: "freeFarm", text: "Free farm" },
+      { value: "fullFarm", text: "Full farm" },
+      { value: "merchantTotal", text: "Merchant count" },
+      { value: "highestPits", text: "Highest pits" },
+      { value: "equal", text: "Equal weight" }
+    ].forEach(optionData => {
+      const option = document.createElement("option");
+      option.value = optionData.value;
+      option.textContent = optionData.text;
+      weightSelect.appendChild(option);
+    });
+		
+		weightSelect.value = "freeFarm";
+
+    function syncGoalDefaults() {
+      modeSelect.value = "rebuild";
+
+      if (goalSelect.value === "recruitment") {
+        weightSelect.value = "freeFarm";
+      } else if (goalSelect.value === "offense") {
+        weightSelect.value = "equal";
+      } else if (goalSelect.value === "defense") {
+        weightSelect.value = "equal";
+      } else if (goalSelect.value === "merchants") {
+        weightSelect.value = "merchantTotal";
+      } else if (goalSelect.value === "haul") {
+        weightSelect.value = "fullFarm";
+      } else if (goalSelect.value === "production") {
+        weightSelect.value = "highestPits";
+      } else if (goalSelect.value === "construction") {
+        weightSelect.value = "equal";
+      } else if (goalSelect.value === "noble") {
+        weightSelect.value = "equal";
+      }
+
+      if (ui.nobleTargetWrap) {
+        ui.nobleTargetWrap.style.display = goalSelect.value === "noble" ? "block" : "none";
+      }
+      if (ui.focusGroupWrap) {
+        ui.focusGroupWrap.style.display = (goalSelect.value === "offense" || goalSelect.value === "defense" || goalSelect.value === "recruitment") ? "block" : "none";
+      }
+      if (ui.recruitmentDemandWrap) {
+        ui.recruitmentDemandWrap.style.display = goalSelect.value === "recruitment" ? "block" : "none";
+      }
+    }
+
+		goalSelect.addEventListener("change", syncGoalDefaults);
+
+    weightWrap.appendChild(weightLabel);
+    weightWrap.appendChild(weightSelect);
+
+    const countWrap = document.createElement("div");
+    const countLabel = document.createElement("label");
+    countLabel.className = "twrp-label";
+    countLabel.textContent = "Relic Slots";
+
+    const countInput = document.createElement("input");
+    countInput.className = "twrp-input";
+    countInput.type = "number";
+    countInput.min = "1";
+    countInput.max = "10";
+		countInput.value = String(state.unlockedRelicSlots || 10);
+		
+		let countInputWasEdited = false;
+
+		countInput.addEventListener("input", function () {
+			countInputWasEdited = true;
+		});
+
+    countWrap.appendChild(countLabel);
+    countWrap.appendChild(countInput);
+
+    const capWrap = document.createElement("div");
+    const capLabel = document.createElement("label");
+    capLabel.className = "twrp-label";
+    capLabel.textContent = "Cap %";
+
+    const capInput = document.createElement("input");
+    capInput.className = "twrp-input";
+    capInput.type = "number";
+    capInput.min = "1";
+    capInput.max = "100";
+    capInput.step = "0.1";
+    capInput.value = formatSettingNumber(getBenefitCap());
+
+    capInput.addEventListener("input", function () {
+      ui.capInputWasEdited = true;
+      applyBenefitCapInputToState();
+    });
+
+    capWrap.appendChild(capLabel);
+    capWrap.appendChild(capInput);
+
+    const nobleTargetWrap = document.createElement("div");
+    nobleTargetWrap.className = "twrp-noble-target-wrap";
+    nobleTargetWrap.style.display = "none";
+
+    const nobleTargetLabel = document.createElement("label");
+    nobleTargetLabel.className = "twrp-label";
+    nobleTargetLabel.textContent = "Noble target villages";
+
+    const nobleTargetInput = document.createElement("textarea");
+    nobleTargetInput.className = "twrp-input";
+    nobleTargetInput.rows = 3;
+    nobleTargetInput.placeholder = "One or more coords, e.g. 510|510, 511|510";
+
+    const nobleTargetHelp = createUiElement("small", "twrp-muted", "Only these villages are scored. Relics may be placed in nearby villages as long as the targets are affected.");
+
+    nobleTargetWrap.appendChild(nobleTargetLabel);
+    nobleTargetWrap.appendChild(nobleTargetInput);
+    nobleTargetWrap.appendChild(nobleTargetHelp);
+
+    const focusGroupWrap = document.createElement("div");
+    focusGroupWrap.className = "twrp-wide-option";
+    focusGroupWrap.style.display = "none";
+    const focusGroupLabel = document.createElement("label");
+    focusGroupLabel.className = "twrp-label";
+    focusGroupLabel.textContent = "Focus Group";
+    const focusGroupSelect = document.createElement("select");
+    focusGroupSelect.className = "twrp-select";
+    const focusAll = document.createElement("option");
+    focusAll.value = "0";
+    focusAll.textContent = "All villages";
+    focusGroupSelect.appendChild(focusAll);
+    const focusGroupHelp = createUiElement("small", "twrp-muted", "For Offensive strength, Defensive strength or Recruitment output, only villages in this group contribute score. Relics can still be placed on ANY owned village if their range reaches the focus group.");
+    focusGroupWrap.appendChild(focusGroupLabel);
+    focusGroupWrap.appendChild(focusGroupSelect);
+    focusGroupWrap.appendChild(focusGroupHelp);
+
+    const recruitmentDemandWrap = document.createElement("div");
+    recruitmentDemandWrap.className = "twrp-wide-option";
+    recruitmentDemandWrap.style.display = "none";
+    const demandLine = document.createElement("label");
+    demandLine.className = "twrp-checkline";
+    const recruitmentDemandCheckbox = document.createElement("input");
+    recruitmentDemandCheckbox.type = "checkbox";
+    const demandText = document.createElement("span");
+    demandText.innerHTML = "<strong>Use Account Manager troop demand</strong><br><span class='twrp-muted'>Compare AM troop targets with current units and weight Barracks/Stable/Workshop relics by remaining training workload. Optional; no game actions are performed.</span>";
+    demandLine.appendChild(recruitmentDemandCheckbox);
+    demandLine.appendChild(demandText);
+    recruitmentDemandWrap.appendChild(demandLine);
+
+    grid.appendChild(goalWrap);
+    grid.appendChild(modeWrap);
+    grid.appendChild(weightWrap);
+    grid.appendChild(countWrap);
+    grid.appendChild(capWrap);
+    grid.appendChild(nobleTargetWrap);
+    grid.appendChild(focusGroupWrap);
+    grid.appendChild(recruitmentDemandWrap);
+
+    const buttons = document.createElement("div");
+    buttons.className = "twrp-buttons";
+
+    const loadButton = document.createElement("button");
+    loadButton.type = "button";
+    loadButton.className = "btn";
+    loadButton.textContent = "Load data + optimize";
+    loadButton.addEventListener("click", loadAndOptimize);
+
+    const copyButton = document.createElement("button");
+    copyButton.type = "button";
+    copyButton.className = "btn";
+    copyButton.textContent = "Copy plan";
+    copyButton.addEventListener("click", copyPlan);
+
+    buttons.appendChild(loadButton);
+    buttons.appendChild(copyButton);
+
+    const status = document.createElement("div");
+    status.className = "twrp-status";
+    status.textContent = "Ready. Choose goal/mode and click Load data + optimize.";
+
+    const results = document.createElement("div");
+
+    const footer = document.createElement("div");
+    footer.className = "twrp-footer";
+    footer.textContent = "Created by Twactics";
+
+    body.appendChild(help);
+    body.appendChild(grid);
+    body.appendChild(buttons);
+    body.appendChild(status);
+    body.appendChild(results);
+    body.appendChild(footer);
+
+    box.appendChild(header);
+    box.appendChild(body);
+    document.body.appendChild(box);
+
+    ui.goalSelect = goalSelect;
+		ui.modeSelect = modeSelect;
+		ui.weightSelect = weightSelect;
+		ui.countInput = countInput;
+    ui.capInput = capInput;
+    ui.capInputWasEdited = false;
+    ui.nobleTargetWrap = nobleTargetWrap;
+    ui.nobleTargetInput = nobleTargetInput;
+    ui.focusGroupWrap = focusGroupWrap;
+    ui.focusGroupSelect = focusGroupSelect;
+    ui.recruitmentDemandWrap = recruitmentDemandWrap;
+    ui.recruitmentDemandCheckbox = recruitmentDemandCheckbox;
+		ui.loadButton = loadButton;
+		ui.copyButton = copyButton;
+		ui.status = status;
+		ui.results = results;
+
+		setDefaultMaxRelicSlotsFromOverview(countInput, function () {
+			return countInputWasEdited;
+		});
+
+    syncGoalDefaults();
+    populateFocusGroupSelect();
+		makeDraggable(box, header);
+  }
+
+  createDialog();
+
+  console.log(SCRIPT_NAME + " " + SCRIPT_VERSION + " loaded");
+})();
