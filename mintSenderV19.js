@@ -26,9 +26,9 @@
  * - Groups planned transfers by destination and uses one manual market request per target village
  * - On insufficient-resource errors, refreshes only affected request origins and safely adjusts the existing unsent plan
  * - Skips any planned transfer below 900 total resources so every send uses at least one meaningful merchant load
- * - Optional Respacks Optimizer with per-warehouse pack percentage, per-resource send priorities,
+ * - Optional Respacks Optimizer with per-warehouse pack percentage, per-resource relay priorities,
  *   internal two-percentage-point warehouse reserve, safe relay receiver limits,
- *   and a projected no-waste pack-readiness summary
+ *   strict 28:30:25 direct-to-mint shipments, and a projected no-waste pack-readiness summary
  * - Supports TribalWars.scriptData settings input when enabled in the Script Library
  *
  * Routing overview:
@@ -99,7 +99,7 @@
     'use strict';
 
     const SCRIPT_NAME = 'Twactics Smart Mint Resource Sender';
-    const SCRIPT_VERSION = '1.6.5';
+    const SCRIPT_VERSION = '1.6.6';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 5;
@@ -1032,6 +1032,21 @@
 
         let scale = 1;
         const merchantCarry = Math.max(0, Number(budget.merchants) || 0) * MERCHANT_CAPACITY;
+
+        // The normal proportional floor() would turn e.g. 28:30:25 into
+        // 27:29:24 on a partial retry. Preserve exact whole bundles instead.
+        if (settings.respacksOptimizer && transfer.kind === 'direct') {
+            const bundles = Math.max(0, Math.floor(Math.min(
+                original.wood / 28, original.stone / 30, original.iron / 25,
+                merchantCarry / 83,
+                Math.max(0, Number(budget.wood) || 0) / 28,
+                Math.max(0, Number(budget.stone) || 0) / 30,
+                Math.max(0, Number(budget.iron) || 0) / 25
+            )));
+            const balanced = {wood: bundles * 28, stone: bundles * 30, iron: bundles * 25};
+            return totalResources(balanced) >= MIN_TRANSFER_TOTAL ? balanced : emptyResourceSet();
+        }
+
         scale = Math.min(scale, merchantCarry / originalTotal);
 
         for (const key of RESOURCE_KEYS) {
@@ -1336,6 +1351,41 @@
         };
     }
 
+    // Mint villages must always receive exactly 28 wood : 30 clay : 25 iron.
+    // Use whole 83-resource bundles so integer rounding never alters the ratio.
+    // In respack mode the critical pass only sends enough balanced bundles to
+    // cover the largest remaining pack-clearance deficit (if possible).
+    // Relays may still move a single resource to relieve an overfilled village.
+    function calculateRespackMintShipment(source, cfg, criticalOnly = false) {
+        const available = respackAvailable(source, cfg);
+        const merchantCarry = Math.max(0, source.availableMerchants) * MERCHANT_CAPACITY;
+        const possibleBundles = Math.max(0, Math.floor(Math.min(
+            merchantCarry / 83,
+            available.wood / 28,
+            available.stone / 30,
+            available.iron / 25
+        )));
+        if (possibleBundles <= 0) return emptyResourceSet();
+
+        let bundles = possibleBundles;
+        if (criticalOnly) {
+            const needed = Math.max(
+                Math.ceil(respackExcess(source, cfg, 'wood') / 28),
+                Math.ceil(respackExcess(source, cfg, 'stone') / 30),
+                Math.ceil(respackExcess(source, cfg, 'iron') / 25)
+            );
+            bundles = Math.min(possibleBundles, needed);
+        }
+        return { wood: 28 * bundles, stone: 30 * bundles, iron: 25 * bundles };
+    }
+
+    function isExactMintRatio(amount) {
+        const bundles = Number(amount.wood) / 28;
+        return Number.isInteger(bundles) && bundles >= 0 &&
+            Number(amount.stone) === bundles * 30 &&
+            Number(amount.iron) === bundles * 25;
+    }
+
     function fillAfter(source, amount) {
         const wh = Math.max(1, Number(source.warehouse) || 1);
         return Math.max(...RESOURCE_KEYS.map(key => {
@@ -1634,8 +1684,8 @@
 
     // First move resources that would overflow on the next pack; with spare merchants,
     // continue draining other resources to make room for repeated packs.
-    // Unlike ordinary direct mint transfers, this intentionally does not preserve
-    // the fixed 28/30/25 ratio: that ratio can leave a nearly full resource untouched.
+    // This flexible allocator is ONLY for relay shipments (never mint destinations).
+    // The mint-bound allocator below always enforces the 28:30:25 ratio.
     function calculateRespackShipment(source, cfg, receiver = null, criticalOnly = false) {
         let carry = Math.max(0, source.availableMerchants) * MERCHANT_CAPACITY;
         const available = respackAvailable(source, cfg);
@@ -1723,7 +1773,7 @@
         transfers.push({
             kind,
             rule: 'RESPACK',
-            note: kind === 'relay' ? 'Pack-safe relay' : 'Pack clearance (no fixed mint ratio)',
+            note: kind === 'relay' ? 'Pack-safe relay' : 'Mint 28:30:25 (pack clearance)',
             receiverPriority: null,
             receiverLabel: kind === 'relay' ? 'Pack-safe relay' : 'Final target',
             sourceId: source.id,
@@ -1777,11 +1827,12 @@
 
             if (source.availableMerchants > 0 &&
                 RESOURCE_KEYS.some(key => respackExcess(source, cfg, key) > 0)) {
-                const critical = calculateRespackShipment(source, cfg, null, true);
-                // A sub-900 critical send is not requestable by this script; include
-                // extra stock in this direct transfer to exceed the minimum.
+                // Pack urgency may affect the number of bundles, but NOT the
+                // ratio delivered to the mint. Excess iron with insufficient
+                // wood/clay must remain or find relay space, never go direct alone.
+                const critical = calculateRespackMintShipment(source, cfg, true);
                 const amount = totalResources(critical) >= MIN_TRANSFER_TOTAL
-                    ? critical : calculateRespackShipment(source, cfg);
+                    ? critical : calculateRespackMintShipment(source, cfg);
                 addRespackTransfer(transfers, source, finalTarget, 'direct', amount, finalTarget, cfg, dist);
             }
 
@@ -1802,11 +1853,15 @@
             // The mint target is an intentional sink; receiver pack limits do not apply to it.
             // If no short relay has room, use a direct request for remaining resources.
             if (source.availableMerchants > 0) {
-                const amount = calculateRespackShipment(source, cfg);
+                const amount = calculateRespackMintShipment(source, cfg);
                 addRespackTransfer(transfers, source, finalTarget, 'direct', amount, finalTarget, cfg, dist);
             }
         }
 
+        // Refuse any optimizer plan that would send an unbalanced direct shipment.
+        if (transfers.some(item => item.kind === 'direct' && !isExactMintRatio(item))) {
+            throw new Error('Mint ratio safety check failed. Plan not created.');
+        }
         transfers.sort((a, b) => {
             if (a.kind !== b.kind) return a.kind === 'relay' ? -1 : 1;
             return b.sourceToTarget - a.sourceToTarget || a.legDistance - b.legDistance;
@@ -2820,7 +2875,7 @@
                             <input id="strr-respack-pct" class="twsr-input" type="number" min="1" max="100" step="1"
                                 value="${escapeHtml(settings.respackPct)}">
                             <div class="twsr-hint">A ${escapeHtml(settings.respackPct)}% pack adds that percentage of each village's warehouse capacity to each resource. The optimizer plans transfers to leave room for the next pack.</div>
-                            <div class="twsr-small">Prioritizes overfilled resources, then clears extra stock when merchants are free. Mint ratio 28/30/25 is not enforced in this mode. WH threshold and imbalance gap are ignored. Relays respect the lower of Safe receiver ceiling and the pack-safe limit.</div>
+                            <div class="twsr-small">Prioritizes overfilled resources in relay shipments. Every direct shipment to a mint keeps the exact 28:30:25 wood/clay/iron ratio. WH threshold and imbalance gap are ignored. Relays respect the lower of Safe receiver ceiling and the pack-safe limit.</div>
                         </div>
                         <div id="strr-multi-config" class="twsr-multi-config">
                             <div class="twsr-multi-toolbar">
@@ -3192,10 +3247,6 @@
     function mintResourceRowHtml(key, label, image, split) {
         const direct = Math.max(0, Number(split.direct[key]) || 0);
         const relay = Math.max(0, Number(split.relay[key]) || 0);
-        const total = direct + relay;
-        const directPct = total > 0 ? Math.round((direct / total) * 100) : 0;
-        const relayPct = total > 0 ? 100 - directPct : 0;
-
         return `
             <div class="twsr-mint-resource-row">
                 <div class="twsr-mint-resource-top">
@@ -3203,11 +3254,11 @@
                         <img src="${image}" alt="${escapeHtml(label)}">
                         <span class="twsr-mint-resource-name">${escapeHtml(label)}</span>
                     </div>
-                    <span class="twsr-mint-resource-total">${fmt(total)}</span>
+                    <span class="twsr-mint-resource-total" title="Directly requested into the mint">${fmt(direct)}</span>
                 </div>
                 <div class="twsr-mint-resource-split">
-                    <span title="Share requested directly to the mint">Direct <strong>${directPct}%</strong></span>
-                    <span title="Share staged through relay villages first">Relay <strong>${relayPct}%</strong></span>
+                    <span title="Resources actually requested into mint on this run">Mint direct <strong>${fmt(direct)}</strong></span>
+                    <span title="Staged in relay villages, not yet delivered to the mint">Relay staged <strong>${fmt(relay)}</strong></span>
                 </div>
             </div>
         `;
@@ -3232,6 +3283,7 @@
                             </div>
                             ${targets.length > 1 ? '<div class="twsr-small">#' + (index + 1) + '</div>' : ''}
                         </div>
+                        <div class="twsr-mint-card-meta">Direct to mint (relays shown separately)</div>
                         ${mintResourceRowHtml('wood', 'Wood', '/graphic/holz.png', split)}
                         ${mintResourceRowHtml('stone', 'Clay', '/graphic/lehm.png', split)}
                         ${mintResourceRowHtml('iron', 'Iron', '/graphic/eisen.png', split)}
@@ -3594,6 +3646,17 @@
 
         if (sendLocked) {
             return;
+        }
+
+        if (settings.respacksOptimizer) {
+            const isMint = getMintTargetDefinitions().some(item => String(item.id) === String(group.targetId));
+            if (isMint && (!isExactMintRatio(group) ||
+                group.transfers.some(entry => !isExactMintRatio(entry.transfer)))) {
+                const message = 'Blocked unsafe mint request: destination must receive wood/clay/iron in the exact 28:30:25 ratio. Recreate the plan.';
+                setStatus(message, 'error');
+                if (window.UI?.ErrorMessage) UI.ErrorMessage(message);
+                return;
+            }
         }
 
         sendLocked = true;
