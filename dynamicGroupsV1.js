@@ -1966,10 +1966,11 @@ window.twSDK = {
     const BOX_ID = 'twactics-dynamic-group-manager';
     const STYLE_ID = 'twactics-dynamic-group-manager-style';
     const PACKAGE_FORMAT = 'twactics-dynamic-group-package';
-    const PACKAGE_VERSION = 1;
+    const PACKAGE_VERSION = 2;
 
     const state = {
         groups: [],
+        manualGroups: [],
         importPackage: null,
         busy: false,
     };
@@ -1989,7 +1990,7 @@ window.twSDK = {
         buildUI();
         bindUI();
         state.groups = discoverDynamicGroups(document);
-        renderExportGroups();
+        await refreshGroups();
     } catch (error) {
         UI.ErrorMessage(twSDK.tt('There was an error!'));
         console.error(`${scriptInfo} Error:`, error);
@@ -2013,7 +2014,7 @@ window.twSDK = {
             </div>
             <div class="tdgm-body">
                 <div class="tdgm-intro">
-                    Export or import <strong>multiple Dynamic Groups</strong> in one copy/paste package. Complete nested <strong>Filter Combinations</strong> are preserved.
+                    Export or import <strong>manual groups first, then Dynamic Groups</strong> in one copy/paste package. Complete nested <strong>Filter Combinations</strong> are preserved.
                 </div>
 
                 <div class="tdgm-grid">
@@ -2021,7 +2022,7 @@ window.twSDK = {
                         <div class="tdgm-section-head">
                             <div>
                                 <div class="tdgm-section-title">Export groups</div>
-                                <div class="tdgm-section-subtitle">Select any Dynamic Groups and export them together.</div>
+                                <div class="tdgm-section-subtitle">Select manual and dynamic groups. Manual groups are exported first.</div>
                             </div>
                             <button type="button" id="tdgmRefreshGroups" class="tdgm-mini-button">Refresh</button>
                         </div>
@@ -2055,7 +2056,7 @@ window.twSDK = {
                             <div id="tdgmImportGroupList" class="tdgm-group-list"></div>
                             <label class="tdgm-option">
                                 <input type="checkbox" id="tdgmOverwriteExisting">
-                                Update an existing Dynamic Group when the same group name already exists
+                                Update existing same-name groups (manual memberships are replaced)
                             </label>
                             <div class="tdgm-buttons">
                                 <button type="button" id="tdgmImportSelected" class="tdgm-button">Import selected</button>
@@ -2095,7 +2096,7 @@ window.twSDK = {
                 </details>
 
                 <div class="tdgm-note">
-                    <strong>Import behavior:</strong> missing groups are created automatically. Existing same-name groups are skipped unless the update option is enabled. Imports are saved one group at a time through Tribal Wars' own Dynamic Group endpoint. Manual-group filters still contain account-specific manual group IDs, exactly like the original tool.
+                    <strong>Import behavior:</strong> missing groups are created automatically. Existing same-name groups are skipped unless the update option is enabled. Imports are saved one group at a time through Tribal Wars' own Dynamic Group endpoint. Manual group memberships use village coordinates; imported dynamic filter references to included manual groups are remapped to the target account.
                 </div>
 
                 <div class="tdgm-footer"><span>MIT</span><span>Created by Twactics (zidrox) · Original script by RedAlert · Mod credit: JawJaw</span></div>
@@ -2205,7 +2206,7 @@ window.twSDK = {
 
         box.querySelector('#tdgmRefreshGroups').addEventListener('click', async function () {
             await refreshGroups();
-            UI.SuccessMessage(`Found ${state.groups.length} Dynamic Group${state.groups.length === 1 ? '' : 's'}.`);
+            UI.SuccessMessage(`Found ${state.manualGroups.length} manual and ${state.groups.length} dynamic groups.`);
         });
 
         box.querySelector('#tdgmExportAll').addEventListener('click', function () {
@@ -2259,24 +2260,25 @@ window.twSDK = {
     async function refreshGroups() {
         const latest = await fetchCurrentDynamicGroupsPage();
         state.groups = discoverDynamicGroups(latest.doc, latest.url);
+        state.manualGroups = await fetchManualGroups();
         renderExportGroups();
         if (state.importPackage) renderImportGroups();
     }
 
     function renderExportGroups() {
         const container = document.getElementById('tdgmExportGroupList');
-        if (!state.groups.length) {
-            container.innerHTML = '<div class="tdgm-empty">No Dynamic Groups could be discovered on this page.</div>';
+        if (!state.groups.length && !state.manualGroups.length) {
+            container.innerHTML = '<div class="tdgm-empty">No groups could be discovered.</div>';
             updateSelectionCounts();
             return;
         }
 
-        container.innerHTML = state.groups.map((group, index) => `
+        container.innerHTML = [...state.manualGroups.map(g => ({...g, kind: 'manual'})), ...state.groups.map(g => ({...g, kind: 'dynamic'}))].map((group, index) => `
             <div class="tdgm-group-row">
-                <input type="checkbox" id="tdgm-exp-${index}" data-group-id="${escapeHtml(group.id)}" checked>
+                <input type="checkbox" id="tdgm-exp-${index}" data-group-id="${escapeHtml(group.id)}" data-kind="${group.kind}" checked>
                 <label for="tdgm-exp-${index}">
                     <div class="tdgm-group-name">${escapeHtml(group.name)}</div>
-                    <div class="tdgm-group-meta">Group ID ${escapeHtml(group.id)}${group.isCurrent ? ' · currently open' : ''}</div>
+                    <div class="tdgm-group-meta">${group.kind === "manual" ? "Manual" : "Dynamic"} · Group ID ${escapeHtml(group.id)}${group.isCurrent ? ' · currently open' : ''}</div>
                 </label>
             </div>
         `).join('');
@@ -2293,14 +2295,15 @@ window.twSDK = {
         }
 
         const existingByName = buildExistingNameMap();
+        const manualByName = new Map(state.manualGroups.map(g => [normalizeName(g.name), g]));
         container.innerHTML = state.importPackage.groups.map((group, index) => {
-            const existing = existingByName.get(normalizeName(group.name));
+            const existing = (group.kind === 'manual' ? manualByName : existingByName).get(normalizeName(group.name));
             return `
                 <div class="tdgm-group-row">
                     <input type="checkbox" id="tdgm-imp-${index}" data-import-index="${index}" checked>
                     <label for="tdgm-imp-${index}">
                         <div class="tdgm-group-name">${escapeHtml(group.name)}</div>
-                        <div class="tdgm-group-meta">${countActiveFilters(group.config)} active filter${countActiveFilters(group.config) === 1 ? '' : 's'}${groupUsesCustomLogic(group.config) ? ' · custom combinations' : ''}</div>
+                        <div class="tdgm-group-meta">${group.kind === "manual" ? `Manual · ${group.coords.length} villages` : `Dynamic · ${countActiveFilters(group.config)} active filters${groupUsesCustomLogic(group.config) ? " · custom combinations" : ""}`}</div>
                     </label>
                     ${existing ? '<span class="tdgm-badge tdgm-badge-exists">Already exists</span>' : '<span class="tdgm-badge">New</span>'}
                 </div>
@@ -2327,13 +2330,14 @@ window.twSDK = {
 
     async function exportSelectedGroups() {
         if (state.busy) return;
-        const selectedIds = Array.from(document.querySelectorAll('#tdgmExportGroupList input[type="checkbox"]:checked')).map((input) => input.dataset.groupId);
-        if (!selectedIds.length) {
+        const selectedKeys = Array.from(document.querySelectorAll('#tdgmExportGroupList input[type="checkbox"]:checked')).map(input => ({id: input.dataset.groupId, kind: input.dataset.kind}));
+        if (!selectedKeys.length) {
             UI.ErrorMessage('Select at least one group to export.');
             return;
         }
 
-        const selectedGroups = selectedIds.map((id) => state.groups.find((g) => g.id === id)).filter(Boolean);
+        const selectedGroups = selectedKeys.map(({id, kind}) => (kind === 'manual' ? state.manualGroups : state.groups).find(g => g.id === id)).filter(Boolean);
+        selectedGroups.sort((a,b) => (a.kind === 'manual' ? 0 : 1) - (b.kind === 'manual' ? 0 : 1));
         setBusy(true);
         startProgress('Exporting groups', selectedGroups.length);
 
@@ -2343,12 +2347,13 @@ window.twSDK = {
                 const group = selectedGroups[i];
                 updateProgress(i, selectedGroups.length, `Reading ${group.name}...`);
                 try {
-                    const config = await exportOneGroup(group);
-                    outputGroups.push({
-                        name: group.name,
-                        source_group_id: group.id,
-                        config: stripLocalFields(config),
-                    });
+                    if (group.kind === 'manual') {
+                        const coords = await fetchManualGroupCoords(group.id);
+                        outputGroups.push({kind: 'manual', name: group.name, source_group_id: group.id, coords});
+                    } else {
+                        const config = await exportOneGroup(group);
+                        outputGroups.push({kind: 'dynamic', name: group.name, source_group_id: group.id, config: stripLocalFields(config)});
+                    }
                     appendProgress(`✓ ${group.name}`);
                 } catch (error) {
                     appendProgress(`✗ ${group.name}: ${error.message}`);
@@ -2427,16 +2432,21 @@ window.twSDK = {
 
             const groups = pkg.groups.map((group, index) => {
                 if (!group || typeof group.name !== 'string' || !group.name.trim()) throw new Error(`group ${index + 1} has no name`);
+                if (group.kind === 'manual') {
+                    if (!Array.isArray(group.coords) || !group.coords.every(c => /^\d{1,3}\|\d{1,3}$/.test(c))) throw new Error(`invalid village coordinates in ${group.name}`);
+                    return {kind: 'manual', name: group.name.trim(), source_group_id: String(group.source_group_id || ''), coords: [...new Set(group.coords)]};
+                }
                 if (typeof group.config !== 'string' || !group.config.trim()) throw new Error(`group ${group.name} has no configuration`);
                 validatePortableConfig(group.config);
                 return {
+                    kind: 'dynamic',
                     name: group.name.trim(),
                     source_group_id: group.source_group_id ? String(group.source_group_id) : '',
                     config: stripLocalFields(group.config),
                 };
             });
 
-            return { format: PACKAGE_FORMAT, version: pkg.version || 1, groups };
+            return { format: PACKAGE_FORMAT, version: pkg.version || 1, groups: groups.sort((a,b) => (a.kind === 'manual' ? 0 : 1) - (b.kind === 'manual' ? 0 : 1)) };
         }
 
         // Backwards compatibility: a raw old-style query string becomes one package item.
@@ -2444,7 +2454,7 @@ window.twSDK = {
         return {
             format: PACKAGE_FORMAT,
             version: 1,
-            groups: [{ name: 'Imported Dynamic Group', source_group_id: '', config: stripLocalFields(raw) }],
+            groups: [{ kind: 'dynamic', name: 'Imported Dynamic Group', source_group_id: '', config: stripLocalFields(raw) }],
         };
     }
 
@@ -2461,7 +2471,7 @@ window.twSDK = {
             return;
         }
 
-        const groups = indexes.map((index) => state.importPackage.groups[index]).filter(Boolean);
+        const groups = indexes.map((index) => state.importPackage.groups[index]).filter(Boolean).sort((a,b) => (a.kind === 'manual' ? 0 : 1) - (b.kind === 'manual' ? 0 : 1));
         const overwrite = document.getElementById('tdgmOverwriteExisting').checked;
 
         setBusy(true);
@@ -2473,12 +2483,30 @@ window.twSDK = {
         try {
             await refreshGroups();
             let existingByName = buildExistingNameMap();
+            let manualByName = new Map(state.manualGroups.map(g => [normalizeName(g.name), g]));
+            const manualIdMap = new Map();
 
             for (let i = 0; i < groups.length; i++) {
                 const group = groups[i];
                 updateProgress(i, groups.length, `Importing ${group.name}...`);
                 try {
-                    let target = existingByName.get(normalizeName(group.name));
+                    let target = (group.kind === 'manual' ? manualByName : existingByName).get(normalizeName(group.name));
+                    if (group.kind === 'manual') {
+                        if (!target) {
+                            await createManualGroup(group.name);
+                            state.manualGroups = await fetchManualGroups();
+                            manualByName = new Map(state.manualGroups.map(g => [normalizeName(g.name), g]));
+                            target = manualByName.get(normalizeName(group.name));
+                            if (!target) throw new Error('new manual group not found');
+                        }
+                        if (group.source_group_id) manualIdMap.set(group.source_group_id, target.id);
+                        if (overwrite || !(await fetchManualGroupCoords(target.id)).length) {
+                            await setManualGroupVillages(target.id, group.coords, overwrite);
+                            imported++;
+                            appendProgress(`✓ Manual: ${group.name}`);
+                        } else { skipped++; appendProgress(`– Manual: ${group.name} (already exists)`); }
+                        continue;
+                    }
                     if (target && !overwrite) {
                         skipped++;
                         appendProgress(`– ${group.name}: skipped (already exists)`);
@@ -2495,7 +2523,7 @@ window.twSDK = {
                         if (!target) throw new Error('group was created but its new ID could not be found');
                     }
 
-                    await saveGroupConfiguration(target.id, group.config);
+                    await saveGroupConfiguration(target.id, remapManualGroupReferences(group.config, manualIdMap));
                     imported++;
                     appendProgress(`✓ ${group.name}${target ? '' : ''}`);
                 } catch (error) {
@@ -2516,6 +2544,96 @@ window.twSDK = {
         } finally {
             setBusy(false);
         }
+    }
+
+
+    // Manual groups use Tribal Wars' own group menu and bulk village-edit endpoints.
+    async function gameRequest(screen, params = {}, post = null) {
+        const url = new URL('/game.php', location.origin);
+        addSessionContext(url);
+        url.searchParams.set('screen', screen);
+        Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, v));
+        const response = await fetch(url, {method: post ? 'POST' : 'GET', credentials:'same-origin',
+            headers: post ? {'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'} : {},
+            body: post ? new URLSearchParams(post).toString() : undefined});
+        if (!response.ok) throw new Error(`HTTP ${response.status} (${screen})`);
+        return response;
+    }
+
+    async function fetchManualGroups() {
+        const response = await gameRequest('groups', {mode:'overview', ajax:'load_group_menu'});
+        const data = await response.json();
+        if (!Array.isArray(data.result)) throw new Error('Unexpected manual group menu response');
+        return data.result.filter(g => g.type === 'group_static' && /^\d+$/.test(String(g.group_id)) && String(g.group_id) !== '0')
+            .map(g => ({id:String(g.group_id), name:cleanText(g.name), kind:'manual'}))
+            .filter(g => g.name).sort((a,b) => a.name.localeCompare(b.name,undefined,{numeric:true}));
+    }
+
+    function extractGroupVillageRows(html) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        return [...doc.querySelectorAll('#group_table tr')].map(row => {
+            const idEl = row.querySelector('td:first-child a[data-village-id], a[data-village-id]');
+            const id = idEl && idEl.getAttribute('data-village-id');
+            const coord = (row.textContent.match(/\b\d{1,3}\|\d{1,3}\b/) || [])[0];
+            return id && coord ? {id, coord} : null;
+        }).filter(Boolean);
+    }
+
+    async function fetchManualGroupRows(groupId) {
+        const response = await gameRequest('groups', {ajax:'load_villages_from_group'}, {h:getCsrfToken(),group_id:String(groupId)});
+        const data = await response.json();
+        if (typeof data.html !== 'string') throw new Error('Unexpected manual group villages response');
+        return extractGroupVillageRows(data.html);
+    }
+
+    async function fetchManualGroupCoords(groupId) {
+        return [...new Set((await fetchManualGroupRows(groupId)).map(row => row.coord))];
+    }
+
+    async function createManualGroup(name) {
+        // The static group creation action is separate from create_dynamic.
+        const response = await gameRequest('groups', {mode:'overview', action:'create_group'},
+            {h:getCsrfToken(), group_name:name});
+        const html = await response.text();
+        if (/error_message|class=["']error["']/i.test(html)) throw new Error('Tribal Wars rejected manual group creation');
+    }
+
+    async function setManualGroupVillages(groupId, coords, replace) {
+        const all = await fetchManualGroupRows('0');
+        const byCoord = new Map(all.map(row => [row.coord, row.id]));
+        const missing = coords.filter(c => !byCoord.has(c));
+        if (missing.length) throw new Error(`${missing.length} villages are not owned on this world (e.g. ${missing[0]})`);
+        const existing = await fetchManualGroupRows(groupId);
+        async function update(action, ids) {
+            if (!ids.length) return;
+            const body = new URLSearchParams();
+            body.set(action, '1');
+            body.set('selected_group', String(groupId));
+            body.set('h', getCsrfToken());
+            ids.forEach(id => body.append('village_ids[]', id));
+            const url = new URL('/game.php', location.origin);
+            addSessionContext(url);
+            url.searchParams.set('screen','overview_villages');
+            url.searchParams.set('action','bulk_edit_villages');
+            url.searchParams.set('mode','groups');
+            url.searchParams.set('type','static');
+            url.searchParams.set('partial','');
+            const response = await fetch(url,{method:'POST',credentials:'same-origin',
+                headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:body.toString()});
+            if (!response.ok) throw new Error(`Manual membership update failed (HTTP ${response.status})`);
+        }
+        if (replace) await update('remove_from_group', existing.map(x => x.id));
+        await update('add_to_group', coords.map(c => byCoord.get(c)));
+    }
+
+    function remapManualGroupReferences(config, idMap) {
+        const params = new URLSearchParams(config);
+        for (const [key, value] of [...params.entries()]) {
+            if (!/group/i.test(key)) continue;
+            const remapped = value.replace(/\d+/g, id => idMap.get(id) || id);
+            if (remapped !== value) params.set(key, remapped);
+        }
+        return params.toString();
     }
 
     async function createDynamicGroup(name) {
