@@ -99,7 +99,7 @@
     'use strict';
 
     const SCRIPT_NAME = 'Twactics Smart Mint Resource Sender';
-    const SCRIPT_VERSION = '1.6.6';
+    const SCRIPT_VERSION = '1.6.7';
     const SCRIPT_ID = 'twactics-smart-resource-sender';
     const STYLE_ID = 'twactics-smart-resource-sender-style';
     const DATA_VERSION = 5;
@@ -1007,14 +1007,14 @@
             );
         }
 
-        if (settings.relayEnabled) {
+        if (settings.relayEnabled || settings.respacksOptimizer) {
             existingIncomingByCoord = await loadExistingIncomingTransports();
             applyExistingIncomingToVillages(Array.from(freshById.values()), existingIncomingByCoord);
         }
 
         freshById.forEach(patchStoredVillage);
 
-        if (settings.relayEnabled) {
+        if (settings.relayEnabled || settings.respacksOptimizer) {
             applyExistingIncomingToVillages(villages, existingIncomingByCoord);
         }
 
@@ -1311,6 +1311,7 @@
     // 28/30/25, then all three amounts are proportionally reduced whenever one
     // resource cannot support its share. This preserves the ratio on direct sends.
     function calculateDirectShipment(source, cfg) {
+        if (cfg.respacksOptimizer) return calculateRespackMintShipment(source, cfg);
         const merchantCarry = Math.max(0, source.availableMerchants) * MERCHANT_CAPACITY;
         const leaveBehind = Math.floor(source.warehouse / 100 * cfg.keepWhPct);
 
@@ -1438,11 +1439,16 @@
             ceiling = safeCeiling;
         }
 
-        return {
+        const need = {
             wood: Math.max(0, Math.floor(wh * ceiling - projectedValue(village, 'wood'))),
             stone: Math.max(0, Math.floor(wh * ceiling - projectedValue(village, 'stone'))),
             iron: Math.max(0, Math.floor(wh * ceiling - projectedValue(village, 'iron')))
         };
+        if (!cfg.respacksOptimizer) return need;
+        // Keep the original P5-P10 priority; enforce pack-safe receiver capacity.
+        const protectedRoom = respackReceiverRoom(village, cfg);
+        for (const key of RESOURCE_KEYS) need[key] = Math.min(need[key], protectedRoom[key]);
+        return need;
     }
 
     function relayAvailable(source, cfg) {
@@ -1454,18 +1460,21 @@
         };
     }
 
-    function usefulRelayAmount(source, target, priority, cfg) {
+    function usefulRelayAmount(source, target, priority, cfg, criticalOnly = false) {
         const available = relayAvailable(source, cfg);
         const need = receiverNeed(target, priority, cfg);
         const carry = source.availableMerchants * MERCHANT_CAPACITY;
         if (carry <= 0) return 0;
 
         let useful = 0;
-        for (const key of RESOURCE_KEYS) useful += Math.min(available[key], need[key]);
+        for (const key of RESOURCE_KEYS) {
+            useful += Math.min(available[key], need[key],
+                criticalOnly ? respackExcess(source, cfg, key) : Infinity);
+        }
         return Math.min(carry, useful);
     }
 
-    function allocateRelayShipment(source, target, priority, cfg) {
+    function allocateRelayShipment(source, target, priority, cfg, criticalOnly = false) {
         let carry = source.availableMerchants * MERCHANT_CAPACITY;
         const available = relayAvailable(source, cfg);
         const need = receiverNeed(target, priority, cfg);
@@ -1475,6 +1484,10 @@
         // Receiver need still acts as a hard ceiling, so we relieve overflow risk
         // without overfilling the relay village.
         const order = [...RESOURCE_KEYS].sort((a, b) => {
+            if (cfg.respacksOptimizer) {
+                const urgency = respackExcess(source, cfg, b) - respackExcess(source, cfg, a);
+                if (urgency !== 0) return urgency;
+            }
             const sourceWh = Math.max(1, source.warehouse);
             const ar = Math.max(0, source[a]) / sourceWh;
             const br = Math.max(0, source[b]) / sourceWh;
@@ -1490,7 +1503,8 @@
 
         for (const key of order) {
             if (carry <= 0) break;
-            const send = Math.floor(Math.min(carry, available[key], need[key]));
+            const send = Math.floor(Math.min(carry, available[key], need[key],
+                criticalOnly ? respackExcess(source, cfg, key) : Infinity));
             if (send <= 0) continue;
             amount[key] = send;
             carry -= send;
@@ -1517,7 +1531,7 @@
         }
     }
 
-    function findRelayCandidate(source, state, finalTarget, allowedPriorities, cfg) {
+    function findRelayCandidate(source, state, finalTarget, allowedPriorities, cfg, criticalOnly = false) {
         const sourceToTarget = distance(source, finalTarget);
         const hopRadius = cfg.directRadius;
 
@@ -1528,7 +1542,7 @@
                 const candidateToTarget = distance(candidate, finalTarget);
                 const priority = classifyReceiver(candidate, cfg);
                 const useful = allowedPriorities.includes(priority)
-                    ? usefulRelayAmount(source, candidate, priority, cfg)
+                    ? usefulRelayAmount(source, candidate, priority, cfg, criticalOnly)
                     : 0;
                 return { candidate, hopDistance, candidateToTarget, priority, useful };
             })
@@ -1590,17 +1604,17 @@
         return true;
     }
 
-    function routeThroughRelays(transfers, source, state, finalTarget, rule, allowedPriorities, cfg) {
+    function routeThroughRelays(transfers, source, state, finalTarget, rule, allowedPriorities, cfg, criticalOnly = false) {
         let relayedSomething = false;
         let safety = 0;
 
         while (source.availableMerchants > 0 && totalResources(relayAvailable(source, cfg)) >= MIN_TRANSFER_TOTAL && safety++ < 100) {
-            const choice = findRelayCandidate(source, state, finalTarget, allowedPriorities, cfg);
+            const choice = findRelayCandidate(source, state, finalTarget, allowedPriorities, cfg, criticalOnly);
             if (!choice) break;
 
             const sourceBefore = maxProjectedFill(source);
             const receiverBefore = maxProjectedFill(choice.candidate);
-            const amount = allocateRelayShipment(source, choice.candidate, choice.priority, cfg);
+            const amount = allocateRelayShipment(source, choice.candidate, choice.priority, cfg, criticalOnly);
             const total = totalResources(amount);
             if (total < MIN_TRANSFER_TOTAL) break;
 
@@ -1640,7 +1654,7 @@
         return relayedSomething;
     }
 
-    // Respacks Optimizer is a separate planning mode. Existing planning is unchanged when disabled.
+    // Respacks Optimizer adds pack-safe constraints to the original P1-P10 routing.
     // A selected X% pack really adds X% per resource. Planning intentionally reserves
     // X + 2 percentage points of free warehouse capacity per resource, to allow a
     // little room for production before the pack is opened. The UI still shows X%.
@@ -1682,195 +1696,10 @@
         return Math.max(0, projectedValue(source, key) - respackResourceCap(source, cfg));
     }
 
-    // First move resources that would overflow on the next pack; with spare merchants,
-    // continue draining other resources to make room for repeated packs.
-    // This flexible allocator is ONLY for relay shipments (never mint destinations).
-    // The mint-bound allocator below always enforces the 28:30:25 ratio.
-    function calculateRespackShipment(source, cfg, receiver = null, criticalOnly = false) {
-        let carry = Math.max(0, source.availableMerchants) * MERCHANT_CAPACITY;
-        const available = respackAvailable(source, cfg);
-        const room = receiver ? respackReceiverRoom(receiver, cfg) : null;
-        const result = emptyResourceSet();
-        const sortByNeed = (a, b) => {
-            const excessDiff = respackExcess(source, cfg, b) - respackExcess(source, cfg, a);
-            if (excessDiff !== 0) return excessDiff;
-            const fillDiff = projectedValue(source, b) - projectedValue(source, a);
-            if (fillDiff !== 0) return fillDiff;
-            return RESOURCE_KEYS.indexOf(a) - RESOURCE_KEYS.indexOf(b);
-        };
-        const order = [...RESOURCE_KEYS].sort(sortByNeed);
-
-        // Stage one: relieve projected overflow as far as the actual current stock permits.
-        for (const key of order) {
-            if (carry <= 0) break;
-            const send = Math.floor(Math.min(
-                carry, available[key],
-                room ? room[key] : Infinity,
-                respackExcess(source, cfg, key)
-            ));
-            if (send <= 0) continue;
-            result[key] += send;
-            available[key] -= send;
-            if (room) room[key] -= send;
-            carry -= send;
-        }
-
-        if (criticalOnly) return result;
-
-        // Stage two: extra clearance for future packs, favoring the fullest resources.
-        for (const key of order) {
-            if (carry <= 0) break;
-            const send = Math.floor(Math.min(
-                carry, available[key], room ? room[key] : Infinity
-            ));
-            if (send <= 0) continue;
-            result[key] += send;
-            available[key] -= send;
-            if (room) room[key] -= send;
-            carry -= send;
-        }
-        return result;
-    }
-
-    function findRespackRelay(source, state, finalTarget, cfg, criticalOnly = false) {
-        const sourceDistance = distance(source, finalTarget);
-        return state
-            .filter(candidate => candidate.id !== source.id && candidate.id !== finalTarget.id)
-            .map(candidate => {
-                const legDistance = distance(source, candidate);
-                const remainingDistance = distance(candidate, finalTarget);
-                if (legDistance > cfg.directRadius + 1e-9 || remainingDistance + 1e-9 >= sourceDistance) return null;
-                const amount = calculateRespackShipment(source, cfg, candidate, criticalOnly);
-                const useful = totalResources(amount);
-                const critical = RESOURCE_KEYS.reduce((sum, key) =>
-                    sum + Math.min(amount[key], respackExcess(source, cfg, key)), 0);
-                return { candidate, legDistance, remainingDistance, useful, critical };
-            })
-            .filter(item => item && item.useful >= MIN_TRANSFER_TOTAL)
-            .sort((a, b) => {
-                // Free dangerous resources before optimizing route length.
-                if (a.critical !== b.critical) return b.critical - a.critical;
-                // Prefer receivers with merchants available to relay again in later runs.
-                const aMerchants = a.candidate.availableMerchants > 0 ? 1 : 0;
-                const bMerchants = b.candidate.availableMerchants > 0 ? 1 : 0;
-                if (aMerchants !== bMerchants) return bMerchants - aMerchants;
-                if (Math.abs(a.remainingDistance - b.remainingDistance) > 1e-9) {
-                    return a.remainingDistance - b.remainingDistance;
-                }
-                if (a.useful !== b.useful) return b.useful - a.useful;
-                return a.legDistance - b.legDistance;
-            })[0] || null;
-    }
-
-    function addRespackTransfer(transfers, source, receiver, kind, amount, finalTarget, cfg, legDistance) {
-        const total = totalResources(amount);
-        if (total < MIN_TRANSFER_TOTAL) return false;
-        const sourceBefore = maxProjectedFill(source);
-        const receiverBefore = kind === 'relay' ? maxProjectedFill(receiver) : null;
-        const merchants = applyOutgoing(source, amount);
-        if (kind === 'relay') applyIncoming(receiver, amount);
-
-        transfers.push({
-            kind,
-            rule: 'RESPACK',
-            note: kind === 'relay' ? 'Pack-safe relay' : 'Mint 28:30:25 (pack clearance)',
-            receiverPriority: null,
-            receiverLabel: kind === 'relay' ? 'Pack-safe relay' : 'Final target',
-            sourceId: source.id,
-            sourceName: source.name,
-            sourceCoord: source.coord,
-            sourceToTarget: distance(source, finalTarget),
-            targetId: receiver.id,
-            targetName: receiver.name,
-            targetCoord: receiver.coord,
-            targetToFinal: kind === 'relay' ? distance(receiver, finalTarget) : 0,
-            legDistance,
-            wood: amount.wood,
-            stone: amount.stone,
-            iron: amount.iron,
-            total,
-            merchants,
-            sourceBeforePct: sourceBefore,
-            sourceAfterPct: maxProjectedFill(source),
-            receiverBeforePct: receiverBefore,
-            receiverAfterPct: kind === 'relay' ? maxProjectedFill(receiver) : null,
-            sent: false
-        });
-        return true;
-    }
-
-    function buildRespackPlan(sourceVillages, finalTarget, cfg) {
-        const state = sourceVillages.map(cloneVillage);
-        const transfers = [];
-        const sources = state
-            .filter(v => String(v.id) !== String(finalTarget.id) && v.availableMerchants > 0)
-            // Farther villages first: relay receivers closer to the mint are processed later.
-            .sort((a, b) => distance(b, finalTarget) - distance(a, finalTarget));
-
-        for (const source of sources) {
-            const dist = distance(source, finalTarget);
-            if (!cfg.relayEnabled && cfg.maxDistance > 0 && dist > cfg.maxDistance + 1e-9) continue;
-
-            // Phase 1: reserve merchant capacity for resources that would be lost
-            // on the next pack. Do not spend that capacity on optional clearing.
-            if (cfg.relayEnabled && dist > cfg.directRadius + 1e-9) {
-                let safety = 0;
-                while (source.availableMerchants > 0 && safety++ < 100 &&
-                    RESOURCE_KEYS.some(key => respackExcess(source, cfg, key) > 0)) {
-                    const choice = findRespackRelay(source, state, finalTarget, cfg, true);
-                    if (!choice) break;
-                    const amount = calculateRespackShipment(source, cfg, choice.candidate, true);
-                    if (!addRespackTransfer(transfers, source, choice.candidate, 'relay', amount,
-                        finalTarget, cfg, choice.legDistance)) break;
-                }
-            }
-
-            if (source.availableMerchants > 0 &&
-                RESOURCE_KEYS.some(key => respackExcess(source, cfg, key) > 0)) {
-                // Pack urgency may affect the number of bundles, but NOT the
-                // ratio delivered to the mint. Excess iron with insufficient
-                // wood/clay must remain or find relay space, never go direct alone.
-                const critical = calculateRespackMintShipment(source, cfg, true);
-                const amount = totalResources(critical) >= MIN_TRANSFER_TOTAL
-                    ? critical : calculateRespackMintShipment(source, cfg);
-                addRespackTransfer(transfers, source, finalTarget, 'direct', amount, finalTarget, cfg, dist);
-            }
-
-            // Phase 2: once the pack is protected, drain remaining resources to
-            // make room for subsequent packs, using short relays when possible.
-            if (cfg.relayEnabled && dist > cfg.directRadius + 1e-9 &&
-                !RESOURCE_KEYS.some(key => respackExcess(source, cfg, key) > 0)) {
-                let safety = 0;
-                while (source.availableMerchants > 0 && safety++ < 100) {
-                    const choice = findRespackRelay(source, state, finalTarget, cfg);
-                    if (!choice) break;
-                    const amount = calculateRespackShipment(source, cfg, choice.candidate);
-                    if (!addRespackTransfer(transfers, source, choice.candidate, 'relay', amount,
-                        finalTarget, cfg, choice.legDistance)) break;
-                }
-            }
-
-            // The mint target is an intentional sink; receiver pack limits do not apply to it.
-            // If no short relay has room, use a direct request for remaining resources.
-            if (source.availableMerchants > 0) {
-                const amount = calculateRespackMintShipment(source, cfg);
-                addRespackTransfer(transfers, source, finalTarget, 'direct', amount, finalTarget, cfg, dist);
-            }
-        }
-
-        // Refuse any optimizer plan that would send an unbalanced direct shipment.
-        if (transfers.some(item => item.kind === 'direct' && !isExactMintRatio(item))) {
-            throw new Error('Mint ratio safety check failed. Plan not created.');
-        }
-        transfers.sort((a, b) => {
-            if (a.kind !== b.kind) return a.kind === 'relay' ? -1 : 1;
-            return b.sourceToTarget - a.sourceToTarget || a.legDistance - b.legDistance;
-        });
-        return transfers;
-    }
+    // Respack limits supplement normal P1-P10 routing below.
+    // Mint villages intentionally remain excluded from receiver pack limits.
 
     function buildPlan(sourceVillages, finalTarget, cfg) {
-        if (cfg.respacksOptimizer) return buildRespackPlan(sourceVillages, finalTarget, cfg);
         const state = sourceVillages.map(cloneVillage);
         const transfers = [];
         const threshold = cfg.triggerPct / 100;
@@ -1995,6 +1824,19 @@
             const relayed = routeThroughRelays(transfers, source, state, finalTarget, 'ROUTE', [5, 6, 7, 8, 9, 10], cfg);
             if (!relayed || source.availableMerchants > 0) {
                 addDirectTransfer(transfers, source, finalTarget, relayed ? 'ROUTE' : 'DIRECT', relayed ? 'No more closer receiver room -> direct remainder' : 'No useful closer receiver -> direct', cfg);
+            }
+        }
+
+        // Extra safety-only pass AFTER normal routing: forward just the resources
+        // at risk when a pack is popped. Keep original P5-P10 receiver ranking.
+        if (cfg.respacksOptimizer && cfg.relayEnabled) {
+            for (const source of sources) {
+                if (source.availableMerchants <= 0) continue;
+                if (!RESOURCE_KEYS.some(key => respackExcess(source, cfg, key) > 0)) continue;
+                routeThroughRelays(
+                    transfers, source, state, finalTarget,
+                    'RESPACK_SAFETY', [5, 6, 7, 8, 9, 10], cfg, true
+                );
             }
         }
 
@@ -2868,14 +2710,14 @@
                                 <input id="strr-respack-enabled" type="checkbox" ${settings.respacksOptimizer ? 'checked' : ''}>
                                 <strong>Respacks Optimizer</strong>
                             </label>
-                            <span class="twsr-small">Free space for resource packs, minimizing resource waste across villages.</span>
+                            <span class="twsr-small">Add pack-safe limits and overflow protection to normal routing.</span>
                         </div>
                         <div id="strr-respack-options" class="twsr-respack-options">
                             <label class="twsr-label" for="strr-respack-pct">Respack size (%)</label>
                             <input id="strr-respack-pct" class="twsr-input" type="number" min="1" max="100" step="1"
                                 value="${escapeHtml(settings.respackPct)}">
                             <div class="twsr-hint">A ${escapeHtml(settings.respackPct)}% pack adds that percentage of each village's warehouse capacity to each resource. The optimizer plans transfers to leave room for the next pack.</div>
-                            <div class="twsr-small">Prioritizes overfilled resources in relay shipments. Every direct shipment to a mint keeps the exact 28:30:25 wood/clay/iron ratio. WH threshold and imbalance gap are ignored. Relays respect the lower of Safe receiver ceiling and the pack-safe limit.</div>
+                            <div class="twsr-small">Uses original P1-P10 direct/relay priorities with pack-safe receiver limits. Overfilled resources move first and mint-bound sends keep exact 28:30:25 ratio. WH threshold and imbalance gap still apply. Incoming transports count toward pack safety.</div>
                         </div>
                         <div id="strr-multi-config" class="twsr-multi-config">
                             <div class="twsr-multi-toolbar">
@@ -3077,8 +2919,8 @@
         const mappings = validateMultiMintMappings(cfg);
         const sets = await loadMultiMintVillageSets(cfg, true);
 
-        if (cfg.relayEnabled) {
-            setStatus('Loading existing incoming transports for relay planning...', 'warn');
+        if (cfg.relayEnabled || cfg.respacksOptimizer) {
+            setStatus('Loading existing incoming transports for safe planning...', 'warn');
             await refreshExistingIncomingForVillages(villages);
         }
 
@@ -3152,8 +2994,8 @@
                 multiMintVillageSets = new Map();
                 multiMintOverlapSkips = [];
 
-                if (settings.relayEnabled) {
-                    setStatus('Loading existing incoming transports for relay planning...', 'warn');
+                if (settings.relayEnabled || settings.respacksOptimizer) {
+                    setStatus('Loading existing incoming transports for safe planning...', 'warn');
                     await refreshExistingIncomingForVillages(villages);
                 }
 
