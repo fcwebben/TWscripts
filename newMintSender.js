@@ -157,6 +157,8 @@
     let enterKeyHeld = false;
     let worldSpeed = 1;
     let planCreatedAtServerMs = 0;
+    let planSettingsSignature = null;
+    let planDirtyDuringSend = false;
     let settings;
 
     try {
@@ -1054,6 +1056,9 @@
             scale = Math.min(scale, Math.max(0, Number(budget[key]) || 0) / original[key]);
         }
 
+        if (settings.respacksOptimizer && transfer.kind === 'relay' && !receiverState) {
+            return emptyResourceSet(); // Receiver's current pack-safe capacity is unknown.
+        }
         if (receiverState && transfer.kind === 'relay') {
             const priority = Number(transfer.receiverPriority) || classifyReceiver(receiverState, settings);
             const need = settings.respacksOptimizer
@@ -2628,10 +2633,27 @@
         });
     }
 
+    function getPlanningSettingsSignature(cfg) {
+        return JSON.stringify(sanitizeSettings(cfg));
+    }
+
+    function invalidatePlan(message = 'Settings changed. Create a new plan before requesting resources.') {
+        plan = [];
+        planSettingsSignature = null;
+        const output = document.querySelector('#strr-output');
+        if (output) output.innerHTML = '<div class="twsr-empty">' + escapeHtml(message) + '</div>';
+        setStatus(message, 'warn');
+    }
+
     function persistUiSettings() {
         try {
             settings = getSettingsFromUi();
             saveSettings(settings);
+            if (planSettingsSignature &&
+                getPlanningSettingsSignature(settings) !== planSettingsSignature) {
+                if (sendLocked) planDirtyDuringSend = true;
+                else invalidatePlan();
+            }
         } catch (error) {
         }
     }
@@ -2980,11 +3002,19 @@
     async function generateFromUi() {
         const output = document.querySelector('#strr-output');
         const buildButton = document.querySelector('#strr-build');
+        if (sendLocked) {
+            setStatus('Wait for the current request to finish before creating a new plan.', 'warn');
+            return;
+        }
 
         try {
             if (buildButton) buildButton.disabled = true;
             settings = getSettingsFromUi();
             settings = saveSettings(settings);
+            const buildingSignature = getPlanningSettingsSignature(settings);
+            planSettingsSignature = null;
+            plan = [];
+            if (output) output.innerHTML = '';
 
             if (settings.multiMintEnabled) {
                 setStatus('Loading configured groups and creating multi-mint routing plan...', 'warn');
@@ -3004,6 +3034,11 @@
                 plan = buildPlan(villages, resolvedTarget, settings);
             }
 
+            if (getPlanningSettingsSignature(getSettingsFromUi()) !== buildingSignature) {
+                plan = [];
+                throw new Error('Settings changed during planning. Create a new plan.');
+            }
+            planSettingsSignature = buildingSignature;
             planCreatedAtServerMs = getServerNowMs();
             if (settings.relayEnabled && plan.some(item => item.kind === 'relay')) {
                 await ensureWorldSpeed();
@@ -3024,6 +3059,8 @@
                 'success'
             );
         } catch (error) {
+            planSettingsSignature = null;
+            plan = [];
             setStatus(error && error.message ? error.message : String(error), 'error');
             if (output) output.innerHTML = '';
         } finally {
@@ -3089,6 +3126,10 @@
     function mintResourceRowHtml(key, label, image, split) {
         const direct = Math.max(0, Number(split.direct[key]) || 0);
         const relay = Math.max(0, Number(split.relay[key]) || 0);
+        const total = direct + relay;
+        const directPct = total > 0 ? Math.round((direct / total) * 100) : 0;
+        const relayPct = total > 0 ? 100 - directPct : 0;
+
         return `
             <div class="twsr-mint-resource-row">
                 <div class="twsr-mint-resource-top">
@@ -3096,11 +3137,11 @@
                         <img src="${image}" alt="${escapeHtml(label)}">
                         <span class="twsr-mint-resource-name">${escapeHtml(label)}</span>
                     </div>
-                    <span class="twsr-mint-resource-total" title="Directly requested into the mint">${fmt(direct)}</span>
+                    <span class="twsr-mint-resource-total">${fmt(total)}</span>
                 </div>
                 <div class="twsr-mint-resource-split">
-                    <span title="Resources actually requested into mint on this run">Mint direct <strong>${fmt(direct)}</strong></span>
-                    <span title="Staged in relay villages, not yet delivered to the mint">Relay staged <strong>${fmt(relay)}</strong></span>
+                    <span title="Share requested directly to the mint">Direct <strong>${directPct}%</strong></span>
+                    <span title="Share staged through relay villages first">Relay <strong>${relayPct}%</strong></span>
                 </div>
             </div>
         `;
@@ -3125,7 +3166,6 @@
                             </div>
                             ${targets.length > 1 ? '<div class="twsr-small">#' + (index + 1) + '</div>' : ''}
                         </div>
-                        <div class="twsr-mint-card-meta">Direct to mint (relays shown separately)</div>
                         ${mintResourceRowHtml('wood', 'Wood', '/graphic/holz.png', split)}
                         ${mintResourceRowHtml('stone', 'Clay', '/graphic/lehm.png', split)}
                         ${mintResourceRowHtml('iron', 'Iron', '/graphic/eisen.png', split)}
@@ -3489,6 +3529,11 @@
         if (sendLocked) {
             return;
         }
+        if (!planSettingsSignature ||
+            getPlanningSettingsSignature(getSettingsFromUi()) !== planSettingsSignature) {
+            invalidatePlan();
+            return;
+        }
 
         if (settings.respacksOptimizer) {
             const isMint = getMintTargetDefinitions().some(item => String(item.id) === String(group.targetId));
@@ -3502,6 +3547,11 @@
         }
 
         sendLocked = true;
+        const fields = Array.from(document.querySelectorAll(
+            '#strr-settings-panel input, #strr-settings-panel select'
+        ));
+        const disabledBefore = fields.map(node => node.disabled);
+        fields.forEach(node => { node.disabled = true; });
         document.querySelectorAll('.twsr-send-button').forEach(node => { node.disabled = true; });
         const oldText = button.textContent;
         button.textContent = 'Requesting...';
@@ -3512,7 +3562,7 @@
         );
 
         const payload = buildCallDataForRequestGroup(group);
-
+        let requestSucceeded = false;
 
         try {
             const response = await postMarketRequest(group.targetId, payload);
@@ -3536,6 +3586,7 @@
             );
 
 
+            requestSucceeded = true;
             setStatus(message, 'success');
             if (window.UI?.SuccessMessage) UI.SuccessMessage(message);
         } catch (error) {
@@ -3586,10 +3637,22 @@
             }
         } finally {
             sendLocked = false;
+            fields.forEach((node, index) => { node.disabled = disabledBefore[index]; });
             document.querySelectorAll('.twsr-send-button').forEach(node => { node.disabled = false; });
-            const next = document.querySelector('.twsr-send-button:not(:disabled)');
-            if (next) next.focus();
-            else renderFinishedSummary();
+            if (planDirtyDuringSend) {
+                planDirtyDuringSend = false;
+                invalidatePlan();
+            } else {
+                const next = document.querySelector('.twsr-send-button:not(:disabled)');
+                const pending = plan.some(item => !item.sent);
+                if (next) next.focus();
+                else if (pending) renderPlan();
+                else if (requestSucceeded && planSettingsSignature) renderFinishedSummary();
+                else {
+                    renderPlan();
+                    setStatus('Last request was not completed. Refresh village data and recreate the plan.', 'warn');
+                }
+            }
         }
     }
 
@@ -3598,6 +3661,7 @@
         sendLocked = false;
         document.querySelectorAll('.twsr-send-button').forEach(node => { node.disabled = false; });
 
+        if (planSettingsSignature) invalidatePlan('Refreshing village data. Recreate the plan.');
         const build = document.querySelector('#strr-build');
         const refresh = document.querySelector('#strr-refresh');
         if (build) build.disabled = true;
