@@ -15,7 +15,19 @@
  * - Calculates suggested relic placements after a manual user click
  * - Can focus Offensive strength, Defensive strength or Recruitment output scoring on one village group while still placing relics on any owned village
  * - Can optionally read Account Manager troop targets/current counts for recruitment-demand scoring
+ * - Can optionally prioritise dense Focus Group clusters for Axe, Light, Marcher and Ram offensive bonuses
  * - Uses diminishing-return scoring for Offense/Defense/Recruitment so balanced useful bonuses are preferred over one-stat stacking
+ *
+ * v1.4.0 notes:
+ * - Adds optional "Prioritise maximising clusters" for Offensive strength.
+ * - Ranks compact Focus Group clusters by coverable village count and density
+ *   at the median range of available core-offense relics.
+ * - Prioritises Axe, Light Cavalry, Mounted Archer and Ram bonuses in the best
+ *   clusters, without excluding other Focus Group villages from scoring.
+ * - Candidate relic centers remain unrestricted to eligible owned villages;
+ *   broader coverage wins when priority-cluster gains are equal.
+ * - Existing scoring, modes, rate limiter and request behavior are unchanged
+ *   when the new option is not selected.
  *
  * v1.3.1 notes:
  * - Routes every script GET through one shared request queue/rate limiter.
@@ -61,7 +73,7 @@
   window.twacticsRelicPlannerV2Loaded = true;
 
   const SCRIPT_NAME = "Twactics Relic Planner";
-  const SCRIPT_VERSION = "v1.3.1";
+  const SCRIPT_VERSION = "v1.4.0";
   const BOX_ID = "twactics-relic-planner-v2";
   const STYLE_ID = "twactics-relic-planner-v2-style";
   const DEFAULT_BENEFIT_CAP = 20;
@@ -69,6 +81,9 @@
   const OPTIMIZATION_YIELD_EVERY = 350;
   const LOCAL_SEARCH_MAX_ESTIMATED_EVALUATIONS = 120000;
   const LOCAL_SEARCH_MAX_VILLAGES = 120;
+  // Cluster mode is opt-in. No cluster calculations run for other goals / when disabled.
+  const CLUSTER_PRIORITY_BOOST = 10;
+  const CLUSTER_RANK_DECAY = 0.58;
 
   // Network safety / review compliance.
   // All GET requests made by this script must pass through the same queue.
@@ -118,6 +133,25 @@
     catapult_attack: 0.10,
     catapult_offdef: 0.10,
     catapult_damage: 0.10
+  };
+
+  // Core units are weighted equally in the optional cluster mode. Heavy/
+  // Catapult still receive a small secondary score for genuinely useful coverage.
+  const CLUSTER_OFFENSE_WEIGHTS = {
+    axe_attack: 1.0,
+    axe_offdef: 1.0,
+    light_attack: 1.0,
+    light_offdef: 1.0,
+    marcher_attack: 1.0,
+    marcher_offdef: 1.0,
+    ram_attack: 1.0,
+    ram_offdef: 1.0,
+    ram_damage: 1.0,
+    heavy_attack: 0.05,
+    heavy_offdef: 0.05,
+    catapult_attack: 0.05,
+    catapult_offdef: 0.05,
+    catapult_damage: 0.05
   };
 
   const DEFENSE_WEIGHTS = {
@@ -405,6 +439,11 @@
     focusCoords: new Set(),
     lastGoal: "",
     recruitmentDemandRequested: false,
+    prioritiseClustersRequested: false,
+    prioritiseClustersActive: false,
+    offenseClusters: [],
+    offenseClusterRange: 0,
+    offenseClusterUnreachable: 0,
     recruitmentDemandActive: false,
     amTemplates: [],
     amRecruitmentDemandByCoord: new Map(),
@@ -1290,7 +1329,7 @@
   }
 
   function getRelevantWeights(goal) {
-    if (goal === "offense") return OFFENSE_WEIGHTS;
+    if (goal === "offense") return state.prioritiseClustersActive ? CLUSTER_OFFENSE_WEIGHTS : OFFENSE_WEIGHTS;
     if (goal === "defense") return DEFENSE_WEIGHTS;
     if (goal === "merchants") return MERCHANT_WEIGHTS;
     if (goal === "haul") return HAUL_WEIGHTS;
@@ -2304,6 +2343,118 @@
     return getCoveredVillages(center, range);
   }
 
+  function isCoreOffenseStat(statKey) {
+    return /^(axe|light|marcher|ram)_(attack|offdef|damage)$/.test(String(statKey || "")) &&
+      OFFENSE_WEIGHTS[statKey] !== undefined;
+  }
+
+  function getClusterReferenceRange(availableRelics) {
+    // Lower median: one unusually long-range relic should not define every cluster.
+    const ranges = (availableRelics || [])
+      .filter(relic => (relic.stats || []).some(stat => stat.normalized && isCoreOffenseStat(stat.normalized.key)))
+      .map(relic => Math.max(0, parseInt(relic.range || 0, 10)))
+      .filter(range => range > 0)
+      .sort((a, b) => a - b);
+    return ranges.length ? ranges[Math.floor((ranges.length - 1) / 2)] : 0;
+  }
+
+  function buildOffenseClusters(optimizationContext, availableRelics) {
+    const range = getClusterReferenceRange(availableRelics);
+    const clusters = [];
+    const clusterByCoord = new Map();
+    const eligibleFocus = state.villages.filter(village => isVillageIncludedInGoalImpact(village, "offense"));
+    const remaining = new Set(eligibleFocus.map(village => village.coord));
+
+    if (!range || !remaining.size) {
+      return { range: range, clusters: clusters, clusterByCoord: clusterByCoord, unreachable: remaining.size };
+    }
+
+    // A ranking anchor may be ANY eligible owned village, not only villages in
+    // the Focus Group or the geographical cluster itself.
+    const candidateCenters = getCandidateCentersForRelic({ range: range }, "offense", optimizationContext);
+    const candidates = [];
+    const candidatesForCoord = new Map();
+
+    candidateCenters.forEach(center => {
+      const members = getCachedCoveredVillages(center, range, optimizationContext)
+        .filter(village => remaining.has(village.coord));
+      if (!members.length) return;
+
+      const index = candidates.length;
+      const squaredDistances = new Map();
+      let totalSquaredDistance = 0;
+      members.forEach(village => {
+        const distance = Math.pow(village.x - center.x, 2) + Math.pow(village.y - center.y, 2);
+        squaredDistances.set(village.coord, distance);
+        totalSquaredDistance += distance;
+        if (!candidatesForCoord.has(village.coord)) candidatesForCoord.set(village.coord, []);
+        candidatesForCoord.get(village.coord).push(index);
+      });
+      candidates.push({
+        center: center,
+        members: members.map(village => village.coord),
+        squaredDistances: squaredDistances,
+        count: members.length,
+        totalSquaredDistance: totalSquaredDistance
+      });
+    });
+
+    // Greedy, disjoint coverage ranking: largest still-unassigned cluster first;
+    // for equal sizes prefer the more tightly packed one. Inverted membership
+    // updates keep this efficient on large accounts (no full re-count per round).
+    while (remaining.size) {
+      let bestIndex = -1;
+      let bestCount = 0;
+      let bestMeanDistance = Infinity;
+
+      for (let i = 0; i < candidates.length; i++) {
+        const candidate = candidates[i];
+        if (candidate.count <= 0) continue;
+        const meanDistance = candidate.totalSquaredDistance / candidate.count;
+        if (candidate.count > bestCount ||
+            (candidate.count === bestCount && meanDistance < bestMeanDistance - 0.000001)) {
+          bestIndex = i;
+          bestCount = candidate.count;
+          bestMeanDistance = meanDistance;
+        }
+      }
+
+      if (bestIndex < 0) break;
+      const best = candidates[bestIndex];
+      const coords = best.members.filter(coord => remaining.has(coord));
+      const cluster = {
+        rank: clusters.length + 1,
+        center: best.center,
+        range: range,
+        size: coords.length,
+        coords: coords,
+        meanSquaredDistance: bestMeanDistance
+      };
+      clusters.push(cluster);
+      coords.forEach(coord => {
+        clusterByCoord.set(coord, cluster);
+        remaining.delete(coord);
+        (candidatesForCoord.get(coord) || []).forEach(index => {
+          candidates[index].count -= 1;
+          candidates[index].totalSquaredDistance -= candidates[index].squaredDistances.get(coord) || 0;
+        });
+      });
+    }
+
+    return { range: range, clusters: clusters, clusterByCoord: clusterByCoord, unreachable: remaining.size };
+  }
+
+  function getClusterPriorityMultiplier(village, statKey, goal, optimizationContext) {
+    if (goal !== "offense" || !state.prioritiseClustersActive || !isCoreOffenseStat(statKey)) return 1;
+    const cluster = optimizationContext && optimizationContext.clusterByCoord &&
+      optimizationContext.clusterByCoord.get(village.coord);
+    if (!cluster || cluster.size < 2) return 1; // Isolated villages remain eligible at normal weight.
+
+    const firstSize = (optimizationContext.clusters && optimizationContext.clusters[0] || {}).size || cluster.size;
+    const densityFactor = 0.8 + 0.2 * Math.min(1, cluster.size / Math.max(1, firstSize));
+    return 1 + CLUSTER_PRIORITY_BOOST * Math.pow(CLUSTER_RANK_DECAY, cluster.rank - 1) * densityFactor;
+  }
+
   function getCachedVillageWeight(village, weighting, optimizationContext) {
     if (optimizationContext && optimizationContext.weightCache && optimizationContext.weightCache.has(village.coord)) {
       return optimizationContext.weightCache.get(village.coord);
@@ -2539,9 +2690,13 @@
         const bucketCurrent = bucketTotals[bucketKey] || 0;
         const marginalGain = getBalancedMarginalGain(bucketCurrent, effectiveGain, benefitCap, goal);
 
-        const statScore = marginalGain * statWeight * villageWeight;
-        const statRawScore = stat.value * statWeight * villageWeight;
-        const statWastedScore = wastedGain * statWeight * villageWeight;
+        // The extra cluster factor is applied ONLY to core offensive bonuses.
+        // Every affected Focus Group village still contributes: thus shifting a
+        // relic to cover the same preferred cluster PLUS extra villages wins.
+        const clusterMultiplier = getClusterPriorityMultiplier(village, stat.key, goal, optimizationContext);
+        const statScore = marginalGain * statWeight * villageWeight * clusterMultiplier;
+        const statRawScore = stat.value * statWeight * villageWeight * clusterMultiplier;
+        const statWastedScore = wastedGain * statWeight * villageWeight * clusterMultiplier;
 
         score += statScore;
         rawScore += statRawScore;
@@ -2641,6 +2796,12 @@
     if (candidate.score > best.score + EPSILON) return true;
     if (candidate.score < best.score - EPSILON) return false;
 
+    // When priority gains tie, favor the placement that reaches more Focus Group villages.
+    if (state.prioritiseClustersActive &&
+        (candidate.scoredCoverageCount || 0) !== (best.scoredCoverageCount || 0)) {
+      return (candidate.scoredCoverageCount || 0) > (best.scoredCoverageCount || 0);
+    }
+
     if (candidate.wastedScore < best.wastedScore - EPSILON) return true;
     if (candidate.wastedScore > best.wastedScore + EPSILON) return false;
 
@@ -2671,6 +2832,7 @@
     const usedRelics = new Set();
     const usedCenters = new Set();
     const scoredPlan = [];
+    const scoredFocusCoords = new Set();
     let totalScore = 0;
     let totalWaste = 0;
 
@@ -2690,6 +2852,11 @@
       const move = buildMove(i + 1, placement.relic, placement.center, scored);
 
       scoredPlan.push(move);
+      if (state.prioritiseClustersActive) {
+        move.covered.forEach(village => {
+          if (isVillageIncludedInGoalImpact(village, goal)) scoredFocusCoords.add(village.coord);
+        });
+      }
       totalScore += scored.score;
       totalWaste += scored.wastedScore;
       applyRelicToBonuses(placement.relic, placement.center, workingBonuses, true, optimizationContext);
@@ -2699,6 +2866,7 @@
       valid: true,
       totalScore: totalScore,
       totalWaste: totalWaste,
+      scoredFocusCoverage: scoredFocusCoords.size,
       plan: scoredPlan
     };
   }
@@ -2711,6 +2879,10 @@
     if (candidate.totalScore > current.totalScore + EPSILON) return true;
     if (candidate.totalScore < current.totalScore - EPSILON) return false;
 
+    if (state.prioritiseClustersActive &&
+        candidate.scoredFocusCoverage !== current.scoredFocusCoverage) {
+      return candidate.scoredFocusCoverage > current.scoredFocusCoverage;
+    }
     return candidate.totalWaste < current.totalWaste - EPSILON;
   }
 
@@ -2774,10 +2946,34 @@
   }
 
   async function optimizePlan(goal, mode, weighting, maxPlacements) {
+    const allAvailableRelics = getAvailableRelics(mode);
+    state.prioritiseClustersActive = goal === "offense" && state.prioritiseClustersRequested &&
+      allAvailableRelics.some(relic =>
+        (relic.stats || []).some(stat => stat.normalized && isCoreOffenseStat(stat.normalized.key)) &&
+        parseInt(relic.range || 0, 10) > 0
+      );
+    state.offenseClusters = [];
+    state.offenseClusterRange = 0;
+    state.offenseClusterUnreachable = 0;
+
+    const availableRelics = allAvailableRelics.filter(relic => getRelevantStats(relic, goal).length > 0);
     const optimizationContext = buildOptimizationContext(weighting, goal);
+    if (state.prioritiseClustersActive) {
+      const clusterData = buildOffenseClusters(optimizationContext, availableRelics);
+      optimizationContext.clusters = clusterData.clusters;
+      optimizationContext.clusterByCoord = clusterData.clusterByCoord;
+      state.offenseClusters = clusterData.clusters;
+      state.offenseClusterRange = clusterData.range;
+      state.offenseClusterUnreachable = clusterData.unreachable;
+      // Nothing to prioritise: preserve original offense weights for isolated villages.
+      if (!clusterData.clusters.some(cluster => cluster.size >= 2)) {
+        state.prioritiseClustersActive = false;
+      }
+      console.log(SCRIPT_NAME + " ranked offensive clusters:", clusterData.clusters);
+    }
+
     const baseBonuses = buildCurrentBonuses(mode, optimizationContext);
     const workingBonuses = cloneBonusMap(baseBonuses);
-    const availableRelics = getAvailableRelics(mode).filter(relic => getRelevantStats(relic, goal).length > 0);
     const remainingRelics = availableRelics.slice();
     const usedCenters = new Set();
     const plan = [];
@@ -2891,6 +3087,8 @@
     });
 
     state.recruitmentDemandRequested = goal === "recruitment" && !!(ui.recruitmentDemandCheckbox && ui.recruitmentDemandCheckbox.checked);
+    state.prioritiseClustersRequested = goal === "offense" && !!(ui.prioritiseClustersCheckbox && ui.prioritiseClustersCheckbox.checked);
+    state.prioritiseClustersActive = false;
     resetRecruitmentDemandState();
 
 	  if (goal === "offense" || goal === "defense") {
@@ -3010,6 +3208,11 @@
             ? " AM demand: active for " + state.amRecruitmentDemandScoringRows + " scoring village(s)."
             : " AM demand: unavailable/empty; balanced fallback used.")
         : "";
+      const clusterStatus = goal === "offense" && state.prioritiseClustersRequested
+        ? (state.prioritiseClustersActive
+            ? " Cluster priority: active, " + state.offenseClusters.filter(cluster => cluster.size >= 2).length + " compact clusters (reference range " + state.offenseClusterRange + ")."
+            : " Cluster priority: no usable core-offense bonuses or compact clusters; normal offense scoring used.")
+        : "";
       const blockedStatus = state.inactiveRelicPlacements.length
         ? " Blocked placement villages: " + state.inactiveRelicPlacements.length + " (inactive/captured relics)."
         : "";
@@ -3027,7 +3230,7 @@
           formatSettingNumber(getBenefitCap()) +
           "% (" +
           getBenefitCapSourceLabel() +
-          ")." + focusStatus + amStatus + blockedStatus,
+          ")." + focusStatus + amStatus + clusterStatus + blockedStatus,
         "success"
       );
     } catch (err) {
@@ -3570,6 +3773,15 @@ function buildVillageImpactSummary(plan) {
       ));
     }
 
+    if (context.goal === "offense" && state.prioritiseClustersRequested) {
+      contextBar.appendChild(createUiElement(
+        "span", "twrp-context-pill",
+        state.prioritiseClustersActive
+          ? ("Cluster priority: " + state.offenseClusters.filter(cluster => cluster.size >= 2).length + " clusters (range " + state.offenseClusterRange + ")")
+          : "Cluster priority: normal scoring fallback"
+      ));
+    }
+
     if (context.goal === "recruitment" && state.recruitmentDemandRequested) {
       contextBar.appendChild(createUiElement(
         "span",
@@ -3671,6 +3883,59 @@ function buildVillageImpactSummary(plan) {
     });
 
     ui.results.appendChild(grid);
+  }
+
+  function renderOffenseClusterPreview() {
+    if (state.lastGoal !== "offense" || !state.prioritiseClustersActive || !state.offenseClusters.length) return;
+    const compactClusters = state.offenseClusters.filter(cluster => cluster.size >= 2);
+    if (!compactClusters.length) return;
+
+    const details = document.createElement("details");
+    details.className = "twrp-details twrp-scoring-info";
+    const summary = document.createElement("summary");
+    summary.textContent = "Offensive cluster priority (" + compactClusters.length + " ranked clusters)";
+    details.appendChild(summary);
+    details.appendChild(createUiElement(
+      "div", "twrp-muted-block",
+      "Clusters are ranked by Focus Group village count at the typical available relic range (" +
+      state.offenseClusterRange + "), then by compactness. Reference centers identify clusters; actual placements may be elsewhere to reach additional Focus Group villages."
+    ));
+
+    const tableWrap = createUiElement("div", "twrp-table-wrap");
+    const table = createUiElement("table", "twrp-table twrp-compact-table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    ["Rank", "Villages", "Reference center", "Priority x", "Member coordinates"].forEach(label => {
+      const th = document.createElement("th");
+      th.textContent = label;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    compactClusters.slice(0, 15).forEach(cluster => {
+      const row = document.createElement("tr");
+      appendTableCell(row, String(cluster.rank));
+      appendTableCell(row, String(cluster.size));
+      appendTableCell(row, cluster.center.coord);
+      appendTableCell(row, formatScore(getClusterPreviewMultiplier(cluster)));
+      appendTableCell(row, cluster.coords.join(", "), "twrp-left");
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+    details.appendChild(tableWrap);
+    if (compactClusters.length > 15) {
+      details.appendChild(createUiElement("div", "twrp-small", "Showing top 15 of " + compactClusters.length + " ranked clusters."));
+    }
+    ui.results.appendChild(details);
+  }
+
+  function getClusterPreviewMultiplier(cluster) {
+    if (!cluster || cluster.size < 2) return 1;
+    const firstSize = state.offenseClusters.length ? state.offenseClusters[0].size : cluster.size;
+    return 1 + CLUSTER_PRIORITY_BOOST * Math.pow(CLUSTER_RANK_DECAY, cluster.rank - 1) *
+      (0.8 + 0.2 * Math.min(1, cluster.size / Math.max(1, firstSize)));
   }
 
   function renderVillageImpactSummary() {
@@ -3777,6 +4042,12 @@ function buildVillageImpactSummary(plan) {
       scoringParts.push(state.inactiveRelicPlacements.length + " village(s) with inactive/captured relics are excluded as placement centers while they are locked. They can still receive relic effects from another village's range.");
     }
 
+    if (state.lastGoal === "offense" && state.prioritiseClustersRequested) {
+      scoringParts.push(state.prioritiseClustersActive
+        ? "Cluster mode ranks disjoint compact groups of Focus Group villages by how many villages a typical available relic can cover (then by compactness). Axe, Light, Marcher and Ram marginal gains get a rank-dependent multiplier, while other Focus Group villages remain scored. Every eligible owned village is still considered as a placement center, so covering more group villages is better when priority-cluster gains are equal. This prioritises clusters but is not a guarantee of filling every bonus to the cap."
+        : "Cluster mode was requested but there were no usable core-offense relic bonuses or coverable multi-village clusters; normal offensive scoring was used.");
+    }
+
     if (state.lastGoal === "recruitment" && state.recruitmentDemandRequested) {
       scoringParts.push(state.recruitmentDemandActive
         ? "AM demand mode weights Barracks/Stable/Workshop stats by remaining target-current training workload. " + state.amRecruitmentMeta.note
@@ -3853,6 +4124,7 @@ function buildVillageImpactSummary(plan) {
       return;
     }
 
+    renderOffenseClusterPreview();
     renderPlacementCards();
     renderVillageImpactSummary();
     renderRecruitmentDemandPreview();
@@ -3869,6 +4141,10 @@ function buildVillageImpactSummary(plan) {
 
     lines.push("[size=14]" + SCRIPT_NAME + " " + SCRIPT_VERSION + "[/size]");
     lines.push("");
+    if (state.lastGoal === "offense" && state.prioritiseClustersActive) {
+      lines.push("[i]Offensive cluster priority: ON (" + state.offenseClusters.filter(cluster => cluster.size >= 2).length + " clusters, reference range " + state.offenseClusterRange + ")[/i]");
+      lines.push("");
+    }
     lines.push("[b][size=12]Relic Placements[/size][/b]");
     lines.push("");
     lines.push("[table]");
@@ -4743,6 +5019,9 @@ function buildVillageImpactSummary(plan) {
       if (ui.recruitmentDemandWrap) {
         ui.recruitmentDemandWrap.style.display = goalSelect.value === "recruitment" ? "block" : "none";
       }
+      if (ui.prioritiseClustersWrap) {
+        ui.prioritiseClustersWrap.style.display = goalSelect.value === "offense" ? "block" : "none";
+      }
     }
 
 		goalSelect.addEventListener("change", syncGoalDefaults);
@@ -4841,6 +5120,19 @@ function buildVillageImpactSummary(plan) {
     demandLine.appendChild(demandText);
     recruitmentDemandWrap.appendChild(demandLine);
 
+    const prioritiseClustersWrap = document.createElement("div");
+    prioritiseClustersWrap.className = "twrp-wide-option";
+    prioritiseClustersWrap.style.display = "none";
+    const clusterLine = document.createElement("label");
+    clusterLine.className = "twrp-checkline";
+    const prioritiseClustersCheckbox = document.createElement("input");
+    prioritiseClustersCheckbox.type = "checkbox";
+    const clusterText = document.createElement("span");
+    clusterText.innerHTML = "<strong>Prioritise maximising clusters</strong><br><span class='twrp-muted'>Prioritise Axe, Light, Marcher and Ram bonuses in the most tightly grouped Focus Group villages first. Still score every other Focus Group village covered, and consider placement centers anywhere you own villages.</span>";
+    clusterLine.appendChild(prioritiseClustersCheckbox);
+    clusterLine.appendChild(clusterText);
+    prioritiseClustersWrap.appendChild(clusterLine);
+
     grid.appendChild(goalWrap);
     grid.appendChild(modeWrap);
     grid.appendChild(weightWrap);
@@ -4849,6 +5141,7 @@ function buildVillageImpactSummary(plan) {
     grid.appendChild(nobleTargetWrap);
     grid.appendChild(focusGroupWrap);
     grid.appendChild(recruitmentDemandWrap);
+    grid.appendChild(prioritiseClustersWrap);
 
     const buttons = document.createElement("div");
     buttons.className = "twrp-buttons";
@@ -4901,6 +5194,8 @@ function buildVillageImpactSummary(plan) {
     ui.focusGroupSelect = focusGroupSelect;
     ui.recruitmentDemandWrap = recruitmentDemandWrap;
     ui.recruitmentDemandCheckbox = recruitmentDemandCheckbox;
+    ui.prioritiseClustersWrap = prioritiseClustersWrap;
+    ui.prioritiseClustersCheckbox = prioritiseClustersCheckbox;
 		ui.loadButton = loadButton;
 		ui.copyButton = copyButton;
 		ui.status = status;
