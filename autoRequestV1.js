@@ -29,7 +29,7 @@
   const root = tool.root;
   const allSendButtons = ".twsr-send-button, .twrp-send-button";
   const POLL_MS = 100;
-  const GAP_MS = 250;
+  const GAP_MS = 125;
   const START_TIMEOUT_MS = 2000;
   const REQUEST_TIMEOUT_MS = 120000;
   const attempts = new Map();
@@ -43,7 +43,7 @@
   let stopKey = "";
   const initialState = getState();
   const initialPlan = initialState && initialState.plan;
-  const controller = { stop: stop, tool: tool.name, version: "1.0" };
+  const controller = { stop: stop, tool: tool.name, version: "1.1" };
 
   function getState() {
     return tool.balancer && window.twacticsResourceBalancer
@@ -145,8 +145,8 @@
     }
   }
 
-  function schedule() {
-    if (!stopped) timer = setTimeout(step, POLL_MS);
+  function schedule(delayMs) {
+    if (!stopped) timer = setTimeout(step, delayMs === undefined ? POLL_MS : delayMs);
   }
 
   function step() {
@@ -200,8 +200,9 @@
         return;
       }
       if (!pending.settledAt) pending.settledAt = now;
-      if (now - pending.settledAt < GAP_MS) {
-        schedule();
+      const remainingGap = GAP_MS - (now - pending.settledAt);
+      if (remainingGap > 0) {
+        schedule(remainingGap);
         return;
       }
       pending = null;
